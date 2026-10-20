@@ -1,0 +1,5 @@
+# Git for Windows sets core.autocrlf=true system-wide, which rewrites every file on
+# checkout and leaves the whole tree permanently reading as modified. Pinned instead.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.jar binary

@@ -1,0 +1,28 @@
+# Secrets and machine-local config
+local.properties
+*.keystore
+*.jks
+
+# Build output — app/build/ contains a generated BuildConfig with the Telegram app credentials in it
+.gradle/
+.kotlin/
+build/
+app/build/
+app/release/
+.cxx/
+captures/
+*.apk
+*.aab
+*.orig
+*.rej
+
+# Crash and profiling dumps, tool scratch
+*.hprof
+*.log
+*.tmp
+*.swp
+
+# IDE
+.idea/
+*.iml
+.DS_Store

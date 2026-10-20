@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    TDLib keeps its session database and its downloaded video files under filesDir/telegram.
+    Neither may leave the device: the database is a logged-in Telegram session, and the files are
+    gigabytes of video. Everything else the app stores (saved playback positions in
+    arc_player_prefs) is still backed up, so a reinstall keeps the place you stopped at.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="telegram" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="telegram" />
+    </device-transfer>
+</data-extraction-rules>
