@@ -89,15 +89,16 @@ interface MediaSource {
  *
  * TMDB first because it is the widest and the key is free, but it is not even in the list until a key
  * is compiled in. AniList carries the anime that fills this library without needing any registration.
- * Wikipedia is last because it knows a film by its article rather than by a poster.
+ * IMDb is asked third because it indexes the regional films TMDB's name search misses, and spends the
+ * IMDb id on TMDB when the two turn out to hold the same film under different spellings. Wikipedia is
+ * last because it knows a film by its article rather than by a poster.
  */
 object MediaSources {
 
-    fun chain(apiKey: String): List<MediaSource> = listOfNotNull(
-        if (apiKey.isBlank()) null else TmdbSource(apiKey),
-        AniListSource(),
-        WikipediaSource()
-    )
+    fun chain(apiKey: String): List<MediaSource> {
+        val tmdb = if (apiKey.isBlank()) null else TmdbSource(apiKey)
+        return listOfNotNull(tmdb, AniListSource(), ImdbSource(tmdb), WikipediaSource())
+    }
 
     /**
      * The first catalogue that recognises this file, or why none of them did.

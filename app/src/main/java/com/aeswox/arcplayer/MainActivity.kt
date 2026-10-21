@@ -70,6 +70,8 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.animation.rememberSplineBasedDecay
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
@@ -113,6 +115,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -142,8 +145,11 @@ import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -155,7 +161,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -181,6 +186,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -211,7 +217,12 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -224,20 +235,31 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import com.aeswox.arcplayer.ui.animations.headerActionRetreat
 import com.aeswox.arcplayer.ui.animations.jelly
 import com.aeswox.arcplayer.ui.animations.jellyClick
+import com.aeswox.arcplayer.ui.animations.rememberHeaderActionsVisible
 import com.aeswox.arcplayer.ui.animations.jellyCombinedClickable
+import com.aeswox.arcplayer.ui.animations.jellyTabCrossSlide
+import com.aeswox.arcplayer.ui.animations.physicsBounceOverscroll
+import com.aeswox.arcplayer.ui.components.FrostedDialog
+import com.aeswox.arcplayer.ui.components.FrostedModalPanel
 import com.aeswox.arcplayer.ui.components.MorphingMenu
 import com.aeswox.arcplayer.ui.components.MorphingMenuItem
+import com.aeswox.arcplayer.ui.haptics.AppHaptics
+import com.aeswox.arcplayer.ui.haptics.HapticIntensity
 import com.aeswox.arcplayer.ui.theme.Background as JellyBackground
+import com.aeswox.arcplayer.ui.theme.Accent as JellyAccent
+import com.aeswox.arcplayer.ui.theme.Error as JellyError
 import com.aeswox.arcplayer.ui.theme.OnBackground as JellyOnBackground
+import com.aeswox.arcplayer.ui.theme.OnPrimary as JellyOnPrimary
 import com.aeswox.arcplayer.ui.theme.OnSurface as JellyOnSurface
 import com.aeswox.arcplayer.ui.theme.OnSurfaceVariant as JellyOnSurfaceVariant
 import com.aeswox.arcplayer.ui.theme.Outline as JellyOutline
+import com.aeswox.arcplayer.ui.theme.Primary as JellyPrimary
+import com.aeswox.arcplayer.ui.theme.Surface as JellySurface
 import com.aeswox.arcplayer.ui.theme.SurfaceContainer as JellySurfaceContainer
 import com.aeswox.arcplayer.ui.theme.SurfaceContainerHigh as JellySurfaceContainerHigh
-import com.aeswox.arcplayer.ui.theme.SurfaceContainerLowest as JellySurfaceContainerLowest
-import com.aeswox.arcplayer.ui.theme.SurfaceContainerLow as JellySurfaceContainerLow
 import com.aeswox.arcplayer.ui.theme.ArcPlayerJellyTheme
 import com.aeswox.arcplayer.ui.jelly.jellyGlass
 import com.aeswox.arcplayer.ui.jelly.jellySource
@@ -256,7 +278,9 @@ import com.aeswox.arcplayer.metadata.AbsoluteSeasons
 import com.aeswox.arcplayer.metadata.EpisodeDetail
 import com.aeswox.arcplayer.metadata.LookupRequest
 import com.aeswox.arcplayer.metadata.MediaCard
+import com.aeswox.arcplayer.metadata.MediaGuess
 import com.aeswox.arcplayer.metadata.MediaLibrary
+import com.aeswox.arcplayer.metadata.MediaNameParser
 import com.aeswox.arcplayer.metadata.PosterCache
 import com.aeswox.arcplayer.metadata.PlayOrder
 import com.aeswox.arcplayer.metadata.ReleaseInfo
@@ -322,13 +346,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.light(
-                scrim = android.graphics.Color.TRANSPARENT,
-                darkScrim = android.graphics.Color.TRANSPARENT
+            statusBarStyle = SystemBarStyle.dark(
+                scrim = android.graphics.Color.TRANSPARENT
             ),
-            navigationBarStyle = SystemBarStyle.light(
-                scrim = android.graphics.Color.TRANSPARENT,
-                darkScrim = android.graphics.Color.TRANSPARENT
+            navigationBarStyle = SystemBarStyle.dark(
+                scrim = android.graphics.Color.TRANSPARENT
             )
         )
         setContent {
@@ -366,15 +388,19 @@ tailrec fun Context.findActivity(): ComponentActivity? = when (this) {
 }
 
 // ============================================================================
-// THEME & SHARED CONSTANTS (Samsung One UI Light Palette)
+// THEME & SHARED CONSTANTS (Frosted Jelly dark foundation)
 // ============================================================================
 
 private val OneUiBackground = JellyBackground
 private val OneUiTextPrimary = JellyOnSurface
 private val OneUiTextSecondary = JellyOnSurfaceVariant
-private val OneUiPillSurface = JellySurfaceContainerLowest
+private val OneUiCardSurface = JellySurface
+private val OneUiPillSurface = JellySurfaceContainer
 private val OneUiPillSelected = JellySurfaceContainerHigh
-private val OneUiBadgeOrange = JellySurfaceContainerHigh
+private val OneUiSelectedFill = JellyPrimary
+private val OneUiOnSelectedFill = JellyOnPrimary
+private val OneUiAccent = JellyAccent
+private val OneUiDestructive = JellyError
 private val OneUiPlaceholderGray = JellyOutline
 
 private const val CARD_ASPECT_RATIO = 0.78f
@@ -476,6 +502,18 @@ class ArcPreferencesStore(context: Context) {
         private set
     var defaultPlaybackSpeed by mutableFloatStateOf(1.0f)
         private set
+
+    /**
+     * Tactile feedback, mirrored straight into [AppHaptics] on every change.
+     *
+     * The engine is a process-wide object holding a vibrator handle, and a control halfway down a
+     * list has no business asking the preferences file what the viewer chose — so the answer lives in
+     * both places: here as observable state for the Settings row, and there for everything that knocks.
+     */
+    var hapticsEnabled by mutableStateOf(true)
+        private set
+    var hapticIntensity by mutableStateOf(HapticIntensity.MEDIUM)
+        private set
     var telegramApiId by mutableIntStateOf(0)
         private set
     var telegramApiHash by mutableStateOf("")
@@ -523,6 +561,11 @@ class ArcPreferencesStore(context: Context) {
             backgroundAudioEnabled = prefs.getBoolean("bg_audio", false)
             autoPipEnabled = prefs.getBoolean("auto_pip", true)
             defaultPlaybackSpeed = prefs.getFloat("default_speed", 1.0f).coerceIn(0.5f, 2.0f)
+
+            hapticsEnabled = prefs.getBoolean("haptics_enabled", true)
+            hapticIntensity = HapticIntensity.fromName(prefs.getString("haptic_intensity", null))
+            AppHaptics.isEnabled = hapticsEnabled
+            AppHaptics.intensity = hapticIntensity
 
             // Credentials typed into the Cloud tab win over whatever was compiled in.
             telegramApiId = prefs.getInt("tg_api_id", 0)
@@ -709,6 +752,18 @@ class ArcPreferencesStore(context: Context) {
         prefs.edit().putFloat("default_speed", speed).apply()
     }
 
+    fun updateHaptics(enabled: Boolean) {
+        hapticsEnabled = enabled
+        AppHaptics.isEnabled = enabled
+        prefs.edit().putBoolean("haptics_enabled", enabled).apply()
+    }
+
+    fun updateHapticIntensity(level: HapticIntensity) {
+        hapticIntensity = level
+        AppHaptics.intensity = level
+        prefs.edit().putString("haptic_intensity", level.name).apply()
+    }
+
     fun updateTelegramCredentials(apiId: Int, apiHash: String) {
         val trimmed = apiHash.trim()
         telegramApiId = apiId
@@ -891,11 +946,12 @@ data class MediaLibrarySnapshot(
 )
 
 @Immutable
-enum class BottomNavTab(val label: String, val headerTitle: String) {
-    VIDEOS(label = "Videos", headerTitle = "Videos"),
-    FOLDERS(label = "Folders", headerTitle = "Folders"),
-    CLOUD(label = "Cloud", headerTitle = "Cloud"),
-    MENU(label = "Menu", headerTitle = "Arc Player")
+enum class BottomNavTab(val label: String) {
+    HOME("Home"), SEARCH("Search"), LIBRARY("Library"), SETTINGS("Settings")
+}
+
+private enum class LibraryPage(val headerTitle: String) {
+    VIDEOS("All videos"), FOLDERS("On Device"), CLOUD("Collection"), MENU("Settings")
 }
 
 /**
@@ -1537,6 +1593,7 @@ class ArcVlcPlayerEngine(
                 MediaPlayer.Event.EndReached -> {
                     isPlaying = false
                     currentPositionMs = durationMs
+                    isAtEnd = true
                 }
 
                 MediaPlayer.Event.Vout -> {
@@ -1676,6 +1733,9 @@ class ArcVlcPlayerEngine(
             if (currentPositionMs >= durationMs - 200L && durationMs > 0L) {
                 mediaPlayer.setTime(0L, true)
                 currentPositionMs = 0L
+                // Starting over is the one backward jump that is not a stale report, and a hold still
+                // armed from the seek to the end would drop every tick the replay produces.
+                seekHold = null
             }
             pausedForSeek = false
             stoppedOnPurpose = false
@@ -1684,6 +1744,9 @@ class ArcVlcPlayerEngine(
     }
 
     fun seekTo(targetMs: Long) {
+        // A play head sent somewhere new is no longer at the end, and saying so here is what lets a
+        // rewind during the next-up countdown take the card back off.
+        isAtEnd = false
         // A file sent as a document has no length until the container opens, and clamping a resume
         // seek against the placeholder would drop it at the very start.
         val clamped = if (durationMs > 1L) targetMs.coerceIn(0L, durationMs) else targetMs.coerceAtLeast(0L)
@@ -1744,8 +1807,12 @@ class ArcVlcPlayerEngine(
      */
     private fun onTimeChanged(timeMs: Long) {
         seekHold?.let { hold ->
-            if (hold.isStale(timeMs, SystemClock.elapsedRealtime())) return
-            seekHold = null
+            val now = SystemClock.elapsedRealtime()
+            // The tick that lands a seek does not retire the hold: libVLC still has reports from the
+            // position the seek left, and the first of them to arrive after the landing is what pulls
+            // the scrubber back and turns the one download window around.
+            if (hold.isExpired(now)) seekHold = null
+            else if (hold.isStale(timeMs, now)) return
         }
         // A play head that moves somewhere new is the answer the seek was owed, so the debt is paid
         // here and nowhere else. Left stamped, it would read as "still catching up" for the rest of
@@ -1754,6 +1821,10 @@ class ArcVlcPlayerEngine(
         if (playOwedSinceMs != BufferGuard.NEVER && timeMs != currentPositionMs) {
             playOwedSinceMs = BufferGuard.NEVER
         }
+        // The end is only a fact until the play head moves again: a rewind, a replay from the start,
+        // or a stall recovery that finds bytes after a hole all report ticks well short of the
+        // length, and each one is the ending not having been an ending.
+        if (isAtEnd && timeMs < durationMs - NextUp.HONEST_END_TOLERANCE_MS) isAtEnd = false
         currentPositionMs = timeMs
         lastPlayedPositionMs = timeMs
         lastTickAtMs = SystemClock.elapsedRealtime()
@@ -2265,9 +2336,15 @@ fun ArcPlayerHomeScreen() {
 
     val jellyHazeState = remember { HazeState() }
     val jellyBackdrop = rememberLayerBackdrop()
+    val destinationState = rememberSaveableStateHolder()
 
-    var selectedTabIndex by rememberSaveable { mutableIntStateOf(BottomNavTab.FOLDERS.ordinal) }
-    val selectedTab = BottomNavTab.entries[selectedTabIndex]
+    var mainTabName by rememberSaveable { mutableStateOf(BottomNavTab.HOME.name) }
+    val mainTab = BottomNavTab.valueOf(mainTabName)
+    var libraryPageName by rememberSaveable { mutableStateOf<String?>(null) }
+    val selectedTab = if (mainTab == BottomNavTab.SETTINGS) LibraryPage.MENU
+        else libraryPageName?.let(LibraryPage::valueOf) ?: LibraryPage.CLOUD
+    val showingBrowser = mainTab == BottomNavTab.SETTINGS ||
+        (mainTab == BottomNavTab.LIBRARY && libraryPageName != null)
 
     var openedFolderBucketId by rememberSaveable { mutableStateOf<String?>(null) }
     var openedPlaylistName by rememberSaveable { mutableStateOf<String?>(null) }
@@ -2285,6 +2362,15 @@ fun ArcPlayerHomeScreen() {
 
     var cloudScreenName by rememberSaveable { mutableStateOf(CloudScreen.SHELF.name) }
     var cloudNotice by remember { mutableStateOf<String?>(null) }
+    val openLibraryBrowser: (LibraryPage, CloudScreen) -> Unit = { page, screen ->
+        mainTabName = BottomNavTab.LIBRARY.name
+        libraryPageName = page.name
+        cloudScreenName = screen.name
+        openedFolderBucketId = null
+        openedPlaylistName = null
+        isSearchExpanded = false
+        searchQuery = ""
+    }
 
     /**
      * The shelf card opened as a page.
@@ -2455,13 +2541,18 @@ fun ArcPlayerHomeScreen() {
         when {
             openedPlaylistName != null -> openedPlaylistName = null
             openedFolderBucketId != null -> openedFolderBucketId = null
-            else -> cloudScreenName = CloudScreen.SHELF.name
+            else -> {
+                libraryPageName = null
+                cloudScreenName = CloudScreen.SHELF.name
+            }
         }
     }
-    val cloudOnShelf = cloudScreenName == CloudScreen.SHELF.name && openedPlaylistName == null
-    val somethingToLeave = openedFolderBucketId != null || openedPlaylistName != null || !cloudOnShelf
-    BackHandler(enabled = activePlayback == null && !isSearchExpanded && somethingToLeave) {
-        leaveDetailScreen()
+    BackHandler(enabled = activePlayback == null && mainTab != BottomNavTab.HOME && !showingBrowser) {
+        mainTabName = BottomNavTab.HOME.name
+    }
+    BackHandler(enabled = activePlayback == null && showingBrowser && !isSearchExpanded) {
+        if (mainTab == BottomNavTab.SETTINGS) mainTabName = BottomNavTab.HOME.name
+        else leaveDetailScreen()
     }
 
     // Registered last so it wins over the screens underneath it, and disabled while the player is up:
@@ -2487,12 +2578,12 @@ fun ArcPlayerHomeScreen() {
     val cloudScreen = CloudScreen.entries.firstOrNull { it.name == cloudScreenName } ?: CloudScreen.SHELF
 
     val activeGridState = when {
-        selectedTab == BottomNavTab.FOLDERS && openedFolderBucketId != null -> openedFolderGridState
-        selectedTab == BottomNavTab.CLOUD && openedPlaylistName != null -> openedFolderGridState
-        selectedTab == BottomNavTab.CLOUD && cloudScreen == CloudScreen.PLAYLISTS -> playlistsGridState
-        selectedTab == BottomNavTab.CLOUD -> shelfGridState
-        selectedTab == BottomNavTab.VIDEOS -> allVideosGridState
-        selectedTab == BottomNavTab.MENU -> menuGridState
+        selectedTab == LibraryPage.FOLDERS && openedFolderBucketId != null -> openedFolderGridState
+        selectedTab == LibraryPage.CLOUD && openedPlaylistName != null -> openedFolderGridState
+        selectedTab == LibraryPage.CLOUD && cloudScreen == CloudScreen.PLAYLISTS -> playlistsGridState
+        selectedTab == LibraryPage.CLOUD -> shelfGridState
+        selectedTab == LibraryPage.VIDEOS -> allVideosGridState
+        selectedTab == LibraryPage.MENU -> menuGridState
         else -> foldersGridState
     }
 
@@ -2567,11 +2658,7 @@ fun ArcPlayerHomeScreen() {
     }
 
     LaunchedEffect(Unit) {
-        if (!hasPermission) {
-            permissionLauncher.launch(requiredVideoPermissions())
-        } else {
-            refreshMediaLibrary(false)
-        }
+        if (hasPermission) refreshMediaLibrary(false)
     }
 
     DisposableEffect(lifecycleOwner, context, refreshMediaLibrary) {
@@ -2606,11 +2693,11 @@ fun ArcPlayerHomeScreen() {
 
     val currentHeaderTitle: () -> String = {
         when {
-            selectedTab == BottomNavTab.FOLDERS && openedFolderBucketId != null ->
+            selectedTab == LibraryPage.FOLDERS && openedFolderBucketId != null ->
                 librarySnapshot.folders.find { it.bucketId == openedFolderBucketId }?.title ?: selectedTab.headerTitle
-            selectedTab == BottomNavTab.CLOUD && openedPlaylistName != null -> openedPlaylistName!!
-            selectedTab == BottomNavTab.CLOUD && cloudScreenName == CloudScreen.PLAYLISTS.name -> "Playlists"
-            selectedTab == BottomNavTab.CLOUD -> "Library"
+            selectedTab == LibraryPage.CLOUD && openedPlaylistName != null -> openedPlaylistName!!
+            selectedTab == LibraryPage.CLOUD && cloudScreenName == CloudScreen.PLAYLISTS.name -> "Playlists"
+            selectedTab == LibraryPage.CLOUD -> "Library"
             else -> selectedTab.headerTitle
         }
     }
@@ -2661,10 +2748,47 @@ fun ArcPlayerHomeScreen() {
                 // content on API 34+ and cycles the render tree on API 31-33.
                 Box(modifier = Modifier.fillMaxSize()) {
                 Box(
-                    modifier = Modifier
-                        .fillMaxSize()
+                    modifier = Modifier.fillMaxSize()
                         .jellySource(hazeState = jellyHazeState, backdrop = jellyBackdrop)
                         .background(OneUiBackground)
+                ) {
+                if (!showingBrowser) {
+                    AnimatedContent(
+                        targetState = mainTab,
+                        transitionSpec = {
+                            val (enter, exit) = jellyTabCrossSlide(targetState.ordinal > initialState.ordinal)
+                            enter togetherWith exit
+                        },
+                        label = "tab_switch"
+                    ) { tab ->
+                    destinationState.SaveableStateProvider("collection:${tab.name}") {
+                    CollectionScreens(
+                        tab = tab,
+                        repository = cloudRepository,
+                        prefsStore = prefsStore,
+                        snapshot = librarySnapshot,
+                        topInset = statusBarTopPadding,
+                        bottomInset = navBarBottomPadding,
+                        onOpenTitle = { shelfTitle = it },
+                        onCloudPlay = launchCloudVideo,
+                        onLocalPlay = { video, videos ->
+                            activePlayback = ActiveVideoPlayback(video, videos, "home_local")
+                        },
+                        onOpenDevice = { openLibraryBrowser(LibraryPage.FOLDERS, CloudScreen.SHELF) },
+                        onOpenAllVideos = { openLibraryBrowser(LibraryPage.VIDEOS, CloudScreen.SHELF) },
+                        onOpenPlaylists = { openLibraryBrowser(LibraryPage.CLOUD, CloudScreen.PLAYLISTS) },
+                        onManageCollection = { openLibraryBrowser(LibraryPage.CLOUD, CloudScreen.SHELF) }
+                    )
+                    }
+                    }
+                } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        // The two-stop controller spends a gesture on the list, then the header, and
+                        // only hands back what neither of them can take — so this stretches the
+                        // surface exactly where the reference app runs out of things to scroll.
+                        .physicsBounceOverscroll()
                         .pointerInput(scrollController) {
                             awaitPointerEventScope {
                                 while (true) {
@@ -2806,10 +2930,7 @@ fun ArcPlayerHomeScreen() {
                                         }
                                     }
                                 } else {
-                                    val showBackTitle = (selectedTab == BottomNavTab.FOLDERS && openedFolderBucketId != null) ||
-                                        (selectedTab == BottomNavTab.CLOUD &&
-                                            (openedPlaylistName != null ||
-                                                cloudScreenName != CloudScreen.SHELF.name))
+                                    val showBackTitle = showingBrowser
 
                                     Box(modifier = Modifier.weight(1f)) {
                                         androidx.compose.animation.AnimatedVisibility(
@@ -2853,7 +2974,10 @@ fun ArcPlayerHomeScreen() {
                                                     val backSource = remember { MutableInteractionSource() }
                                                     IconButton(
                                                         interactionSource = backSource,
-                                                        onClick = leaveDetailScreen,
+                                                        onClick = {
+                                                            if (mainTab == BottomNavTab.SETTINGS) mainTabName = BottomNavTab.HOME.name
+                                                            else leaveDetailScreen()
+                                                        },
                                                         modifier = Modifier
                                                             .size(38.dp)
                                                             .jelly(backSource, scaleDownTo = 0.88f)
@@ -2881,7 +3005,7 @@ fun ArcPlayerHomeScreen() {
                                         }
                                     }
 
-                                    Box(
+                                    if (selectedTab == LibraryPage.FOLDERS || selectedTab == LibraryPage.VIDEOS) Box(
                                         contentAlignment = Alignment.Center,
                                         modifier = Modifier.height(42.dp)
                                     ) {
@@ -2960,8 +3084,9 @@ fun ArcPlayerHomeScreen() {
                             }
                         },
                         content = {
+                            val browsingDevice = selectedTab == LibraryPage.FOLDERS || selectedTab == LibraryPage.VIDEOS
                             when {
-                                !hasPermission -> {
+                                browsingDevice && !hasPermission -> {
                                     PermissionRequestView(
                                         onGrantClick = {
                                             permissionLauncher.launch(requiredVideoPermissions())
@@ -2969,7 +3094,7 @@ fun ArcPlayerHomeScreen() {
                                     )
                                 }
 
-                                isScanning && librarySnapshot.videos.isEmpty() -> {
+                                browsingDevice && isScanning && librarySnapshot.videos.isEmpty() -> {
                                     Box(
                                         modifier = Modifier.fillMaxSize(),
                                         contentAlignment = Alignment.Center
@@ -2982,7 +3107,7 @@ fun ArcPlayerHomeScreen() {
                                     }
                                 }
 
-                                librarySnapshot.videos.isEmpty() -> {
+                                browsingDevice && librarySnapshot.videos.isEmpty() -> {
                                     EmptyMediaStateView(onRescanClick = { refreshMediaLibrary(false) })
                                 }
 
@@ -2991,7 +3116,7 @@ fun ArcPlayerHomeScreen() {
                                     val bottomContentPad = 128.dp + navBarBottomPadding
 
                                     when (selectedTab) {
-                                        BottomNavTab.FOLDERS -> {
+                                        LibraryPage.FOLDERS -> {
                                             AnimatedContent(
                                                 targetState = openedFolderBucketId,
                                                 transitionSpec = {
@@ -3062,6 +3187,7 @@ fun ArcPlayerHomeScreen() {
                                                                     )
                                                                 },
                                                                 onVideoLongClick = { video ->
+                                                                    AppHaptics.grab()
                                                                     longPressedVideo = video
                                                                 }
                                                             )
@@ -3086,7 +3212,7 @@ fun ArcPlayerHomeScreen() {
                                             }
                                         }
 
-                                        BottomNavTab.VIDEOS -> {
+                                        LibraryPage.VIDEOS -> {
                                             VideoGridContent(
                                                 videos = sortedFilteredAllVideos,
                                                 columns = prefsStore.gridColumns,
@@ -3108,12 +3234,13 @@ fun ArcPlayerHomeScreen() {
                                                     )
                                                 },
                                                 onVideoLongClick = { video ->
+                                                    AppHaptics.grab()
                                                     longPressedVideo = video
                                                 }
                                             )
                                         }
 
-                                        BottomNavTab.CLOUD -> {
+                                        LibraryPage.CLOUD -> {
                                             CloudTabContent(
                                                 repository = cloudRepository,
                                                 prefsStore = prefsStore,
@@ -3156,15 +3283,18 @@ fun ArcPlayerHomeScreen() {
                                                     launchCloudVideo(item, list, slots, card)
                                                 },
                                                 onVideoLongClick = { video ->
+                                                    AppHaptics.grab()
                                                     longPressedVideo = video
                                                 }
                                             )
                                         }
 
-                                        BottomNavTab.MENU -> {
-                                            MenuTabContent(
+                                        LibraryPage.MENU -> {
+                                            SettingsContent(
                                                 snapshot = librarySnapshot,
                                                 prefsStore = prefsStore,
+                                                repository = cloudRepository,
+                                                onManageCollection = { openLibraryBrowser(LibraryPage.CLOUD, CloudScreen.SHELF) },
                                                 gridState = menuGridState,
                                                 topPadding = topContentPad,
                                                 bottomPadding = bottomContentPad
@@ -3176,9 +3306,11 @@ fun ArcPlayerHomeScreen() {
                         }
                     )
                 }
+                }
+                }
 
                     AnimatedVisibility(
-                        visible = lastResumableVideo != null && !showScrollToTopButton,
+                        visible = showingBrowser && selectedTab != LibraryPage.MENU && lastResumableVideo != null && !showScrollToTopButton,
                         enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.9f, animationSpec = tween(180)),
                         exit = fadeOut(tween(140)),
                         modifier = Modifier
@@ -3209,7 +3341,7 @@ fun ArcPlayerHomeScreen() {
                                     Icon(
                                         imageVector = Icons.Default.PlayArrow,
                                         contentDescription = null,
-                                        tint = OneUiBadgeOrange,
+                                        tint = OneUiAccent,
                                         modifier = Modifier.size(18.dp)
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
@@ -3227,7 +3359,7 @@ fun ArcPlayerHomeScreen() {
                     }
 
                     AnimatedVisibility(
-                        visible = showScrollToTopButton,
+                        visible = showingBrowser && showScrollToTopButton,
                         enter = fadeIn(tween(180)) + scaleIn(
                             initialScale = 0.72f,
                             animationSpec = spring(
@@ -3252,22 +3384,29 @@ fun ArcPlayerHomeScreen() {
                         )
                     }
 
+                    Box(
+                        Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                            .height(106.dp + navBarBottomPadding)
+                            .background(Brush.verticalGradient(
+                                0f to OneUiBackground.copy(alpha = 0f),
+                                0.25f to OneUiBackground.copy(alpha = 0.28f),
+                                0.62f to OneUiBackground.copy(alpha = 0.76f),
+                                1f to OneUiBackground
+                            ))
+                    )
                     OneUiFloatingBottomBar(
-                        selectedTab = selectedTab,
+                        selectedTab = mainTab,
                         hazeState = jellyHazeState,
                         backdrop = jellyBackdrop,
                         onTabSelected = { tab ->
-                            if (tab == BottomNavTab.FOLDERS && selectedTab == BottomNavTab.FOLDERS) {
-                                openedFolderBucketId = null
-                            }
-                            if (tab == BottomNavTab.CLOUD && selectedTab == BottomNavTab.CLOUD) {
-                                openedPlaylistName = null
-                                cloudScreenName = CloudScreen.SHELF.name
-                            }
-                            // The page belongs to the Cloud tab, and it covers the whole screen, so
-                            // carrying it onto another tab would hide the tab it landed on.
-                            if (tab != BottomNavTab.CLOUD) shelfTitle = null
-                            selectedTabIndex = tab.ordinal
+                            mainTabName = tab.name
+                            libraryPageName = null
+                            shelfTitle = null
+                            openedFolderBucketId = null
+                            openedPlaylistName = null
+                            cloudScreenName = CloudScreen.SHELF.name
+                            isSearchExpanded = false
+                            searchQuery = ""
                         },
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -3323,7 +3462,7 @@ fun ArcPlayerHomeScreen() {
 
     longPressedVideo?.let { targetVideo ->
         val isFav = prefsStore.favoriteIds.contains(targetVideo.id)
-        AlertDialog(
+        FrostedDialog(
             onDismissRequest = { longPressedVideo = null },
             title = {
                 Text(
@@ -3344,6 +3483,7 @@ fun ArcPlayerHomeScreen() {
                     Spacer(modifier = Modifier.height(6.dp))
                     Surface(
                         onClick = {
+                            AppHaptics.favorite(!isFav)
                             prefsStore.toggleFavorite(targetVideo.id)
                             longPressedVideo = null
                         },
@@ -3358,7 +3498,7 @@ fun ArcPlayerHomeScreen() {
                             Icon(
                                 imageVector = if (isFav) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
                                 contentDescription = null,
-                                tint = if (isFav) OneUiBadgeOrange else OneUiTextPrimary,
+                                tint = if (isFav) OneUiAccent else OneUiTextPrimary,
                                 modifier = Modifier.size(20.dp)
                             )
                             Spacer(modifier = Modifier.width(10.dp))
@@ -3427,18 +3567,19 @@ fun ArcPlayerHomeScreen() {
     }
 
     playlistToDelete?.let { targetPlaylist ->
-        AlertDialog(
+        FrostedDialog(
             onDismissRequest = { playlistToDelete = null },
             title = { Text("Delete Playlist?", fontSize = 17.sp, fontWeight = FontWeight.SemiBold) },
             text = { Text("Delete \u201C$targetPlaylist\u201D? Your video files on device will not be removed.") },
             confirmButton = {
                 TextButton(
                     onClick = {
+                        AppHaptics.destructive()
                         prefsStore.deletePlaylist(targetPlaylist)
                         playlistToDelete = null
                     }
                 ) {
-                    Text("Delete", color = OneUiBadgeOrange, fontWeight = FontWeight.SemiBold)
+                    Text("Delete", color = OneUiDestructive, fontWeight = FontWeight.SemiBold)
                 }
             },
             dismissButton = {
@@ -3450,7 +3591,7 @@ fun ArcPlayerHomeScreen() {
     }
 
     if (showCreatePlaylistDialog) {
-        AlertDialog(
+        FrostedDialog(
             onDismissRequest = { showCreatePlaylistDialog = false },
             title = { Text("Create Playlist", fontSize = 17.sp, fontWeight = FontWeight.SemiBold) },
             text = {
@@ -3705,7 +3846,7 @@ private fun CloudTabContent(
     onVideoLongClick: (VideoItem) -> Unit
 ) {
     val authState by repository.authState.collectAsState()
-    if (authState.stage != CloudAuthStage.AUTHORIZED) {
+    if (screen == CloudScreen.SHELF && authState.stage != CloudAuthStage.AUTHORIZED) {
         CloudAuthGrid(
             repository = repository,
             prefsStore = prefsStore,
@@ -4420,7 +4561,7 @@ private fun TitleGroup.toShelfCard(
 
 /** Ask the catalogues what these files are, once each, while the screen holding them is on screen. */
 @Composable
-private fun TitleSearchPass(videos: List<CloudVideoItem>, prefsStore: ArcPreferencesStore) {
+internal fun TitleSearchPass(videos: List<CloudVideoItem>, prefsStore: ArcPreferencesStore) {
     LaunchedEffect(videos) {
         if (videos.isEmpty()) return@LaunchedEffect
         MediaLibrary.search(
@@ -4447,7 +4588,7 @@ private fun TitleSearchPass(videos: List<CloudVideoItem>, prefsStore: ArcPrefere
  * answer is never as wide as the first. A show whose eight episodes are all on the shelf has one
  * playable file per catalogue row; a film uploaded by three groups has three rows and one page.
  */
-private class ShelfTitle(
+internal class ShelfTitle(
     val group: TitleGroup,
     val parts: List<CloudVideoItem>,
     val representative: CloudVideoItem,
@@ -4519,6 +4660,9 @@ private const val PLAYER_RELEASE_SETTLE_MS = 1_500L
 private const val INFO_HERO_HEIGHT_DP = 300
 private const val INFO_HERO_COLLAPSE_DP = 210
 
+/** Frosted Artwork Parallax Fade: the picture travels at six tenths of the column's own speed. */
+private const val INFO_ARTWORK_PARALLAX = 0.6f
+
 /**
  * The page a shelf poster opens.
  *
@@ -4545,6 +4689,7 @@ private fun CloudTitleInfoPage(
     val collapsePx = with(LocalDensity.current) { INFO_HERO_COLLAPSE_DP.dp.toPx() }
     val lifted = (scrollState.value / collapsePx).coerceIn(0f, 1f)
     val barOpaque = lifted > 0.55f
+    val actionsStanding = rememberHeaderActionsVisible(scrollState)
 
     val backdrop = rememberCachedArt(detail?.backdropUrl ?: title.posterUrl, 1_100)
     val wordmark = rememberCachedArt(title.wordmarkUrl, PosterCache.WORDMARK_WIDTH_PX)
@@ -4614,7 +4759,7 @@ private fun CloudTitleInfoPage(
     var copiesSheet by remember(title) { mutableStateOf<EpisodeCopiesSheet?>(null) }
 
     Box(modifier = Modifier.fillMaxSize().background(OneUiBackground)) {
-        Column(modifier = Modifier.fillMaxSize().verticalScroll(scrollState)) {
+        Column(modifier = Modifier.physicsBounceOverscroll().fillMaxSize().verticalScroll(scrollState)) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -4628,12 +4773,17 @@ private fun CloudTitleInfoPage(
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
                         // Oversized and pulled up so the drift never uncovers an edge: the picture
-                        // travels at 0.6x the column, which is what keeps the hero from reading dead.
+                        // travels at 0.6x the column and dissolves as the hero collapses, so what
+                        // shows through at the end of that is the page colour, not a gap.
                         modifier = Modifier
                             .fillMaxWidth()
                             .height((INFO_HERO_HEIGHT_DP + 180).dp)
                             .offset(y = (-90).dp)
-                            .graphicsLayer { translationY = scrollState.value * 0.4f }
+                            .graphicsLayer {
+                                val travel = scrollState.value
+                                translationY = travel * INFO_ARTWORK_PARALLAX
+                                alpha = (1f - travel / collapsePx).coerceIn(0f, 1f)
+                            }
                     )
                 } else {
                     PlaceholderThumbnailBox(modifier = Modifier.fillMaxSize())
@@ -4737,7 +4887,10 @@ private fun CloudTitleInfoPage(
                                 interactionSource = playSource,
                                 indication = null,
                                 scaleDownTo = 0.96f,
-                                onClick = { playCopy(playFile) }
+                                onClick = {
+                                    AppHaptics.click()
+                                    playCopy(playFile)
+                                }
                             )
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -4770,7 +4923,12 @@ private fun CloudTitleInfoPage(
                                 text = "Remove from shelf",
                                 icon = Icons.Default.Delete,
                                 isDestructive = true,
-                                onClick = { onRemove(title) }
+                                onClick = {
+                                    // No confirmation follows this, so the thud is the only warning
+                                    // that the whole work is leaving the shelf rather than one file.
+                                    AppHaptics.destructive()
+                                    onRemove(title)
+                                }
                             )
                         ),
                         buttonSize = 46.dp,
@@ -4865,9 +5023,16 @@ private fun CloudTitleInfoPage(
                 val backSource = remember { MutableInteractionSource() }
                 IconButton(
                     interactionSource = backSource,
-                    onClick = onBack,
+                    onClick = {
+                        AppHaptics.click()
+                        onBack()
+                    },
+                    // A retired action has to stop being tappable as well as invisible, or the viewer
+                    // presses a button they cannot see and the page leaves without saying why.
+                    enabled = actionsStanding,
                     modifier = Modifier
                         .size(40.dp)
+                        .headerActionRetreat(standing = actionsStanding)
                         .jelly(backSource, scaleDownTo = 0.88f)
                 ) {
                     Icon(
@@ -4900,36 +5065,39 @@ private fun CloudTitleInfoPage(
                 contentColor = OneUiTextPrimary,
                 scrimColor = Color.Black.copy(alpha = 0.55f)
             ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 420.dp)
-                        .verticalScroll(rememberScrollState())
-                        .padding(start = 20.dp, end = 20.dp, bottom = 26.dp)
-                ) {
-                    Text(
-                        text = "Season ${sheet.season} · Episode ${sheet.episode.number}",
-                        fontSize = 11.sp,
-                        color = OneUiTextSecondary,
-                        maxLines = 1
-                    )
-                    Text(
-                        text = sheet.episode.name,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = OneUiTextPrimary,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(top = 2.dp)
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-                    InfoCopyList(
-                        files = sheet.episode.copies,
-                        autoPlayId = sheet.episode.file?.stableId,
-                        resumeByCopy = resumeByCopy
-                    ) { file ->
-                        copiesSheet = null
-                        playCopy(file)
+                FrostedModalPanel {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .physicsBounceOverscroll()
+                            .heightIn(max = 420.dp)
+                            .verticalScroll(rememberScrollState())
+                            .padding(start = 20.dp, end = 20.dp, bottom = 26.dp)
+                    ) {
+                        Text(
+                            text = "Season ${sheet.season} · Episode ${sheet.episode.number}",
+                            fontSize = 11.sp,
+                            color = OneUiTextSecondary,
+                            maxLines = 1
+                        )
+                        Text(
+                            text = sheet.episode.name,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = OneUiTextPrimary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 2.dp)
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        InfoCopyList(
+                            files = sheet.episode.copies,
+                            autoPlayId = sheet.episode.file?.stableId,
+                            resumeByCopy = resumeByCopy
+                        ) { file ->
+                            copiesSheet = null
+                            playCopy(file)
+                        }
                     }
                 }
             }
@@ -5112,7 +5280,10 @@ private fun InfoSeasonRail(detail: TitleDetail, selected: Int, onSelect: (Int) -
                             color = OneUiTextPrimary,
                             shape = RoundedCornerShape(10.dp)
                         )
-                        .jellyClick(interactionSource = null, indication = null) { onSelect(seasonCard.number) }
+                        .jellyClick(interactionSource = null, indication = null) {
+                            AppHaptics.tick()
+                            onSelect(seasonCard.number)
+                        }
                 )
                 Text(
                     text = "Season ${seasonCard.number}",
@@ -5282,7 +5453,10 @@ private fun InfoEpisodeRow(
                 if (hasCopies) {
                     Box(
                         modifier = Modifier
-                            .jellyClick(interactionSource = null, indication = null) { onShowCopies(row) }
+                            .jellyClick(interactionSource = null, indication = null) {
+                                AppHaptics.click()
+                                onShowCopies(row)
+                            }
                             .border(1.dp, OneUiTextSecondary.copy(alpha = 0.55f), RoundedCornerShape(4.dp))
                             .padding(horizontal = 6.dp, vertical = 2.dp)
                     ) {
@@ -5352,7 +5526,10 @@ private fun InfoCopyRow(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .jellyClick(interactionSource = null, indication = null) { onPlay(file) }
+            .jellyClick(interactionSource = null, indication = null) {
+                AppHaptics.click()
+                onPlay(file)
+            }
     ) {
         Box(
             contentAlignment = Alignment.Center,
@@ -5451,7 +5628,7 @@ private fun ArtSlot(art: Bitmap?, contentDescription: String?, modifier: Modifie
 
 /** One catalogue image, decoded down before it reaches the screen. Null until it lands, or if it never does. */
 @Composable
-private fun rememberCachedArt(url: String?, targetWidthPx: Int): Bitmap? {
+internal fun rememberCachedArt(url: String?, targetWidthPx: Int): Bitmap? {
     val context = LocalContext.current
     var bitmap by remember(url) { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(url) {
@@ -5469,7 +5646,7 @@ private fun rememberCachedArt(url: String?, targetWidthPx: Int): Bitmap? {
  * open and it is open because somebody asked for it.
  */
 @Composable
-private fun TitleDetailFetch(providerId: Int?, isSeries: Boolean, prefsStore: ArcPreferencesStore): TitleDetail? {
+internal fun TitleDetailFetch(providerId: Int?, isSeries: Boolean, prefsStore: ArcPreferencesStore): TitleDetail? {
     LaunchedEffect(providerId, isSeries) {
         val id = providerId ?: return@LaunchedEffect
         if (prefsStore.titleDetails.containsKey(titleDetailKey(id, isSeries))) return@LaunchedEffect
@@ -5812,14 +5989,18 @@ private fun cloudCodeLabel(hint: CodeHint?): String = when {
 }
 
 @Composable
-private fun MenuTabContent(
+private fun SettingsContent(
     snapshot: MediaLibrarySnapshot,
     prefsStore: ArcPreferencesStore,
+    repository: CloudRepository,
+    onManageCollection: () -> Unit,
     gridState: LazyGridState,
     topPadding: Dp,
     bottomPadding: Dp
 ) {
     val totalBytes = remember(snapshot.videos) { snapshot.videos.sumOf { it.sizeBytes } }
+    val authState by repository.authState.collectAsState()
+    val connected = authState.stage == CloudAuthStage.AUTHORIZED
 
     LazyVerticalGrid(
         state = gridState,
@@ -5827,17 +6008,30 @@ private fun MenuTabContent(
         userScrollEnabled = false,
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(
-            start = 16.dp,
-            end = 16.dp,
-            top = topPadding + 6.dp,
+            start = 24.dp,
+            end = 24.dp,
+            top = topPadding + 16.dp,
             bottom = bottomPadding
         ),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
+        item(key = "settings_telegram") {
+            Surface(
+                shape = RoundedCornerShape(32.dp),
+                color = OneUiCardSurface,
+                modifier = Modifier.fillMaxWidth().jellyClick(onClick = onManageCollection)
+            ) {
+                Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Telegram collection", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                    Text(if (connected) "Connected · Manage your collection" else "Connect your account",
+                        fontSize = 14.sp, color = OneUiTextSecondary)
+                }
+            }
+        }
         item(key = "menu_library_overview") {
             Surface(
                 shape = RoundedCornerShape(24.dp),
-                color = Color.White,
+                color = OneUiCardSurface,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(20.dp)) {
@@ -5860,7 +6054,7 @@ private fun MenuTabContent(
         item(key = "menu_playback_settings") {
             Surface(
                 shape = RoundedCornerShape(24.dp),
-                color = Color.White,
+                color = OneUiCardSurface,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -5913,13 +6107,13 @@ private fun MenuTabContent(
                                 Surface(
                                     onClick = { prefsStore.updateGridColumns(cols) },
                                     shape = RoundedCornerShape(14.dp),
-                                    color = if (selected) OneUiTextPrimary else OneUiPillSelected
+                                    color = if (selected) OneUiSelectedFill else OneUiPillSelected
                                 ) {
                                     Text(
                                         text = "$cols",
                                         fontSize = 13.sp,
                                         fontWeight = FontWeight.SemiBold,
-                                        color = if (selected) Color.White else OneUiTextPrimary,
+                                        color = if (selected) OneUiOnSelectedFill else OneUiTextPrimary,
                                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
                                     )
                                 }
@@ -5938,7 +6132,75 @@ private fun MenuTabContent(
                             fontWeight = FontWeight.Medium
                         )
                         TextButton(onClick = { prefsStore.clearWatchHistory() }) {
-                            Text("Clear History", color = OneUiBadgeOrange)
+                            Text("Clear History", color = OneUiDestructive)
+                        }
+                    }
+                }
+            }
+        }
+
+        item(key = "menu_touch_feedback") {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = OneUiCardSurface,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Text(
+                        text = "Touch Feedback",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = OneUiTextPrimary
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Haptic Feedback", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text("A knock when a control is pressed, a heavier one when something is deleted",
+                                fontSize = 12.sp, color = OneUiTextSecondary)
+                        }
+                        Switch(
+                            checked = prefsStore.hapticsEnabled,
+                            onCheckedChange = {
+                                prefsStore.updateHaptics(it)
+                                AppHaptics.toggle(it)
+                            }
+                        )
+                    }
+
+                    AnimatedVisibility(visible = prefsStore.hapticsEnabled) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Intensity", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                HapticIntensity.entries.forEach { level ->
+                                    val selected = prefsStore.hapticIntensity == level
+                                    Surface(
+                                        // Choosing a strength you cannot feel is a guess, so picking one plays it.
+                                        onClick = {
+                                            prefsStore.updateHapticIntensity(level)
+                                            AppHaptics.preview(level)
+                                        },
+                                        shape = RoundedCornerShape(14.dp),
+                                        color = if (selected) OneUiSelectedFill else OneUiPillSelected
+                                    ) {
+                                        Text(
+                                            text = level.label,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = if (selected) OneUiOnSelectedFill else OneUiTextPrimary,
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -5948,7 +6210,7 @@ private fun MenuTabContent(
         item(key = "menu_data_sources") {
             Surface(
                 shape = RoundedCornerShape(24.dp),
-                color = Color.White,
+                color = OneUiCardSurface,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -6265,7 +6527,7 @@ private fun VideoFolderCard(
             .background(OneUiPlaceholderGray)
             .border(
                 width = 0.5.dp,
-                color = Color.Black.copy(alpha = 0.08f),
+                color = Color.White.copy(alpha = 0.08f),
                 shape = CardCornerShape
             )
             .combinedClickable(
@@ -6316,7 +6578,7 @@ private fun VideoFolderCard(
                         modifier = Modifier
                             .size(6.dp)
                             .clip(CircleShape)
-                            .background(OneUiBadgeOrange)
+                            .background(OneUiAccent)
                     )
                 }
             }
@@ -6406,7 +6668,7 @@ private fun VideoFileCard(
             .background(OneUiPlaceholderGray)
             .border(
                 width = 0.5.dp,
-                color = Color.Black.copy(alpha = 0.08f),
+                color = Color.White.copy(alpha = 0.08f),
                 shape = CardCornerShape
             )
             .combinedClickable(
@@ -6428,7 +6690,7 @@ private fun VideoFileCard(
             Icon(
                 imageVector = Icons.Default.Favorite,
                 contentDescription = "Favorite",
-                tint = OneUiBadgeOrange,
+                tint = OneUiAccent,
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(top = 8.dp, start = 8.dp)
@@ -6491,7 +6753,7 @@ private fun VideoFileCard(
                     modifier = Modifier
                         .fillMaxHeight()
                         .fillMaxWidth(watchProgressFraction)
-                        .background(OneUiBadgeOrange)
+                        .background(OneUiAccent)
                 )
             }
         }
@@ -6574,7 +6836,7 @@ private fun TitleWordmark(wordmark: Bitmap, modifier: Modifier = Modifier) {
     )
 }
 
-@OptIn(ExperimentalSharedTransitionApi::class)
+@OptIn(ExperimentalSharedTransitionApi::class, ExperimentalMaterial3Api::class)
 @Composable
 private fun HeroVlcVideoPlayerScreen(
     playback: ActiveVideoPlayback,
@@ -6618,6 +6880,7 @@ private fun HeroVlcVideoPlayerScreen(
     var showControls by remember { mutableStateOf(true) }
     var isControlsLocked by remember { mutableStateOf(false) }
     var showTracksSheet by remember { mutableStateOf(false) }
+    var expandedPlayerTools by remember { mutableStateOf(false) }
     var scaleMode by remember { mutableStateOf(VideoScaleMode.FIT) }
     var gestureHudText by remember { mutableStateOf<String?>(null) }
     var gestureHudSticky by remember { mutableStateOf(false) }
@@ -6625,8 +6888,14 @@ private fun HeroVlcVideoPlayerScreen(
     var isBoostGauge by remember { mutableStateOf(false) }
     var scrubFraction by remember { mutableStateOf<Float?>(null) }
 
+    /** Where the last scrub tick was felt, as a fraction of the run. */
+    var lastScrubTick by remember { mutableFloatStateOf(0f) }
+
     /** Seconds left on the next-up card. Zero means nothing is being offered. */
     var nextUpSeconds by remember { mutableStateOf(0) }
+
+    /** The next-up card up before the end, with no countdown: offered, not imminent. */
+    var nextUpEarly by remember { mutableStateOf(false) }
 
     /** The part whose offer the viewer turned down; asking again for the same one would be nagging. */
     var declinedPartId by remember { mutableStateOf<Long?>(null) }
@@ -6695,6 +6964,17 @@ private fun HeroVlcVideoPlayerScreen(
     // library, a search result — has no title to inherit and falls back to its file's card.
     val titleCard = playback.titleCard ?: prefsStore.mediaCards[video.id]
     val wordmarkUrl = titleCard?.logoUrl?.takeIf { !isControlsLocked }
+    val parsedTitle = remember(video.title) { MediaNameParser.parse(video.title) }
+    val playerTitle = titleCard?.title ?: when (val guess = parsedTitle) {
+        is MediaGuess.Movie -> guess.title
+        is MediaGuess.Episode -> guess.series
+        is MediaGuess.Unnamed -> guess.fallback
+    }
+    val playerSubtitle = when (val guess = parsedTitle) {
+        is MediaGuess.Episode -> NextUp.labelFor(video.title)
+        is MediaGuess.Movie -> titleCard?.subtitle ?: guess.year?.toString()
+        is MediaGuess.Unnamed -> titleCard?.subtitle
+    }
 
     // Decoded here rather than inside the wordmark so the overlay knows whether the art has landed
     // yet, and can keep the spinner under it until it does instead of leaving a hole.
@@ -6873,6 +7153,14 @@ private fun HeroVlcVideoPlayerScreen(
             if (!stalled) {
                 stalledSinceMs = BufferGuard.NEVER
                 vlcEngine.isBuffering = false
+                // The line this loop put up describes a wait, so it goes when the wait does. Left up,
+                // it outlives the stall and sits over a film that is playing, with nothing on screen
+                // able to clear it short of opening another one.
+                if (admittedSlowly) {
+                    admittedSlowly = false
+                    gestureHudSticky = false
+                    gestureHudText = null
+                }
             } else {
                 if (stalledSinceMs == BufferGuard.NEVER) stalledSinceMs = now
                 vlcEngine.isBuffering = true
@@ -6889,7 +7177,8 @@ private fun HeroVlcVideoPlayerScreen(
                         bytesAhead = ahead,
                         restarts = restarts,
                         lastRestartMs = lastRestartMs,
-                        graceMs = BufferGuard.graceMs(guard)
+                        graceMs = BufferGuard.graceMs(guard),
+                        bytesToEof = (source.sizeBytes - headBytes).coerceAtLeast(0L)
                     )
                 ) {
                     val media = openedMedia
@@ -7028,6 +7317,24 @@ private fun HeroVlcVideoPlayerScreen(
 
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val navBarBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    val density = LocalDensity.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val controlsMargin = if (isLandscape) (configuration.screenWidthDp.dp * 0.085f).coerceAtMost(80.dp) else 24.dp
+    val layoutDirection = LocalLayoutDirection.current
+    val controlsLeft = maxOf(controlsMargin, with(density) { WindowInsets.safeDrawing.getLeft(this, layoutDirection).toDp() })
+    val controlsRight = maxOf(controlsMargin, with(density) { WindowInsets.safeDrawing.getRight(this, layoutDirection).toDp() })
+    val compactToolbar = configuration.screenWidthDp.dp - controlsLeft - controlsRight < 440.dp
+    var bottomControlsHeight by remember { mutableIntStateOf(0) }
+    var nextUpCardHeight by remember { mutableIntStateOf(0) }
+    val nextUpBottom = if (isLandscape) navBarBottom + (if (compactToolbar) 112.dp else 92.dp)
+        else with(density) { bottomControlsHeight.toDp() } + 12.dp
+    val centerControlsOffset = if (isLandscape) minOf(
+        0.dp,
+        configuration.screenHeightDp.dp / 2 - with(density) { bottomControlsHeight.toDp() } - 12.dp,
+        if (nextUpEarly || nextUpSeconds > 0) {
+            configuration.screenHeightDp.dp / 2 - nextUpBottom - with(density) { nextUpCardHeight.toDp() } - 48.dp
+        } else 0.dp
+    ) else 0.dp
 
     // The skip buttons walk the parts rather than the files: another upload of the film already
     // playing is not what a viewer means by "next", and the copy worth landing on is the best one
@@ -7081,6 +7388,38 @@ private fun HeroVlcVideoPlayerScreen(
         onSelectAdjacentVideo(upcoming)
     }
 
+    /**
+     * Puts that same skip in reach before the end instead of only at it.
+     *
+     * The last seconds of a cloud part are the ones that can die on the viewer: a tail the container
+     * will not parse reads exactly like a tail that never arrived, and neither the pump nor a re-open
+     * can tell those apart. Measured on the phone as a play head that stops at 23:38 of 23:48 with
+     * every remaining byte already on disk and three re-opens that produced no ticks at all. Waiting
+     * for an end report from a part like that means waiting forever, so from [NextUp.EARLY_OFFER_MS]
+     * out the card is simply up and the viewer decides.
+     *
+     * No countdown here. This is an offer, not a handover — the handover stays with the effect above,
+     * which only runs once the player has honestly reported the end.
+     */
+    LaunchedEffect(video.id, declinedPartId, nextVideo?.id) {
+        nextUpEarly = false
+        if (nextVideo == null || declinedPartId == video.id) return@LaunchedEffect
+        while (true) {
+            nextUpEarly = !vlcEngine.isAtEnd && nextUpSeconds == 0 && NextUp.withinEarlyWindow(
+                NextUp.Snapshot(
+                    lastShownMs = vlcEngine.resumablePositionMs,
+                    durationMs = vlcEngine.durationMs,
+                    // Deliberately not [VlcEngine.isBuffering]: the freeze this window exists for is
+                    // reported as buffering, and that is precisely when the way out has to stay up.
+                    waitingForBytes = vlcEngine.isSeekWaiting,
+                    knowsItsParts = playback.copySlots.isNotEmpty(),
+                    hasNextPart = hasNext
+                )
+            )
+            delay(1_000L)
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -7104,14 +7443,17 @@ private fun HeroVlcVideoPlayerScreen(
                                 gestureHudText = "Zoom 1.0x"
                             }
                             offset.x < width * 0.35f -> {
+                                AppHaptics.tick()
                                 vlcEngine.seekByDelta(-10_000L)
                                 gestureHudText = "-10s"
                             }
                             offset.x > width * 0.65f -> {
+                                AppHaptics.tick()
                                 vlcEngine.seekByDelta(10_000L)
                                 gestureHudText = "+10s"
                             }
                             else -> {
+                                AppHaptics.click()
                                 vlcEngine.togglePlayPause()
                             }
                         }
@@ -7400,7 +7742,7 @@ private fun HeroVlcVideoPlayerScreen(
                         text = gestureHudText.orEmpty(),
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = if (isBoostGauge) OneUiBadgeOrange else Color.White
+                        color = if (isBoostGauge) OneUiAccent else Color.White
                     )
                     gestureGaugeFraction?.let { frac ->
                         Spacer(modifier = Modifier.height(6.dp))
@@ -7415,7 +7757,7 @@ private fun HeroVlcVideoPlayerScreen(
                                 modifier = Modifier
                                     .fillMaxHeight()
                                     .fillMaxWidth(frac.coerceIn(0f, 1f))
-                                    .background(if (isBoostGauge) OneUiBadgeOrange else Color.White)
+                                    .background(if (isBoostGauge) OneUiAccent else Color.White)
                             )
                         }
                     }
@@ -7443,7 +7785,7 @@ private fun HeroVlcVideoPlayerScreen(
                     Icon(
                         imageVector = Icons.Default.Lock,
                         contentDescription = "Unlock controls",
-                        tint = OneUiBadgeOrange,
+                        tint = OneUiAccent,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
@@ -7464,127 +7806,56 @@ private fun HeroVlcVideoPlayerScreen(
             modifier = Modifier.fillMaxSize()
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
-                Column(
+                Row(
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
                         .align(Alignment.TopCenter)
                         .background(
                             Brush.verticalGradient(
-                                listOf(Color.Black.copy(alpha = 0.72f), Color.Transparent)
+                                listOf(Color.Black.copy(alpha = 0.5f), Color.Transparent)
                             )
                         )
                         .padding(
-                            top = statusBarTop + 6.dp,
-                            bottom = 16.dp,
-                            start = 8.dp,
-                            end = 12.dp
+                            start = controlsLeft,
+                            end = controlsRight,
+                            top = statusBarTop + 12.dp,
+                            bottom = 36.dp
                         )
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        IconButton(
-                            onClick = {
-                                android.util.Log.i("ArcPlayer", "player closed: back arrow")
-                                if (!prefsStore.backgroundAudioEnabled) {
-                                    vlcEngine.pause()
-                                }
-                                onDismiss()
-                            }
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Close player",
-                                tint = Color.White,
-                                modifier = Modifier.size(24.dp)
-                            )
-                        }
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = video.title,
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = Color.White,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = "${video.folderName} • LibVLC",
-                                fontSize = 11.sp,
-                                color = Color.White.copy(alpha = 0.72f),
-                                maxLines = 1
-                            )
-                        }
-
-                        val isFav = prefsStore.favoriteIds.contains(video.id)
-                        IconButton(onClick = { prefsStore.toggleFavorite(video.id) }) {
-                            Icon(
-                                imageVector = if (isFav) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                                contentDescription = "Favorite",
-                                tint = if (isFav) OneUiBadgeOrange else Color.White,
-                                modifier = Modifier.size(22.dp)
-                            )
-                        }
+                    val isFav = prefsStore.favoriteIds.contains(video.id)
+                    IconButton(onClick = {
+                        AppHaptics.favorite(!isFav)
+                        prefsStore.toggleFavorite(video.id)
+                    }) {
+                        Icon(
+                            imageVector = if (isFav) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                            contentDescription = if (isFav) "Remove from favorites" else "Add to favorites",
+                            tint = if (isFav) OneUiAccent else Color.White,
+                            modifier = Modifier.size(24.dp)
+                        )
                     }
-
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState())
-                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    IconButton(onClick = { isControlsLocked = true }) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "Lock controls",
+                            tint = Color.White,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            android.util.Log.i("ArcPlayer", "player closed: back arrow")
+                            if (!prefsStore.backgroundAudioEnabled) vlcEngine.pause()
+                            onDismiss()
+                        }
                     ) {
-                        PlayerChipButton(
-                            text = String.format(Locale.US, "%.2gx", vlcEngine.playbackRate),
-                            onClick = {
-                                val nextIdx = (SpeedPresets.indexOf(vlcEngine.playbackRate) + 1) % SpeedPresets.size
-                                val nextRate = SpeedPresets[nextIdx]
-                                vlcEngine.setSpeed(nextRate)
-                                prefsStore.updateDefaultSpeed(nextRate)
-                            }
-                        )
-
-                        PlayerChipButton(
-                            text = "Tracks & Subs",
-                            onClick = { showTracksSheet = !showTracksSheet }
-                        )
-
-                        PlayerChipButton(
-                            text = scaleMode.label,
-                            onClick = {
-                                scaleMode = VideoScaleMode.entries[(scaleMode.ordinal + 1) % VideoScaleMode.entries.size]
-                            }
-                        )
-
-                        PlayerChipButton(
-                            text = "Rotate",
-                            onClick = {
-                                val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-                                activity?.requestedOrientation = if (isLandscape) {
-                                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                                } else {
-                                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                                }
-                            }
-                        )
-
-                        PlayerChipButton(
-                            text = "PiP",
-                            onClick = {
-                                runCatching {
-                                    val params = PictureInPictureParams.Builder()
-                                        .setAspectRatio(Rational(16, 9))
-                                        .build()
-                                    activity?.enterPictureInPictureMode(params)
-                                }
-                            }
-                        )
-
-                        PlayerChipButton(
-                            text = "Lock",
-                            onClick = { isControlsLocked = true }
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Close player",
+                            tint = Color.White,
+                            modifier = Modifier.size(26.dp)
                         )
                     }
                 }
@@ -7593,84 +7864,81 @@ private fun HeroVlcVideoPlayerScreen(
                     visible = !isWaitingForPicture,
                     enter = fadeIn(tween(180)),
                     exit = fadeOut(tween(150)),
-                    modifier = Modifier.align(Alignment.Center)
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .offset(y = centerControlsOffset)
+                        .padding(horizontal = 24.dp)
+                        .widthIn(max = 560.dp)
+                        .fillMaxWidth()
                 ) {
                     Row(
-                        horizontalArrangement = Arrangement.spacedBy(18.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        PlayerCircleIconButton(
-                            size = 46.dp,
+                        PlayerControlButton(
+                            contentDescription = "Previous episode or video",
                             enabled = hasPrevious,
                             onClick = { previousVideo?.let(onSelectAdjacentVideo) }
                         ) {
                             SkipIconCanvas(isNext = false, enabled = hasPrevious)
                         }
-
-                        PlayerCircleIconButton(
-                            size = 50.dp,
+                        PlayerControlButton(
+                            contentDescription = "Rewind 10 seconds",
+                            size = 56.dp,
                             onClick = {
                                 vlcEngine.seekByDelta(-10_000L)
                                 gestureHudText = "-10s"
                             }
                         ) {
-                            Text(
-                                text = "-10",
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            )
+                            PlayerSeekIcon(forward = false)
                         }
-
-                        PlayerCircleIconButton(
-                            size = 68.dp,
-                            onClick = { vlcEngine.togglePlayPause() }
+                        PlayerControlButton(
+                            contentDescription = if (vlcEngine.isPlaying) "Pause" else "Play",
+                            size = 72.dp,
+                            onClick = {
+                                AppHaptics.click()
+                                vlcEngine.togglePlayPause()
+                            }
                         ) {
                             if (vlcEngine.isPlaying) {
-                                Canvas(modifier = Modifier.size(24.dp)) {
-                                    val barW = size.width * 0.24f
-                                    val barH = size.height * 0.78f
+                                Canvas(modifier = Modifier.size(42.dp)) {
+                                    val barW = size.width * 0.25f
+                                    val barH = size.height * 0.8f
                                     val top = (size.height - barH) / 2f
                                     drawRoundRect(
                                         color = Color.White,
-                                        topLeft = Offset(size.width * 0.16f, top),
+                                        topLeft = Offset(size.width * 0.13f, top),
                                         size = ComposeSize(barW, barH),
-                                        cornerRadius = CornerRadius(barW / 2f, barW / 2f)
+                                        cornerRadius = CornerRadius(3.dp.toPx())
                                     )
                                     drawRoundRect(
                                         color = Color.White,
-                                        topLeft = Offset(size.width * 0.60f, top),
+                                        topLeft = Offset(size.width * 0.62f, top),
                                         size = ComposeSize(barW, barH),
-                                        cornerRadius = CornerRadius(barW / 2f, barW / 2f)
+                                        cornerRadius = CornerRadius(3.dp.toPx())
                                     )
                                 }
                             } else {
                                 Icon(
                                     imageVector = Icons.Default.PlayArrow,
-                                    contentDescription = "Play",
+                                    contentDescription = null,
                                     tint = Color.White,
-                                    modifier = Modifier.size(36.dp)
+                                    modifier = Modifier.size(52.dp)
                                 )
                             }
                         }
-
-                        PlayerCircleIconButton(
-                            size = 50.dp,
+                        PlayerControlButton(
+                            contentDescription = "Forward 10 seconds",
+                            size = 56.dp,
                             onClick = {
                                 vlcEngine.seekByDelta(10_000L)
                                 gestureHudText = "+10s"
                             }
                         ) {
-                            Text(
-                                text = "+10",
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            )
+                            PlayerSeekIcon(forward = true)
                         }
-
-                        PlayerCircleIconButton(
-                            size = 46.dp,
+                        PlayerControlButton(
+                            contentDescription = "Next episode or video",
                             enabled = hasNext,
                             onClick = { nextVideo?.let(onSelectAdjacentVideo) }
                         ) {
@@ -7683,80 +7951,224 @@ private fun HeroVlcVideoPlayerScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .align(Alignment.BottomCenter)
+                        .onSizeChanged { bottomControlsHeight = it.height }
                         .background(
                             Brush.verticalGradient(
-                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.72f))
+                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.78f))
                             )
                         )
                         .padding(
-                            start = 20.dp,
-                            end = 20.dp,
-                            top = 16.dp,
-                            bottom = navBarBottom + 20.dp
+                            start = controlsLeft,
+                            end = controlsRight,
+                            top = 36.dp,
+                            bottom = navBarBottom + 12.dp
                         )
                 ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(
+                            if (isLandscape && (nextUpEarly || nextUpSeconds > 0)) 0.48f else 1f
+                        )
+                    ) {
+                        Text(
+                            text = playerTitle,
+                            fontSize = 24.sp,
+                            lineHeight = 28.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (!playerSubtitle.isNullOrBlank()) {
+                            Text(
+                                text = playerSubtitle,
+                                fontSize = 13.sp,
+                                lineHeight = 18.sp,
+                                color = Color.White.copy(alpha = 0.72f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
                     Slider(
-                        // The drag owns the thumb until the finger lifts. Seeking per frame would
-                        // fight the play head, which keeps snapping the value back, and would leave
-                        // a half dozen download windows pointing at every part of the film the
-                        // gesture swept over.
                         value = scrubFraction
                             ?: (vlcEngine.currentPositionMs.toFloat() / vlcEngine.durationMs.coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f),
-                        onValueChange = { fraction -> scrubFraction = fraction },
+                        onValueChange = { fraction ->
+                            scrubFraction = fraction
+                            // A tick every 3.5% of the run. Denser than that and a long drag buzzes
+                            // instead of ratcheting, which is the one thing that tells a finger how far
+                            // it has travelled without the viewer reading a number.
+                            if (abs(fraction - lastScrubTick) >= 0.035f) {
+                                lastScrubTick = fraction
+                                AppHaptics.tick()
+                            }
+                        },
                         onValueChangeFinished = {
                             val fraction = scrubFraction
                             scrubFraction = null
                             if (fraction != null) {
+                                AppHaptics.click()
                                 vlcEngine.seekTo((fraction * vlcEngine.durationMs).toLong())
                             }
                         },
-                        colors = SliderDefaults.colors(
-                            thumbColor = Color.White,
-                            activeTrackColor = Color.White,
-                            inactiveTrackColor = Color.White.copy(alpha = 0.3f)
-                        )
+                        thumb = { Spacer(modifier = Modifier.size(12.dp)) },
+                        track = { slider ->
+                            Canvas(modifier = Modifier.fillMaxWidth().height(12.dp)) {
+                                val playedEnd = Offset(size.width * slider.value, center.y)
+                                drawLine(
+                                    color = Color.White.copy(alpha = 0.32f),
+                                    start = Offset(0f, center.y),
+                                    end = Offset(size.width, center.y),
+                                    strokeWidth = 3.dp.toPx(),
+                                    cap = StrokeCap.Round
+                                )
+                                drawLine(
+                                    color = Color.White,
+                                    start = Offset(0f, center.y),
+                                    end = playedEnd,
+                                    strokeWidth = 3.dp.toPx(),
+                                    cap = StrokeCap.Round
+                                )
+                                if (scrubFraction != null) {
+                                    drawCircle(Color.White, radius = 6.dp.toPx(), center = playedEnd)
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(36.dp)
+                            .semantics { contentDescription = "Playback position" }
                     )
+                    val timeText = "${formatDuration(scrubFraction?.let { (it * vlcEngine.durationMs).toLong() } ?: vlcEngine.currentPositionMs)} / ${formatDuration(vlcEngine.durationMs)}"
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
+                        Row(
+                            modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            PlayerControlButton(
+                                contentDescription = "Tracks & Subs",
+                                onClick = { showTracksSheet = !showTracksSheet }
+                            ) {
+                                PlayerToolIcon(PlayerTool.TRACKS)
+                            }
+                            PlayerControlButton(
+                                contentDescription = "Playback speed: ${String.format(Locale.US, "%.2gx", vlcEngine.playbackRate)}",
+                                onClick = {
+                                    val nextIdx = (SpeedPresets.indexOf(vlcEngine.playbackRate) + 1) % SpeedPresets.size
+                                    val nextRate = SpeedPresets[nextIdx]
+                                    vlcEngine.setSpeed(nextRate)
+                                    prefsStore.updateDefaultSpeed(nextRate)
+                                }
+                            ) {
+                                Text(
+                                    text = String.format(Locale.US, "%.2gx", vlcEngine.playbackRate),
+                                    color = Color.White,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                            PlayerControlButton(
+                                contentDescription = "Video size: ${scaleMode.label}",
+                                onClick = {
+                                    scaleMode = VideoScaleMode.entries[(scaleMode.ordinal + 1) % VideoScaleMode.entries.size]
+                                    gestureHudText = scaleMode.label
+                                }
+                            ) {
+                                PlayerToolIcon(PlayerTool.FIT)
+                            }
+                            AnimatedVisibility(
+                                visible = expandedPlayerTools,
+                                enter = expandHorizontally(tween(200)) + fadeIn(tween(160)),
+                                exit = shrinkHorizontally(tween(200)) + fadeOut(tween(120))
+                            ) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    PlayerControlButton(
+                                        contentDescription = "Rotate",
+                                        onClick = {
+                                            activity?.requestedOrientation = if (isLandscape) {
+                                                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                            } else {
+                                                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                                            }
+                                        }
+                                    ) {
+                                        PlayerToolIcon(PlayerTool.ROTATE)
+                                    }
+                                    PlayerControlButton(
+                                        contentDescription = "Picture in picture",
+                                        onClick = {
+                                            runCatching {
+                                                val params = PictureInPictureParams.Builder()
+                                                    .setAspectRatio(Rational(16, 9))
+                                                    .build()
+                                                activity?.enterPictureInPictureMode(params)
+                                            }
+                                        }
+                                    ) {
+                                        PlayerToolIcon(PlayerTool.PIP)
+                                    }
+                                }
+                            }
+                            PlayerControlButton(
+                                contentDescription = if (expandedPlayerTools) "Collapse controls" else "Expand controls",
+                                onClick = { expandedPlayerTools = !expandedPlayerTools }
+                            ) {
+                                Canvas(modifier = Modifier.size(22.dp)) {
+                                    val direction = if (expandedPlayerTools) -1f else 1f
+                                    val path = androidx.compose.ui.graphics.Path().apply {
+                                        moveTo(center.x - direction * size.width * 0.15f, size.height * 0.25f)
+                                        lineTo(center.x + direction * size.width * 0.15f, center.y)
+                                        lineTo(center.x - direction * size.width * 0.15f, size.height * 0.75f)
+                                    }
+                                    drawPath(path, Color.White, style = Stroke(2.dp.toPx(), cap = StrokeCap.Round))
+                                }
+                            }
+                        }
+                        if (!compactToolbar) {
+                            Text(
+                                text = timeText,
+                                fontSize = 14.sp,
+                                color = Color.White.copy(alpha = 0.85f),
+                                modifier = Modifier.padding(start = 16.dp)
+                            )
+                        }
+                    }
+                    if (compactToolbar) {
                         Text(
-                            text = formatDuration(
-                                scrubFraction?.let { (it * vlcEngine.durationMs).toLong() }
-                                    ?: vlcEngine.currentPositionMs
-                            ),
-                            fontSize = 12.sp,
-                            color = Color.White.copy(alpha = 0.88f)
-                        )
-                        Text(
-                            text = formatDuration(vlcEngine.durationMs),
-                            fontSize = 12.sp,
-                            color = Color.White.copy(alpha = 0.88f)
+                            text = timeText,
+                            fontSize = 13.sp,
+                            color = Color.White.copy(alpha = 0.85f),
+                            modifier = Modifier.align(Alignment.End)
                         )
                     }
                 }
             }
         }
 
-        // Rests above the scrubber rather than beside it: the transport row is the widest thing the
-        // player draws at the bottom, and on a phone held sideways the two would overlap if this came
-        // in on the same band.
         AnimatedVisibility(
-            visible = nextUpSeconds > 0 && !isInPipMode && !isControlsLocked,
+            visible = (nextUpSeconds > 0 || nextUpEarly) && !isInPipMode && !isControlsLocked,
             enter = fadeIn(tween(160)) + slideInVertically(tween(200)) { it / 2 },
             exit = fadeOut(tween(140)),
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = 20.dp, bottom = navBarBottom + 112.dp)
+                .padding(
+                    start = controlsLeft,
+                    end = controlsRight,
+                    bottom = nextUpBottom
+                )
+                .then(if (isLandscape) Modifier.fillMaxWidth(0.48f) else Modifier)
         ) {
             nextVideo?.let { upcoming ->
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     color = Color.Black.copy(alpha = 0.78f),
                     border = BorderStroke(1.dp, Color.White.copy(alpha = 0.16f)),
-                    // The two actions set the floor here, so the caption is what has to give: without a
-                    // cap the row pushed the second button off a portrait phone's edge.
-                    modifier = Modifier.widthIn(max = 320.dp)
+                    modifier = Modifier
+                        .widthIn(max = 320.dp)
+                        .onSizeChanged { nextUpCardHeight = it.height }
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -7764,7 +8176,9 @@ private fun HeroVlcVideoPlayerScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f, fill = false)) {
                             Text(
-                                text = "Next up in ${nextUpSeconds}s",
+                                // Counting down means the player reached the end and this will hand over
+                                // by itself; without a number it is only being offered.
+                                text = if (nextUpSeconds > 0) "Next up in ${nextUpSeconds}s" else "Next up",
                                 fontSize = 11.sp,
                                 color = Color.White.copy(alpha = 0.66f)
                             )
@@ -7782,6 +8196,7 @@ private fun HeroVlcVideoPlayerScreen(
                             text = "Play now",
                             onClick = {
                                 nextUpSeconds = 0
+                                nextUpEarly = false
                                 declinedPartId = null
                                 onSelectAdjacentVideo(upcoming)
                             }
@@ -7792,6 +8207,7 @@ private fun HeroVlcVideoPlayerScreen(
                             onClick = {
                                 declinedPartId = video.id
                                 nextUpSeconds = 0
+                                nextUpEarly = false
                             }
                         )
                     }
@@ -7978,8 +8394,9 @@ private fun PlayerChipButton(
 }
 
 @Composable
-private fun PlayerCircleIconButton(
-    size: Dp,
+private fun PlayerControlButton(
+    contentDescription: String,
+    size: Dp = 48.dp,
     enabled: Boolean = true,
     onClick: () -> Unit,
     content: @Composable () -> Unit
@@ -7988,11 +8405,125 @@ private fun PlayerCircleIconButton(
         onClick = onClick,
         enabled = enabled,
         shape = CircleShape,
-        color = Color.Black.copy(alpha = if (enabled) 0.55f else 0.25f),
-        modifier = Modifier.size(size)
+        color = Color.Transparent,
+        modifier = Modifier
+            .size(size)
+            .semantics(mergeDescendants = true) { this.contentDescription = contentDescription }
     ) {
         Box(contentAlignment = Alignment.Center) {
             content()
+        }
+    }
+}
+
+@Composable
+private fun PlayerSeekIcon(forward: Boolean) {
+    Box(modifier = Modifier.size(34.dp), contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = if (forward) -1f else 1f }) {
+            drawArc(
+                color = Color.White,
+                startAngle = -90f,
+                sweepAngle = 290f,
+                useCenter = false,
+                topLeft = Offset(size.width * 0.12f, size.height * 0.22f),
+                size = ComposeSize(size.width * 0.76f, size.height * 0.72f),
+                style = Stroke(2.3.dp.toPx(), cap = StrokeCap.Round)
+            )
+            val arrow = androidx.compose.ui.graphics.Path().apply {
+                moveTo(size.width * 0.27f, size.height * 0.22f)
+                lineTo(size.width * 0.53f, size.height * 0.02f)
+                lineTo(size.width * 0.53f, size.height * 0.42f)
+                close()
+            }
+            drawPath(arrow, Color.White)
+        }
+        Text(
+            text = "10",
+            color = Color.White,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.offset(y = 4.dp)
+        )
+    }
+}
+
+private enum class PlayerTool { TRACKS, FIT, ROTATE, PIP }
+
+@Composable
+private fun PlayerToolIcon(tool: PlayerTool) {
+    Box(modifier = Modifier.size(24.dp), contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+            val stroke = Stroke(1.8.dp.toPx(), cap = StrokeCap.Round)
+            when (tool) {
+                PlayerTool.TRACKS -> drawRoundRect(
+                    color = Color.White,
+                    topLeft = Offset(w * 0.04f, h * 0.12f),
+                    size = ComposeSize(w * 0.92f, h * 0.76f),
+                    cornerRadius = CornerRadius(4.dp.toPx()),
+                    style = stroke
+                )
+                PlayerTool.FIT -> {
+                    val path = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(w * 0.34f, h * 0.14f)
+                        lineTo(w * 0.08f, h * 0.14f)
+                        lineTo(w * 0.08f, h * 0.4f)
+                        moveTo(w * 0.66f, h * 0.14f)
+                        lineTo(w * 0.92f, h * 0.14f)
+                        lineTo(w * 0.92f, h * 0.4f)
+                        moveTo(w * 0.08f, h * 0.6f)
+                        lineTo(w * 0.08f, h * 0.86f)
+                        lineTo(w * 0.34f, h * 0.86f)
+                        moveTo(w * 0.66f, h * 0.86f)
+                        lineTo(w * 0.92f, h * 0.86f)
+                        lineTo(w * 0.92f, h * 0.6f)
+                    }
+                    drawPath(path, Color.White, style = stroke)
+                }
+                PlayerTool.ROTATE -> {
+                    drawRoundRect(
+                        color = Color.White,
+                        topLeft = Offset(w * 0.32f, h * 0.21f),
+                        size = ComposeSize(w * 0.36f, h * 0.58f),
+                        cornerRadius = CornerRadius(2.dp.toPx()),
+                        style = stroke
+                    )
+                    val path = androidx.compose.ui.graphics.Path().apply {
+                        moveTo(w * 0.1f, h * 0.57f)
+                        lineTo(w * 0.1f, h * 0.1f)
+                        lineTo(w * 0.59f, h * 0.1f)
+                        moveTo(w * 0.47f, 0f)
+                        lineTo(w * 0.59f, h * 0.1f)
+                        lineTo(w * 0.47f, h * 0.22f)
+                        moveTo(w * 0.9f, h * 0.43f)
+                        lineTo(w * 0.9f, h * 0.9f)
+                        lineTo(w * 0.41f, h * 0.9f)
+                        moveTo(w * 0.53f, h * 0.78f)
+                        lineTo(w * 0.41f, h * 0.9f)
+                        lineTo(w * 0.53f, h)
+                    }
+                    drawPath(path, Color.White, style = stroke)
+                }
+                PlayerTool.PIP -> {
+                    drawRoundRect(
+                        color = Color.White,
+                        topLeft = Offset(w * 0.04f, h * 0.12f),
+                        size = ComposeSize(w * 0.92f, h * 0.76f),
+                        cornerRadius = CornerRadius(2.dp.toPx()),
+                        style = stroke
+                    )
+                    drawRoundRect(
+                        color = Color.White,
+                        topLeft = Offset(w * 0.5f, h * 0.48f),
+                        size = ComposeSize(w * 0.32f, h * 0.26f),
+                        cornerRadius = CornerRadius(1.dp.toPx())
+                    )
+                }
+            }
+        }
+        if (tool == PlayerTool.TRACKS) {
+            Text("CC", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -8253,15 +8784,16 @@ private fun OneUiFloatingBottomBar(
     BoxWithConstraints(
         modifier = modifier
             .fillMaxWidth()
-            .height(64.dp)
-            .clip(RoundedCornerShape(32.dp))
+            .height(70.dp)
+            .clip(RoundedCornerShape(35.dp))
             .jellyGlass(
                 hazeState = hazeState,
                 backdrop = backdrop,
                 tintTransparency = 0.4f,
                 noiseFactor = 0.06f,
-                shape = RoundedCornerShape(32.dp)
+                shape = RoundedCornerShape(35.dp)
             )
+            .border(1.dp, Color.White.copy(alpha = 0.5f), RoundedCornerShape(35.dp))
             .padding(horizontal = 6.dp, vertical = 5.dp)
     ) {
             val tabCount = BottomNavTab.entries.size
@@ -8297,12 +8829,17 @@ private fun OneUiFloatingBottomBar(
                     Box(
                         modifier = Modifier
                             .weight(1f)
-                            .height(54.dp)
+                            .height(60.dp)
+                            .semantics(mergeDescendants = true) { selected = isSelected }
                             .jellyClick(
                                 interactionSource = remember { MutableInteractionSource() },
                                 indication = null,
-                                scaleDownTo = 0.92f,
-                                onClick = { onTabSelected(tab) }
+                                role = Role.Tab,
+                                scaleDownTo = 0.96f,
+                                onClick = {
+                                    AppHaptics.click()
+                                    onTabSelected(tab)
+                                }
                             ),
                         contentAlignment = Alignment.Center
                     ) {
@@ -8336,102 +8873,24 @@ private fun BottomBarTabIcon(
     selected: Boolean,
     modifier: Modifier = Modifier
 ) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        val stroke = Stroke(width = w * 0.085f, cap = StrokeCap.Round)
-        val color = OneUiTextPrimary
-
-        when (tab) {
-            BottomNavTab.VIDEOS -> {
-                drawRoundRect(
-                    color = color,
-                    topLeft = Offset(w * 0.12f, h * 0.16f),
-                    size = ComposeSize(w * 0.76f, h * 0.68f),
-                    cornerRadius = CornerRadius(w * 0.16f, w * 0.16f),
-                    style = if (selected) Stroke(width = w * 0.11f) else stroke
-                )
-                val path = androidx.compose.ui.graphics.Path().apply {
-                    moveTo(w * 0.42f, h * 0.35f)
-                    lineTo(w * 0.64f, h * 0.50f)
-                    lineTo(w * 0.42f, h * 0.65f)
-                    close()
-                }
-                drawPath(path = path, color = color)
-            }
-
-            BottomNavTab.FOLDERS -> {
-                if (selected) {
-                    drawRoundRect(
-                        color = color,
-                        topLeft = Offset(w * 0.14f, h * 0.14f),
-                        size = ComposeSize(w * 0.12f, h * 0.72f),
-                        cornerRadius = CornerRadius(w * 0.05f, w * 0.05f)
-                    )
-                    drawRoundRect(
-                        color = color,
-                        topLeft = Offset(w * 0.32f, h * 0.14f),
-                        size = ComposeSize(w * 0.54f, h * 0.72f),
-                        cornerRadius = CornerRadius(w * 0.14f, w * 0.14f)
-                    )
-                } else {
-                    drawRoundRect(
-                        color = color,
-                        topLeft = Offset(w * 0.16f, h * 0.16f),
-                        size = ComposeSize(w * 0.68f, h * 0.68f),
-                        cornerRadius = CornerRadius(w * 0.14f, w * 0.14f),
-                        style = stroke
-                    )
-                    drawLine(
-                        color = color,
-                        start = Offset(w * 0.34f, h * 0.16f),
-                        end = Offset(w * 0.34f, h * 0.84f),
-                        strokeWidth = stroke.width
-                    )
-                }
-            }
-
-            BottomNavTab.CLOUD -> {
-                val cloud = androidx.compose.ui.graphics.Path().apply {
-                    moveTo(w * 0.30f, h * 0.68f)
-                    lineTo(w * 0.70f, h * 0.68f)
-                    cubicTo(
-                        w * 0.87f, h * 0.68f,
-                        w * 0.86f, h * 0.45f,
-                        w * 0.71f, h * 0.45f
-                    )
-                    cubicTo(
-                        w * 0.67f, h * 0.28f,
-                        w * 0.43f, h * 0.27f,
-                        w * 0.37f, h * 0.45f
-                    )
-                    cubicTo(
-                        w * 0.17f, h * 0.47f,
-                        w * 0.15f, h * 0.68f,
-                        w * 0.30f, h * 0.68f
-                    )
-                    close()
-                }
-                if (selected) {
-                    drawPath(path = cloud, color = color)
-                } else {
-                    drawPath(path = cloud, color = color, style = stroke)
-                }
-            }
-
-            BottomNavTab.MENU -> {
-                val yPositions = listOf(0.26f, 0.50f, 0.74f)
-                val lineStroke = if (selected) w * 0.11f else w * 0.085f
-                yPositions.forEach { yFactor ->
-                    drawLine(
-                        color = color,
-                        start = Offset(w * 0.18f, h * yFactor),
-                        end = Offset(w * 0.82f, h * yFactor),
-                        strokeWidth = lineStroke,
-                        cap = StrokeCap.Round
-                    )
-                }
-            }
+    val color = if (selected) OneUiTextPrimary else OneUiTextSecondary
+    if (tab == BottomNavTab.LIBRARY) {
+        Canvas(modifier) {
+            val stroke = Stroke(1.8.dp.toPx(), cap = StrokeCap.Round)
+            drawLine(color, Offset(size.width * 0.25f, size.height * 0.12f),
+                Offset(size.width * 0.75f, size.height * 0.12f), stroke.width, StrokeCap.Round)
+            drawLine(color, Offset(size.width * 0.17f, size.height * 0.25f),
+                Offset(size.width * 0.83f, size.height * 0.25f), stroke.width, StrokeCap.Round)
+            drawRoundRect(color, Offset(size.width * 0.1f, size.height * 0.38f),
+                ComposeSize(size.width * 0.8f, size.height * 0.5f), CornerRadius(4.dp.toPx()),
+                style = if (selected) androidx.compose.ui.graphics.drawscope.Fill else stroke)
         }
+    } else {
+        val image = when (tab) {
+            BottomNavTab.HOME -> if (selected) Icons.Filled.Home else Icons.Outlined.Home
+            BottomNavTab.SEARCH -> Icons.Outlined.Search
+            else -> if (selected) Icons.Filled.Settings else Icons.Outlined.Settings
+        }
+        Icon(image, contentDescription = null, tint = color, modifier = modifier)
     }
 }

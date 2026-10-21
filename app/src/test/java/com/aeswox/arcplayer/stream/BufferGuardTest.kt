@@ -262,6 +262,36 @@ class BufferGuardTest {
     }
 
     @Test
+    fun aStallInTheLastSecondsRestartsOnTheReadableRemainder() {
+        // The final seconds of a file can never show six megabytes ahead, so without the tail rule a
+        // picture that dies there stays dead with every remaining byte on disk: measured as a freeze
+        // at 23:38 of 23:48 whose tail checksum was real film, not a hole.
+        val remainder = 110_437L
+        assertTrue(
+            BufferGuard.shouldRestart(
+                nowMs = 200_000L, stalledSinceMs = 100_000L, bytesAhead = remainder,
+                restarts = 0, lastRestartMs = BufferGuard.NEVER, bytesToEof = remainder
+            )
+        )
+        // A remainder only half readable is still a wait on the link, and bytes that are not on disk
+        // are not a promise no matter how short the remainder is.
+        assertFalse(
+            BufferGuard.shouldRestart(
+                nowMs = 200_000L, stalledSinceMs = 100_000L, bytesAhead = remainder / 2,
+                restarts = 0, lastRestartMs = BufferGuard.NEVER, bytesToEof = remainder
+            )
+        )
+        // Mid-roll the rule is untouched: the same small readable span in front of a long remainder
+        // waits for the pump rather than re-opening the container.
+        assertFalse(
+            BufferGuard.shouldRestart(
+                nowMs = 200_000L, stalledSinceMs = 100_000L, bytesAhead = remainder,
+                restarts = 0, lastRestartMs = BufferGuard.NEVER, bytesToEof = 40 * mb
+            )
+        )
+    }
+
+    @Test
     fun restartsAreSpacedAndCapped() {
         assertFalse(
             BufferGuard.shouldRestart(

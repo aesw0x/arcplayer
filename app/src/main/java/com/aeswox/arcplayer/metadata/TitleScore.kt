@@ -30,15 +30,21 @@ object TitleScore {
     data class Candidate(val title: String, val year: Int?)
 
     /**
-     * Lower-case, with everything that is not a letter or a digit removed.
+     * Lower-case, with everything that is not a letter or a digit removed and an ampersand spent on
+     * the word it stands for.
      *
-     * This is what makes "Spider-Man", "Spider Man" and "spider man" the same name, and leaves
-     * punctuation to the catalogues, which is where it belongs.
+     * This is what makes "Spider-Man", "Spider Man" and "spider man" the same name. The ampersand is
+     * the exception because catalogues and uploaders disagree about it for the same film: IMDb calls
+     * the 2026 biopic "Virginia Woolf's Night & Day" while the file says "Night and Day", and dropping
+     * the symbol instead of reading it leaves those two names unrelated.
      */
     fun key(value: String): String {
         val builder = StringBuilder(value.length)
         for (character in value.lowercase()) {
-            if (character.isLetterOrDigit()) builder.append(character)
+            when {
+                character.isLetterOrDigit() -> builder.append(character)
+                character == '&' -> builder.append("and")
+            }
         }
         return builder.toString()
     }

@@ -123,6 +123,13 @@ object BufferGuard {
      * A restart costs a cold open of the container, so the pump gets its grace first and the bytes
      * have to actually have arrived before either attempt. Once the attempts are spent the wait is
      * real rather than slow, and saying so beats quietly retrying forever.
+     *
+     * [bytesToEof] keeps the last seconds of a file recoverable. The ahead rule asks for a full
+     * [RECOVER_AHEAD_BYTES] of film to restart into, and a head parked ten seconds from the end can
+     * never show that much even with every remaining byte on disk — measured on device as a picture
+     * frozen at 23:38 of 23:48 while the tail's checksum proved the bytes were there and nothing in
+     * the app was left that could act on it. When the whole remainder is that small and all of it is
+     * readable, the remainder is the same promise the six megabytes are.
      */
     fun shouldRestart(
         nowMs: Long,
@@ -130,10 +137,12 @@ object BufferGuard {
         bytesAhead: Long,
         restarts: Int,
         lastRestartMs: Long,
-        graceMs: Long = GRACE_MS
+        graceMs: Long = GRACE_MS,
+        bytesToEof: Long = Long.MAX_VALUE
     ): Boolean {
         if (restarts >= MAX_RESTARTS) return false
-        if (bytesAhead < RECOVER_AHEAD_BYTES) return false
+        val tailIsTheWholePromise = bytesToEof <= RECOVER_AHEAD_BYTES && bytesAhead >= bytesToEof
+        if (bytesAhead < RECOVER_AHEAD_BYTES && !tailIsTheWholePromise) return false
         if (nowMs - stalledSinceMs < graceMs) return false
         return restarts == 0 || nowMs - lastRestartMs >= RESTART_SPACING_MS
     }

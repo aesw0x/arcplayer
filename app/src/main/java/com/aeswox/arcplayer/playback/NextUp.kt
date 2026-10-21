@@ -21,6 +21,16 @@ object NextUp {
     const val COUNTDOWN_SECONDS = 6
 
     /**
+     * How far from its own end the skip is offered before any end report exists to offer it.
+     *
+     * The last seconds of a part are the ones a cloud file can lose: a tail the container will not
+     * parse reads exactly like a tail that never arrived, and neither the pump nor a re-open can tell
+     * those apart. Waiting for the end report there can mean waiting forever, so the skip is put in
+     * reach while there is still something to skip from.
+     */
+    const val EARLY_OFFER_MS = 20_000L
+
+    /**
      * How far back from its own length the last honest frame may sit and still count as an ending.
      *
      * The end report moves the bar to the full length, so the only number that says where the viewer
@@ -53,6 +63,19 @@ object NextUp {
         // A clip too short to be worth a resume point is too short to be worth queueing after.
         if (fact.durationMs < ResumeRules.MIN_TRACKABLE_DURATION_MS) return false
         return fact.lastShownMs >= fact.durationMs - HONEST_END_TOLERANCE_MS
+    }
+
+    /**
+     * Whether the play head is inside the band before the end where the skip is offered early.
+     *
+     * Deliberately indifferent to [Snapshot.waitingForBytes]: a stall inside the band is one of the
+     * two reasons the band exists, and disqualifying the offer on it would take the way out off the
+     * screen at the exact moment it is needed.
+     */
+    fun withinEarlyWindow(fact: Snapshot): Boolean {
+        if (!fact.hasNextPart || !fact.knowsItsParts) return false
+        if (fact.durationMs < ResumeRules.MIN_TRACKABLE_DURATION_MS) return false
+        return fact.lastShownMs >= fact.durationMs - EARLY_OFFER_MS && fact.lastShownMs < fact.durationMs
     }
 
     /**

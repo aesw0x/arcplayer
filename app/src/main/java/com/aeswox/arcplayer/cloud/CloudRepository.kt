@@ -103,6 +103,20 @@ class CloudRepository(
     @Volatile
     private var started = false
 
+    /**
+     * Which file the player has been handed since this launch, keyed by the id it was handed for.
+     *
+     * The sweep needs to know what is being watched, and by then Telegram's records are no help: ask
+     * about the number a film's file was written against and the answer is a record for a
+     * three-kilobyte thumbnail, because those numbers were handed out again long ago. What this app
+     * does know is the path it gave the player, and that is the one thing the sweep must never take.
+     */
+    private val inUse = ConcurrentHashMap<Int, String>()
+
+    /** Whether this launch has handed back the copies older watches left behind. */
+    @Volatile
+    private var strandedSwept = false
+
     init {
         scope.launch {
             bridge.authInputs.collect { input -> onAuthInput(input) }
@@ -155,12 +169,14 @@ class CloudRepository(
         _authState.value = transition.state
         runEffect(transition.effect)
 
-        if (transition.state.stage == CloudAuthStage.AUTHORIZED && _chats.value.isEmpty()) {
-            // Off the collector: a chat sweep is tens of round trips, and holding the queue during
-            // it would stall any login update TDLib sends while the list is being built.
-            scope.launch {
-                runCatching { refreshChats() }
-                    .onFailure { Log.w(TAG, "chat refresh after auth", it) }
+        if (transition.state.stage == CloudAuthStage.AUTHORIZED) {
+            if (_chats.value.isEmpty()) {
+                // Off the collector: a chat sweep is tens of round trips, and holding the queue during
+                // it would stall any login update TDLib sends while the list is being built.
+                scope.launch {
+                    runCatching { refreshChats() }
+                        .onFailure { Log.w(TAG, "chat refresh after auth", it) }
+                }
             }
         }
     }
@@ -429,6 +445,7 @@ class CloudRepository(
             .sortedByDescending { it.messageId }
         _videos.value = _videos.value + (chatId to items)
         _subtitles.value = _subtitles.value + (chatId to captions)
+        scheduleStrandedSweep()
         if (pendingThumbnails.isNotEmpty()) {
             _thumbnails.value = _thumbnails.value + pendingThumbnails
         }
@@ -760,11 +777,17 @@ class CloudRepository(
      * for the first bytes of the window and gives up after a while rather than hanging the tab.
      */
     suspend fun localPathFor(video: CloudVideoItem): String? {
+        // Claimed before anything is waited for. The sweep hands back the copies no watch of this
+        // session owns, and an open still waiting for its head is indistinguishable from one: the wait
+        // is up to twelve seconds and the sweep walks the whole shelf inside that, deleting as it goes.
+        inUse[video.fileId] = OPENING
         val record = bridge.call(TdApi.GetFile(video.fileId))
         // Telegram's own size outlives its local record, so read it here and not after a possible drop.
-        val size = record?.size ?: 0L
+        // A record that does not know the size is not a licence to hand over an empty file: the shelf
+        // was told it by the message the film arrived in, and that answer does not go stale.
+        val size = (record?.size ?: 0L).takeIf { it > 0L } ?: video.sizeBytes
         var file = record
-        if (!headCouldBeRead(file)) file = dropRecord(video)
+        if (!headCouldBeRead(file, video.sizeBytes)) file = dropRecord(video)
         if (existingPath(file) == null) fetchHead(video)
         var path = awaitUsablePath(video.fileId, size)
         if (path == null) {
@@ -776,7 +799,16 @@ class CloudRepository(
             fetchHead(video)
             path = awaitUsablePath(video.fileId, size)
         }
-        val usable = path ?: return null
+        val usable = path ?: run {
+            inUse.remove(video.fileId)
+            return null
+        }
+        inUse[video.fileId] = usable
+        Log.i(
+            TAG,
+            "open file=${video.fileId} handed over with ${allocatedBytes(usable)} of $size bytes on disk, " +
+                "record complete=${record?.local?.isDownloadingCompleted} active=${record?.local?.isDownloadingActive}"
+        )
         // The player measures the file once, when it opens, and a half fetched file is only as long
         // as the furthest byte Telegram has written. Without this, every later part of the film sits
         // "past the end" as far as the player is concerned and a seek into it never comes back. The
@@ -803,11 +835,16 @@ class CloudRepository(
      * has taken its bytes — the storage clear, the system purging the folder, a shell stretched by an
      * earlier open. Measured here, a 1 GB film's record claimed 674 MB had landed while the path it
      * named had never been written at all, and a player pointed at that path shows black and waits.
+     *
+     * A third case sits between the two and needs its own test: a file whose allocation is real but sits
+     * at the far end, left there by a watch whose last fetch was the cue table. Blocks are counted
+     * wherever they are in the file, so allocation on its own calls that head readable when it is a hole.
      */
-    private fun headCouldBeRead(record: TdApi.File?): Boolean {
+    private suspend fun headCouldBeRead(record: TdApi.File?, shelfSizeBytes: Long): Boolean {
         val path = existingPath(record) ?: return true
-        val needed = minOf(HEAD_READ_BYTES, record?.size ?: 0L)
-        return needed <= 0L || allocatedBytes(path) >= needed
+        val known = (record?.size ?: 0L).takeIf { it > 0L } ?: shelfSizeBytes
+        val needed = if (known > 0L) minOf(HEAD_READ_BYTES, known) else HEAD_READ_BYTES
+        return allocatedBytes(path) >= needed && !headIsHole(path)
     }
 
     /**
@@ -873,14 +910,20 @@ class CloudRepository(
         // trip and one can take seconds while Telegram is busy.
         val giveUpAt = SystemClock.elapsedRealtime() + FIRST_WINDOW_TIMEOUT_MS
         // The header is what the index hunt reads first, and a file that has only its first kilobyte
-        // reads as a broken container.
-        val needBytes = minOf(HEAD_READ_BYTES, fileSizeBytes)
+        // reads as a broken container. An unknown size still has to leave something to read: zeroes
+        // identify no container, and a path handed over empty parks the player at 0 KB/s for good.
+        val needBytes = if (fileSizeBytes > 0L) minOf(HEAD_READ_BYTES, fileSizeBytes) else HEAD_READ_BYTES
         while (true) {
             val path = bridge.call(TdApi.GetFile(fileId))?.local?.path?.takeIf { it.isNotBlank() }
             // What the record *reports* about its bytes is not the question: a window re-aimed by a seek
             // counts some of them twice, and a record that outlived its file reports the whole film as
-            // present. Allocation under the path is what a player can actually read.
-            if (path != null && (needBytes <= 0L || allocatedBytes(path) >= needBytes)) return path
+            // present. Allocation under the path is what a player can actually read — and even that is
+            // not enough on its own, because it counts blocks wherever they sit in the file. A hunt that
+            // landed the cue table leaves a file with plenty allocated and a hole where the header
+            // should be, and a player handed that reads zeroes, reports no container and no duration,
+            // and then nothing ever asks it to try again: measured on device as a black frame parked at
+            // 0 KB/s with the download window never moving.
+            if (path != null && allocatedBytes(path) >= needBytes && !headIsHole(path)) return path
             if (SystemClock.elapsedRealtime() >= giveUpAt) return null
             delay(POLL_INTERVAL_MS)
         }
@@ -929,8 +972,16 @@ class CloudRepository(
             alreadyDelivered = run
         )
         // The run is on this line because a wrong "nothing to do" here is a frozen picture, and the
-        // only way to tell a correct one from a stale memory is to see both spans together.
-        Log.i(TAG, "advance read=$readPositionBytes window=${facts.downloadOffset}+${facts.downloadedPrefixSize} run=$run -> $command")
+        // only way to tell a correct one from a stale memory is to see both spans together. The three
+        // record flags are here for the same reason: every way this answer can be "None" is a belief
+        // about the file, and a park in front of a black player is not diagnosable without knowing
+        // which belief fired.
+        Log.i(
+            TAG,
+            "advance read=$readPositionBytes window=${facts.downloadOffset}+${facts.downloadedPrefixSize} " +
+                "size=${facts.fileSizeBytes} active=${facts.isDownloadingActive} " +
+                "done=${facts.isDownloadingCompleted} run=$run -> $command"
+        )
         when (command) {
             is WindowCommand.None -> Unit
             is WindowCommand.Fetch -> cappedCall(
@@ -1054,10 +1105,14 @@ class CloudRepository(
             cueTables[video.fileId] = table
             return table
         }
-        // An MP4 has no cue table, and looking for one is a file read every seek. A Matroska header
-        // that has not landed yet is the one failure worth another try, so only the second case is
-        // remembered.
-        if (!hasMkvMagic(path)) cueTables[video.fileId] = EMPTY_CUE_TABLE
+        // An MP4 has no cue table, and looking for one is a file read every seek, so that verdict is
+        // worth keeping. A header that has not landed yet is the one failure worth another try, and
+        // "has not landed" has to be tested rather than inferred from the magic being absent: a hole
+        // where the head should be reads as zeroes, which is no more EBML than an MP4 header is.
+        // Remembering that one answer cost a film its index for the rest of the session — measured, the
+        // open-time hunt gave up after a single 158 ms try of a fifteen second budget, and every seek
+        // after it fell back to the constant-bitrate guess.
+        if (!hasMkvMagic(path) && !headIsHole(path)) cueTables[video.fileId] = EMPTY_CUE_TABLE
         return null
     }
 
@@ -1176,6 +1231,24 @@ class CloudRepository(
             first.contentEquals(MKV_MAGIC)
         }
     }.getOrDefault(false)
+
+    /**
+     * Whether the start of the file is a hole rather than a header this app did not recognise.
+     *
+     * A windowed fetch leaves the file its full length with nothing written behind the bytes that
+     * landed, so the two cases look identical from the magic alone and only a read tells them apart.
+     * Anything unreadable counts as a hole: the verdict it would support is the one that is remembered,
+     * and a wrong "this file has no index" is permanent for the session while a wrong "try again" costs
+     * one more read.
+     */
+    private suspend fun headIsHole(path: String): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            RandomAccessFile(path, "r").use { file ->
+                val probe = ByteArray(MKV_MAGIC.size)
+                file.read(probe) < probe.size || probe.all { it == 0.toByte() }
+            }
+        }.getOrDefault(true)
+    }
 
     private fun MkvSeekIndex.CueTable?.ifUsable(): MkvSeekIndex.CueTable? =
         this?.takeIf { !it.isEmpty }
@@ -1320,8 +1393,107 @@ class CloudRepository(
         val deleted = tryCall(TdApi.DeleteFile(fileId)) != null
         deliveredRuns.remove(fileId)
         cueTables.remove(fileId)
+        inUse.remove(fileId)
         _progress.value = _progress.value - fileId
         Log.i(TAG, "forget title=${video.title} file=$fileId deleted=$deleted")
+    }
+
+    /**
+     * Once this launch has a shelf list straight from Telegram, hand back the copies no watch of this
+     * session owns.
+     *
+     * Fired from the walk and not from the manifest that renders the grid while the walk runs. The
+     * manifest's ids are a cache of an older conversation with Telegram, and measured on a phone they
+     * mostly no longer answer: 58 of 61 came back refused, which is a sweep that reclaims nothing while
+     * reporting itself done. Storage has no deadline, so it waits for ids that are live.
+     */
+    private fun scheduleStrandedSweep() {
+        if (strandedSwept) return
+        scope.launch {
+            runCatching { sweepStrandedDownloads() }
+                .onFailure { Log.w(TAG, "stranded download sweep", it) }
+        }
+    }
+
+    /**
+     * Put down every shelf copy Telegram still reports as local and this session has not asked for.
+     *
+     * A watch that ends at the back arrow already released its file. The watches that end because the
+     * app was swiped out of Recents do not, and on the two installs this was measured on they had left
+     * 1.2 GB and 1.9 GB behind. Those bytes are reachable, but only through Telegram: the shelf's own
+     * ids name them, and `DeleteFile` unlinks them *and* retires the record.
+     *
+     * The second half is the whole reason not to reach for the filesystem. The first version of this
+     * listed the folder and deleted what the listing said was unclaimed, which reclaimed the space and
+     * then hung the next open of every film it touched: the record goes on reporting the file complete,
+     * so [headCouldBeRead] waves it through, [localPathFor] stretches a shell of the right length over
+     * the hole, and the planner sees nothing to fetch — measured as `advance read=0 window=0+0 -> None`
+     * in front of a black player sitting at 0 KB/s. Only Telegram can stop believing its own record.
+     *
+     * So a file this app cannot name with a live id stays, however much it costs. Each id is believed
+     * only when its record's own size agrees with the shelf's, because Telegram hands numbers out again
+     * and a stale one usually resolves to a thumbnail.
+     */
+    private suspend fun sweepStrandedDownloads() {
+        if (strandedSwept) return
+        val shelf = _videos.value.values.flatten()
+        if (shelf.isEmpty()) return
+        strandedSwept = true
+        var put = 0
+        var held = 0L
+        val left = mutableMapOf<DownloadSweep.Verdict, Int>()
+        val examples = mutableMapOf<DownloadSweep.Verdict, String>()
+        for (item in shelf) {
+            val claim = DownloadSweep.Claim(item.fileId, item.sizeBytes)
+            val answer = runCatching { cappedCall(TdApi.GetFile(item.fileId)) }
+            val file = answer.getOrNull()
+            val facts = file?.toWindowFacts()
+            val record = facts?.let {
+                DownloadSweep.Record(
+                    claimedSizeBytes = it.fileSizeBytes,
+                    reportsLocalBytes = it.downloadedSizeBytes > 0L || it.isDownloadingCompleted,
+                    isDownloading = it.isDownloadingActive,
+                )
+            }
+            // Read live, and read again after the round trip: a film the viewer tapped while Telegram
+            // was answering is no longer a leftover, and the walk takes long enough for that to happen
+            // on a shelf this size.
+            when (val verdict = DownloadSweep.verdict(claim, record, inUse.containsKey(item.fileId))) {
+                DownloadSweep.Verdict.STRANDED -> {
+                    forgetCopy(item)
+                    put++
+                    // Telegram's own count of what it was holding, not the length of the film: a copy
+                    // left behind by a killed watch is one window, and summing shelf sizes reported 37 GB
+                    // reclaimed on a device that was carrying 134 MB.
+                    held += facts?.downloadedSizeBytes ?: 0L
+                }
+                else -> {
+                    left[verdict] = (left[verdict] ?: 0) + 1
+                    // One illustration of each kind of refusal. The tally says how many copies this
+                    // launch left alone and nothing about why, and "58 no answer" is two different
+                    // failures — an id Telegram has never heard of, and a client that was not ready to
+                    // be asked — with nothing but the reply to tell them apart.
+                    examples.putIfAbsent(
+                        verdict,
+                        if (answer.isFailure) {
+                            "file=${item.fileId} refused: ${answer.exceptionOrNull()?.message}"
+                        } else {
+                            "file=${item.fileId} size=${facts?.fileSizeBytes} downloaded=${facts?.downloadedSizeBytes} " +
+                                "complete=${facts?.isDownloadingCompleted} active=${facts?.isDownloadingActive} " +
+                                "named=${existingPath(file) != null}"
+                        }
+                    )
+                }
+            }
+        }
+        val reasons = left.entries.sortedByDescending { it.value }.joinToString { (verdict, count) ->
+            "$count ${verdict.name.lowercase().replace('_', ' ')} — ${examples[verdict]}"
+        }
+        Log.i(
+            TAG,
+            "sweep put down $put of ${shelf.size} shelf copies, $held bytes their records claimed" +
+                if (reasons.isEmpty()) "" else " (left: $reasons)"
+        )
     }
 
     /**
@@ -1486,6 +1658,15 @@ class CloudRepository(
 
         /** Stored for a file that has no cue table, so the hunt is not repeated on every seek. */
         val EMPTY_CUE_TABLE = MkvSeekIndex.CueTable(LongArray(0), LongArray(0))
+
+        /**
+         * Stands in the in-use map for a file whose open has not been handed a path yet.
+         *
+         * Only the keys of that map are ever read — the sweep asks "is this film being watched", never
+         * "where is it" — so an open in progress can claim its file before it knows the name Telegram
+         * will give it.
+         */
+        const val OPENING = ""
 
         /** Used only when Telegram labels a file `application/octet-stream`, which plenty of them are. */
         val VIDEO_FILE_EXTENSIONS = listOf(

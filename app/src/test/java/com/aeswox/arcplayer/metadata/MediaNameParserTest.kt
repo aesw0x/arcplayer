@@ -15,6 +15,14 @@ class MediaNameParserTest {
     private fun parse(name: String) = MediaNameParser.parse(name, thisYear)
 
     @Test
+    fun anAmpersandIsPartOfTheNameAndNotNoise() {
+        // Deleting the symbol left "Tom Jerry" as the query, which matches neither spelling the
+        // catalogues use once TitleScore reads & as the word it stands for.
+        assertEquals(MediaGuess.Movie("Tom & Jerry", 2021), parse("Tom.&.Jerry.2021.1080p.x264.mkv"))
+        assertEquals(MediaGuess.Movie("Night & Day", 1996), parse("Night & Day (1996) [WEBRip] 720p.mkv"))
+    }
+
+    @Test
     fun episodeWithBracketedTagsAndWatermark() {
         assertEquals(
             MediaGuess.Episode("One Piece", null, 206, null),

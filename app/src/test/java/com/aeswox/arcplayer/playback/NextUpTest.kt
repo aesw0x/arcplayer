@@ -66,6 +66,42 @@ class NextUpTest {
     }
 
     @Test
+    fun theSkipIsInReachBeforeTheEndArrives() {
+        val length = 45 * 60_000L
+        assertEquals(true, NextUp.withinEarlyWindow(episode))
+        assertEquals(true, NextUp.withinEarlyWindow(episode.copy(lastShownMs = length - NextUp.EARLY_OFFER_MS)))
+        assertEquals(
+            false,
+            NextUp.withinEarlyWindow(episode.copy(lastShownMs = length - NextUp.EARLY_OFFER_MS - 1))
+        )
+    }
+
+    @Test
+    fun aStallInsideTheEarlyWindowStillShowsTheWayOut() {
+        // The freeze this window exists for is reported as waiting-for-bytes, so the early offer cannot
+        // disqualify on it: that would take the skip off the screen at the moment it is the only option.
+        assertEquals(false, NextUp.shouldOffer(episode.copy(waitingForBytes = true)))
+        assertEquals(true, NextUp.withinEarlyWindow(episode.copy(waitingForBytes = true)))
+    }
+
+    @Test
+    fun theEarlyWindowHandsOverToTheEndOffer() {
+        // At the length itself the player has reported an ending, and that offer is the one counting down.
+        assertEquals(false, NextUp.withinEarlyWindow(episode.copy(lastShownMs = episode.durationMs)))
+        assertEquals(false, NextUp.withinEarlyWindow(episode.copy(lastShownMs = episode.durationMs + 1)))
+    }
+
+    @Test
+    fun theEarlyOfferKeepsTheQualificationsOfTheRealOne() {
+        assertEquals(false, NextUp.withinEarlyWindow(episode.copy(knowsItsParts = false)))
+        assertEquals(false, NextUp.withinEarlyWindow(episode.copy(hasNextPart = false)))
+        assertEquals(
+            false,
+            NextUp.withinEarlyWindow(episode.copy(lastShownMs = 8_000L, durationMs = 12_000L))
+        )
+    }
+
+    @Test
     fun anEpisodeIsNamedByItsNumber() {
         assertEquals(
             "S1 E2",

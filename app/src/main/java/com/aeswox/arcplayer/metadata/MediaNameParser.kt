@@ -72,8 +72,13 @@ object MediaNameParser {
 
     private val fourDigitYear = Regex("^(19|20)\\d{2}$")
 
-    /** A hyphen someone typed with spaces around it is a separator, not a word. */
-    private val punctuationOnly = Regex("^[-+~#*&]+$")
+    /**
+     * A hyphen someone typed with spaces around it is a separator, not a word.
+     *
+     * The ampersand is deliberately absent: "Tom & Jerry" is a title, and the catalogues spell the
+     * same film both ways, so the symbol has to reach [TitleScore] to be read as the word.
+     */
+    private val punctuationOnly = Regex("^[-+~#*]+$")
 
     private val seasonEpisode = Regex(
         "\\bs(\\d{1,2})[ ._-]*e(?:p(?:isode)?)?[ ._-]*(\\d{1,4})\\b",
@@ -266,7 +271,7 @@ object MediaNameParser {
             .filter { it.isNotBlank() && !punctuationOnly.matches(it) }
 
     /** Clinging punctuation that only ever appears at the ends of a word, unlike the hyphen inside "Spider-Man". */
-    private val edgePunctuation = " -+~#*&"
+    private val edgePunctuation = " -+~#*"
 
     private fun joinUp(words: List<String>): String = words.joinToString(" ").trim()
 

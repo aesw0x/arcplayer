@@ -2,6 +2,7 @@ package com.aeswox.arcplayer.metadata
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 
 /** Catalogue answers for the things this app plays, over plain HTTP. */
 
@@ -108,6 +109,43 @@ internal class TmdbSource(private val apiKey: String) : MediaSource {
                 providerId = row.optInt("id").takeIf { it > 0 },
                 isSeries = true
             )
+        )
+    }
+
+    /**
+     * The title one IMDb id names, when TMDB knows it at all.
+     *
+     * A film whose name search misses on one romanisation is often still in the catalogue under
+     * another, and the id is the only way to reach it. Null is the ordinary answer for a regional
+     * release TMDB has never heard of, and costs nothing: the caller keeps the IMDb row.
+     */
+    internal fun byImdbId(imdbId: String, guess: MediaGuess): MediaMatch? {
+        if (!imdbId.startsWith("tt")) return null
+        val series = guess is MediaGuess.Episode
+        val response = HttpJson.get(
+            HttpJson.url(
+                "$base/find/$imdbId",
+                "api_key" to apiKey,
+                "language" to "en-US",
+                "external_source" to "imdb_id"
+            )
+        ) ?: return null
+        val row = response.optJSONArray(if (series) "tv_results" else "movie_results").objects()
+            .firstOrNull() ?: return null
+        val title = row.optString(if (series) "name" else "title").nullIfBlank()
+            ?: row.optString(if (series) "original_name" else "original_title").nullIfBlank()
+            ?: return null
+        val id = row.optInt("id")
+        return MediaMatch(
+            title = title,
+            subtitle = episodeLabel(guess) ?: yearOf(
+                row.optString(if (series) "first_air_date" else "release_date")
+            )?.toString(),
+            posterUrl = poster(row.optString("poster_path")),
+            source = name,
+            logoUrl = logo(if (series) "tv" else "movie", id),
+            providerId = id.takeIf { it > 0 },
+            isSeries = series
         )
     }
 
@@ -296,5 +334,98 @@ internal class WikipediaSource : MediaSource {
 
     private fun firstYear(text: String): Int? =
         fourDigits.find(text)?.value?.toIntOrNull()?.let { positiveYear(it) }
+}
+
+/**
+ * IMDb's own search box, which needs no key.
+ *
+ * The reason it is here: the regional cinema this library is full of is indexed by Amazon far better
+ * than the name searches above match it. Measured on twelve Malayalam titles, ten answered real key
+ * art on the first ask, and the two that did not were misspelled by the asker — while the same titles
+ * returned nothing at all from Apple's store and nothing from Wikipedia, which leaves fair-use
+ * posters out of its API by design.
+ *
+ * One request carries its own answer: the name, the year, the poster and the `tt` id, and that id is
+ * the more valuable half. [TmdbSource.byImdbId] spends it on the film TMDB could not find by name,
+ * which recovers the wordmark, the backdrop and the runtime IMDb has no equivalent of.
+ *
+ * The endpoint is what the website calls rather than a published API, so it can change without
+ * notice. A reply that is not the shape expected is [MediaOutcome.Unreachable] and not a refusal, so
+ * a moved URL leaves the cards askable instead of naming a whole chat after nothing.
+ */
+internal class ImdbSource(private val tmdb: TmdbSource? = null) : MediaSource {
+
+    override val name = "imdb"
+
+    override fun lookup(guess: MediaGuess): MediaOutcome {
+        val wanted = when (guess) {
+            is MediaGuess.Movie -> guess.title
+            is MediaGuess.Episode -> guess.series
+            is MediaGuess.Unnamed -> return MediaOutcome.NoMatch
+        }
+        val url = imdbTypeaheadUrl(wanted) ?: return MediaOutcome.NoMatch
+        val response = HttpJson.get(url) ?: return MediaOutcome.Unreachable
+        val works = response.optJSONArray("d").objects().filter { row ->
+            val id = row.optString("id").nullIfBlank() ?: return@filter false
+            id.startsWith("tt") && row.optString("qid").nullIfBlank() in
+                (if (guess is MediaGuess.Episode) seriesKinds else filmKinds)
+        }
+        val candidates = works.map { row -> TitleScore.Candidate(row.optString("l"), releaseYear(row)) }
+        val chosen = TitleScore.bestIndex(candidates, wanted, (guess as? MediaGuess.Movie)?.year)
+        if (chosen < 0) return MediaOutcome.NoMatch
+        val row = works[chosen]
+        val poster = imdbPoster(row.optJSONObject("i")?.optString("imageUrl"))
+        val bridged = row.optString("id").nullIfBlank()?.let { tmdb?.byImdbId(it, guess) }
+        if (bridged != null) return MediaOutcome.Found(bridged.copy(posterUrl = bridged.posterUrl ?: poster))
+        return MediaOutcome.Found(
+            MediaMatch(
+                title = row.optString("l").nullIfBlank() ?: wanted,
+                subtitle = episodeLabel(guess) ?: releaseYear(row)?.toString(),
+                posterUrl = poster,
+                source = name,
+                isSeries = guess is MediaGuess.Episode
+            )
+        )
+    }
+
+    private companion object {
+
+        /** `qid` is IMDb's own kind, and a person row is never the answer. */
+        val filmKinds = setOf("movie", "tvMovie")
+        val seriesKinds = setOf("tvSeries", "tvMiniSeries")
+
+        val fourDigits = Regex("\\b(19|20)\\d{2}\\b")
+
+        /** [y] is absent on a title not out yet, where the release line still names a year. */
+        fun releaseYear(row: JSONObject): Int? =
+            positiveYear(row.optInt("y")) ?: fourDigits.find(row.optString("tl"))?.value?.toIntOrNull()
+                ?.let { positiveYear(it) }
+    }
+}
+
+/**
+ * The typeahead address for one name: IMDb buckets its index by the first character of the query, so
+ * that character is part of the path rather than a parameter.
+ */
+internal fun imdbTypeaheadUrl(title: String): String? {
+    val trimmed = title.trim()
+    val bucket = trimmed.firstOrNull { it.isLetterOrDigit() }?.lowercaseChar() ?: return null
+    val query = URLEncoder.encode(trimmed, "UTF-8").replace("+", "%20")
+    return "https://v3.sg.media-imdb.com/suggestion/$bucket/$query.json"
+}
+
+/**
+ * The card-sized rendition of an IMDb poster, or null unless the address is really IMDb's own CDN.
+ *
+ * The URL the API hands back is the scan — 900 KB for a poster this app draws 130 dp wide, once per
+ * card — and Amazon resizes on the address instead of on request. The host is pinned because this
+ * string came out of somebody else's reply and is about to be fetched.
+ */
+internal fun imdbPoster(imageUrl: String?): String? {
+    val url = imageUrl.nullIfBlank() ?: return null
+    if (!url.startsWith("https://m.media-amazon.com/images/")) return null
+    val marker = url.indexOf("@._V1_")
+    if (marker < 0) return url
+    return url.substring(0, marker + "@._V1_".length) + "SX500_.jpg"
 }
 

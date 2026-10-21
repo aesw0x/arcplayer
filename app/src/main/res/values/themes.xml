@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.ArcPlayer" parent="android:Theme.Material.Light.NoActionBar">
+    <!--
+        Dark parent because the app is dark only: it decides what the system draws for anything
+        this app does not paint itself — the text-selection toolbar, context menus, and the default
+        light status and navigation bar icons. forceDarkAllowed is off so Samsung's per-app
+        "Force Dark" cannot re-process a palette that is already dark.
+    -->
+    <style name="Theme.ArcPlayer" parent="android:Theme.Material.NoActionBar">
         <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:forceDarkAllowed">false</item>
     </style>
 </resources>

@@ -63,6 +63,36 @@ class TitleScoreTest {
     }
 
     @Test
+    fun anAmpersandStandsForTheWordAnd() {
+        // IMDb writes "Night & Day" and the uploader typed "Night and Day" for the same film. Left as
+        // punctuation-that-vanishes the two names never meet and the row is refused like a stranger.
+        assertEquals(
+            TitleScore.EXACT + TitleScore.SAME_YEAR,
+            TitleScore.of(candidate("Virginia Woolf's Night & Day", 2026), "Virginia Woolfs Night and Day", 2026)
+        )
+        assertEquals(TitleScore.EXACT, TitleScore.of(candidate("Law & Order"), "Law and Order", null))
+        assertEquals(TitleScore.EXACT, TitleScore.of(candidate("Lilo and Stitch"), "Lilo & Stitch", null))
+    }
+
+    @Test
+    fun theFileThatFellThroughToWikipediaIsTheSameFilmImdbNamed() {
+        val guess = MediaNameParser.parse("Virginia.Woolf's.Night.and.Day.2026.720p.10bit.WEBRip.6C.mkv")
+        val rows = listOf(
+            TitleScore.Candidate("Virginia Woolf's Night & Day", 2026),
+            TitleScore.Candidate("Woolf", 2018),
+            TitleScore.Candidate("Night", 2021)
+        )
+        assertEquals(
+            0,
+            TitleScore.bestIndex(
+                rows,
+                (guess as MediaGuess.Movie).title,
+                guess.year
+            )
+        )
+    }
+
+    @Test
     fun aLongerNameThatStartsLikeOursNeedsTheYearToBackItUp() {
         // AniList really does have an anime called "Interstellar Wanderer", and it is not the 2014 film.
         val rows = listOf(candidate("Interstellar Wanderer"))
