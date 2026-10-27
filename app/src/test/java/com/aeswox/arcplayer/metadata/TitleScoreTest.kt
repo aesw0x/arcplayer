@@ -75,6 +75,31 @@ class TitleScoreTest {
     }
 
     @Test
+    fun aNumberingWordDoesNotMakeTwoNamesOfTheSameFilm() {
+        // Measured against the live catalogues: the file says "John.Wick.4", TMDB, IMDb and Wikipedia
+        // all answer "John Wick: Chapter 4", and that gap alone refused the film.
+        assertEquals(
+            TitleScore.EXACT + TitleScore.SAME_YEAR,
+            TitleScore.of(candidate("John Wick: Chapter 4", 2023), "John Wick 4", 2023)
+        )
+        assertEquals(
+            TitleScore.EXACT + TitleScore.SAME_YEAR,
+            TitleScore.of(candidate("John Wick: Chapter 3 - Parabellum", 2019), "John Wick 3 Parabellum", 2019)
+        )
+        assertEquals(TitleScore.key("John Wick Chapter 2"), TitleScore.key("John Wick 2"))
+    }
+
+    @Test
+    fun theDigitStillTellsTheSequelsApart() {
+        // Dropping "Chapter" must not turn the franchise into one name: 2014's film is not 2017's,
+        // and the year is the only thing left disagreeing once the numbering word is gone.
+        val rows = listOf(candidate("John Wick", 2014), candidate("John Wick: Chapter 2", 2017))
+        assertEquals(0, TitleScore.bestIndex(rows, "John Wick", 2014))
+        assertEquals(1, TitleScore.bestIndex(rows, "John Wick 2", 2017))
+        assertEquals(-1, TitleScore.bestIndex(listOf(candidate("John Wick: Chapter 2", 2017)), "John Wick", 2014))
+    }
+
+    @Test
     fun theFileThatFellThroughToWikipediaIsTheSameFilmImdbNamed() {
         val guess = MediaNameParser.parse("Virginia.Woolf's.Night.and.Day.2026.720p.10bit.WEBRip.6C.mkv")
         val rows = listOf(

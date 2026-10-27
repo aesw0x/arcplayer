@@ -22,6 +22,12 @@ package com.aeswox.arcplayer.cloud
  * - [claimedSizeBytes] has to agree with the shelf before an id is believed. Telegram hands its file
  *   numbers out again, so a stale id usually resolves to a three-kilobyte thumbnail; deleting that would
  *   cost a poster and buy nothing.
+ *
+ * A third source joins the two Telegram ones once the viewer asks to keep a copy, and it is the only one
+ * that can overrule a delete: [Verdict.KEPT] comes from this app's own [DownloadLedger], not from a
+ * record that has no word for "somebody meant this file to stay". Without it, a finished download is
+ * indistinguishable here from the leftovers this sweep exists to reclaim, and the launch pass would hand
+ * back every film taken offline.
  */
 object DownloadSweep {
 
@@ -63,6 +69,18 @@ object DownloadSweep {
 
         /** The record's length disagrees with the shelf's, so this id is somebody else's file now. */
         NOT_THIS_FILM,
+
+        /**
+         * The viewer asked for this copy to stay, through [DownloadLedger].
+         *
+         * This one does not come from Telegram's record at all, and it has to outrank every verdict that
+         * does: a download that has finished looks exactly like the leftovers this sweep exists to
+         * reclaim, because nothing in TDLib's answer says anybody meant it to be there. The promise is
+         * keyed on the shelf entry, so it holds even while the record says nothing local — a file being
+         * filled, or one whose bytes have yet to be verified — and even if its id now resolves to
+         * something whose size disagrees.
+         */
+        KEPT,
     }
 
     /**
@@ -70,9 +88,12 @@ object DownloadSweep {
      *
      * A null [record] means Telegram did not answer, which is a reason to skip the file, not to delete
      * it. [inUse] covers the copy the player was handed — or is being handed — since the app came up.
+     * [kept] covers the copies the viewer asked to keep, which is a promise this app wrote down itself
+     * and therefore the only answer that does not depend on Telegram being honest about its own bytes.
      */
-    fun verdict(claim: Claim, record: Record?, inUse: Boolean): Verdict = when {
+    fun verdict(claim: Claim, record: Record?, inUse: Boolean, kept: Boolean = false): Verdict = when {
         inUse -> Verdict.IN_USE
+        kept -> Verdict.KEPT
         record == null -> Verdict.NO_ANSWER
         record.isDownloading -> Verdict.STILL_ARRIVING
         !record.reportsLocalBytes -> Verdict.NOTHING_LOCAL
@@ -81,13 +102,16 @@ object DownloadSweep {
     }
 
     /** Whether this shelf entry's local copy belongs to no watch and can be handed back. */
-    fun isStranded(claim: Claim, record: Record?, inUse: Boolean): Boolean =
-        verdict(claim, record, inUse) == Verdict.STRANDED
+    fun isStranded(claim: Claim, record: Record?, inUse: Boolean, kept: Boolean = false): Boolean =
+        verdict(claim, record, inUse, kept) == Verdict.STRANDED
 
     /** The shelf entries to put down, in the order they were listed. */
     fun stranded(
         claims: List<Claim>,
         records: Map<Int, Record>,
         inUseFileIds: Set<Int>,
-    ): List<Claim> = claims.filter { isStranded(it, records[it.fileId], it.fileId in inUseFileIds) }
+        keptFileIds: Set<Int> = emptySet(),
+    ): List<Claim> = claims.filter {
+        isStranded(it, records[it.fileId], it.fileId in inUseFileIds, it.fileId in keptFileIds)
+    }
 }

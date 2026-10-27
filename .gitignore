@@ -1,7 +1,17 @@
 # Secrets and machine-local config
 local.properties
+signing.properties
+signing/
 *.keystore
 *.jks
+*.p12
+*.pfx
+.env
+.env.*
+
+# Local investigation notes and extracted binaries
+.tmp-dex/
+/how to fix apk size being too big.txt
 
 # Build output — app/build/ contains a generated BuildConfig with the Telegram app credentials in it
 .gradle/

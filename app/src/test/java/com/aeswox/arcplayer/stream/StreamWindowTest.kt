@@ -70,6 +70,28 @@ class StreamWindowTest {
     }
 
     @Test
+    fun askingForWhatHasLandedExcludesWhatIsStillComing() {
+        // The same span as above, asked as "what can the player read right now": 1,600 of it is inside
+        // a window Telegram is still carrying, and a player re-opened past the last real byte reads the
+        // zeroes behind it and reports them as the end of the film.
+        assertEquals(
+            500L,
+            StreamWindow.readableBytes(
+                position = 500L, size = 10_000L, windowStart = 100L, windowLength = 2_000L,
+                completed = false, alreadyDelivered = DeliveredRun(0L, 1_000L), includeInFlight = false
+            )
+        )
+        // A completed file has no promise in it; everything is on disk.
+        assertEquals(
+            6_000L,
+            StreamWindow.readableBytes(
+                position = 4_000L, size = 10_000L, windowStart = 0L, windowLength = 0L,
+                completed = true, includeInFlight = false
+            )
+        )
+    }
+
+    @Test
     fun seekingBackIntoBytesThatNeverArrivedMovesTheFetch() {
         assertTrue(StreamWindow.shouldReaim(500L, 1_000L, 5_000L, active = true, completed = false))
     }

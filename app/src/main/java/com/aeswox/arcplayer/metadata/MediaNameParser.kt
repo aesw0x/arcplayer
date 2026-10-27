@@ -68,7 +68,20 @@ object MediaNameParser {
      */
     private val separator = Regex("[\\s_.,;:'\"|/\\\\]+")
 
+    /** A balanced bracket group, which is where an uploader puts a season the name itself has no room for. */
     private val bracketed = Regex("[(\\[<{][^()\\[\\]<>{}]*[)\\]>}]")
+
+    /**
+     * Every bracket character, which is a separator and never a title character.
+     *
+     * Telegram clips long captions, so a carefully uploaded name can lose its closing square bracket
+     * in transit: "Ballerina (2025) [English - 1080p HQ HDRip - x264 - [DDP 5." is the whole release
+     * list of one film, with only the first group closed. An opener left glued to the word after it
+     * makes "[English" something other than the tag "english", and the tail then never gets dropped.
+     * Each one becomes exactly one space, because the year boundary is read out of the offsets in the
+     * result and a deletion would move every number after it.
+     */
+    private val strayBracket = Regex("[()\\[\\]<>{}]")
 
     private val fourDigitYear = Regex("^(19|20)\\d{2}$")
 
@@ -112,7 +125,11 @@ object MediaNameParser {
         RegexOption.IGNORE_CASE
     )
 
-    private val yearInsideBrackets = Regex("(19|20)\\d{2}")
+    /**
+     * A year, with the digits either side ruled out so "20260805" in a phone recording is not read as
+     * one, and "1080p" never can be.
+     */
+    private val yearNumber = Regex("(?<!\\d)(19|20)\\d{2}(?!\\d)")
 
     /** A channel handle or group watermark glued onto the name. */
     private val handle = Regex("@[A-Za-z0-9_]+")
@@ -129,16 +146,29 @@ object MediaNameParser {
         "webrip", "webdl", "web", "hdtv", "hdrip", "telesync", "telescreen", "r5", "r6", "vhs",
         "laserdisc", "ptv", "dsr", "sat", "dv", "uhd", "fhd", "sdr", "hdr", "hdr10", "hdr10plus",
         "dolby", "atmos", "dts", "dtshr", "ac3", "eac3", "flac", "opus", "vorbis",
+        "dsnp", "dsn", "dsny", "atvp", "amzn", "hmax", "pmtp", "npvp", "cwa", "dmu",
         "audio", "dual", "multi", "multiaudio", "subs", "subbed", "hardcoded", "softsubs",
-        "multisubs", "eng", "english", "hin", "hindi", "tam", "tamil", "tel", "telugu", "mal",
-        "malayalam", "kan", "kannada", "ben", "bengali", "mar", "marathi", "jav", "japanese",
-        "chi", "chinese", "kor", "korean", "esp", "spanish", "fre", "french", "ger", "german",
-        "ita", "italian", "rus", "russian", "pun", "punjabi",
+        "multisubs",
         "uncut", "extended", "remastered", "remaster", "repack", "proper", "internal", "limited",
         "unrated", "censored", "uncensored", "theatrical", "imax", "final", "cut",
         "mkv", "mp4", "avi", "mov", "webm", "10bit", "8bit",
         "size", "gb", "mb", "nsb", "nzb", "torrent", "rarbg", "yts", "yify", "xoj", "evo", "cmrg",
         "telly", "htwr", "ecsv", "asap", "frss", "pspa", "rtf", "safu", "w4b", "sima", "flaws"
+    )
+
+    /**
+     * Codes that name the language a copy speaks rather than how it was made.
+     *
+     * They count only when they stand on their own. Half of a hyphenated word is somebody's name:
+     * "chi" is Mandarin and also the end of "Shang-Chi", and a word read entirely as a tag is dropped
+     * from the query — that hero's own title went with it, and a file left with no name in front of
+     * its year is never asked about at all. "Ben-Hur" and "Kan" sit in the same trap.
+     */
+    private val languageCodes = setOf(
+        "eng", "english", "hin", "hindi", "tam", "tamil", "tel", "telugu", "mal", "malayalam",
+        "kan", "kannada", "ben", "bengali", "mar", "marathi", "jav", "japanese", "chi", "chinese",
+        "kor", "korean", "esp", "spanish", "fre", "french", "ger", "german", "ita", "italian",
+        "rus", "russian", "pun", "punjabi"
     )
 
     private val releasePatterns = listOf(
@@ -156,16 +186,17 @@ object MediaNameParser {
     fun parse(rawName: String, thisYear: Int = Calendar.getInstance().get(Calendar.YEAR)): MediaGuess {
         val stem = stripExtension(directoryless(rawName))
         val brackets = bracketed.findAll(stem).joinToString(" ") { it.value }
-        val stripped = bracketed.replace(handle.replace(stem, " "), " ")
-
-        // An underscore separates words for every rule below, but \b does not know that: in
-        // "Stranger_Things_S03E01" there is no boundary before the S, so all three marker patterns
-        // read that name as a film and the episode escapes its series card. Swapping the character
-        // for a space costs nothing and leaves every offset exactly where it was.
-        val spaced = stripped.replace('_', ' ')
+        // The bracket characters and any watermark go, but as spaces rather than by deletion, so every
+        // offset still points at the same character of the name: the year is found by where it sits,
+        // and that only works if where it sits survives the cleanup. Underscores go the same way,
+        // because \b does not read one as a boundary — in "Stranger_Things_S03E01" there is none
+        // before the S, and the episode escapes its series card.
+        val spaced = strayBracket.replace(
+            handle.replace(stem) { " ".repeat(it.value.length) },
+            " "
+        ).replace('_', ' ')
 
         // Brackets are where a careful uploader puts the facts the release tail would otherwise hide.
-        val bracketYear = yearInsideBrackets.findAll(brackets).mapNotNull { it.value.toIntOrNull() }.lastOrNull()
         val bracketSeason = seasonAlone.findAll(brackets).mapNotNull { it.groupValues[1].toIntOrNull() }.lastOrNull()
 
         episodeMarker(spaced)?.let { marker ->
@@ -173,8 +204,16 @@ object MediaNameParser {
             val seasonInHead = if (marker.season == null) seasonAlone.find(head) else null
             val seriesText = if (seasonInHead != null) head.substring(0, seasonInHead.range.first) else head
             val series = phraseUpTo(seriesText, dropTrailingYear = true)
-            if (series.isBlank()) return MediaGuess.Unnamed(fallback(rawName, stripped))
-            val episodeTitle = phraseUpTo(spaced.substring(marker.end), dropTrailingYear = false)
+            if (series.isBlank()) return MediaGuess.Unnamed(fallback(rawName, spaced))
+            // A season written after the part number — "Episode 3 (Season 1)" — is the same fact the
+            // head carries, not the name of the episode, so it stops the tail the same way it stops
+            // the head.
+            val tail = spaced.substring(marker.end)
+            val seasonAfter = seasonAlone.find(tail)
+            val episodeTitle = phraseUpTo(
+                if (seasonAfter != null) tail.substring(0, seasonAfter.range.first) else tail,
+                dropTrailingYear = false
+            )
             return MediaGuess.Episode(
                 series = series,
                 season = marker.season ?: seasonInHead?.groupValues?.get(1)?.toIntOrNull() ?: bracketSeason,
@@ -183,30 +222,65 @@ object MediaNameParser {
             )
         }
 
-        val words = tokenize(stripped)
-        if (words.isEmpty()) return MediaGuess.Unnamed(fallback(rawName, stripped))
-        if (words.isUploadBoilerplate()) return MediaGuess.Unnamed(fallback(rawName, stripped))
+        val words = tokenize(spaced)
+        if (words.isEmpty()) return MediaGuess.Unnamed(fallback(rawName, spaced))
+        if (words.isUploadBoilerplate()) return MediaGuess.Unnamed(fallback(rawName, spaced))
 
-        // Right to left, so a title that ends in a number keeps it: Blade Runner 2049, not Blade Runner.
-        val yearIndex = words.indices
-            .reversed()
-            .filter { words[it].isPlausibleYear(thisYear) }
-            .firstOrNull { before -> words.subList(0, before).any { !isReleaseTag(it) } }
-
-        val title = if (yearIndex == null) {
-            joinUp(cutAtFirstTag(words))
+        // A year is the one edge in these names that does not depend on guessing which words an
+        // uploader used for quality: everything in front of it is the title and everything behind it
+        // is how this copy was made. Right to left, so a title that ends in a number keeps it —
+        // Blade Runner 2049, not Blade Runner.
+        val year = titleBlock(spaced, thisYear)
+        return if (year == null) {
+            // With no year to stop at, the first tag is the only edge available — unless taking it
+            // would leave nothing, which means that word is the name and not a tag.
+            val cut = cutAtFirstTag(words)
+            val title = joinUp(cut.ifEmpty { words })
+            if (title.isBlank()) MediaGuess.Unnamed(fallback(rawName, spaced))
+            else MediaGuess.Movie(title, null)
         } else {
-            joinUp(words.subList(0, yearIndex).filterNot { isReleaseTag(it) })
+            if (year.title.isBlank()) MediaGuess.Unnamed(fallback(rawName, spaced))
+            else MediaGuess.Movie(year.title, year.value)
         }
-        val year = yearIndex?.let { words[it].toIntOrNull() } ?: bracketYear
-
-        return if (title.isBlank()) MediaGuess.Unnamed(fallback(rawName, stripped)) else MediaGuess.Movie(title, year)
     }
 
-    private fun String.isPlausibleYear(thisYear: Int): Boolean {
-        if (length != 4 || !fourDigitYear.matches(this)) return false
-        val value = toIntOrNull() ?: return false
-        return value in OLDEST_YEAR..(thisYear + 1)
+    /** A release year and the name that stands in front of it. */
+    private data class YearText(val value: Int, val title: String)
+
+    /**
+     * The name and the year it was released, read out of where the year sits.
+     *
+     * Scanned from the right, so a title ending in a number keeps it — Blade Runner 2049, not Blade
+     * Runner — and a year only counts as a release date when something stands in front of it. Null
+     * when the name carries no plausible year at all, which leaves the release tags as the only edge.
+     */
+    private fun titleBlock(text: String, thisYear: Int): YearText? =
+        yearNumber.findAll(text)
+            .filter { it.range.first > 0 }
+            .mapNotNull { match ->
+                val value = match.value.toIntOrNull()
+                if (value == null || value !in OLDEST_YEAR..(thisYear + 1)) null else match to value
+            }
+            .lastOrNull { (match, _) -> tokenize(text.substring(0, match.range.first)).isNotEmpty() }
+            ?.let { (match, value) ->
+                YearText(
+                    value = value,
+                    title = joinUp(nameBeforeYear(tokenize(text.substring(0, match.range.first)), value))
+                )
+            }
+
+    /**
+     * The words in front of a release year that name the work.
+     *
+     * Tags spoken there describe this copy and go, but the first word stays whatever the list says
+     * about it, because a file name opens with its title — "Final Destination" is a name, and a word
+     * the list calls noise can still be the word a film is known by. A year repeated in front of the
+     * one just found is the uploader stating the release date twice, once bare and once in brackets,
+     * and a name never says the same year twice.
+     */
+    private fun nameBeforeYear(headWords: List<String>, year: Int): List<String> {
+        val kept = headWords.filterIndexed { index, word -> index == 0 || !isReleaseTag(word) }
+        return kept.dropLastWhile { it.matches(fourDigitYear) && it.toIntOrNull() == year }
     }
 
     /**
@@ -275,14 +349,15 @@ object MediaNameParser {
 
     private fun joinUp(words: List<String>): String = words.joinToString(" ").trim()
 
-    private fun isReleaseTag(word: String): Boolean {
+    private fun isReleaseTag(word: String, wholeWord: Boolean = true): Boolean {
         val lower = word.lowercase()
+        if (wholeWord && lower in languageCodes) return true
         if (lower in releaseWords) return true
         if (releasePatterns.any { it.matches(lower) }) return true
         // "x264-group" and "web-dl" are one tag; "Spider-Man" has no tagged half.
         if (word.contains('-')) {
             val parts = word.split('-').filter { it.isNotBlank() }
-            if (parts.size > 1) return parts.any { isReleaseTag(it) }
+            if (parts.size > 1) return parts.any { isReleaseTag(it, wholeWord = false) }
         }
         return false
     }

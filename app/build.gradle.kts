@@ -10,7 +10,29 @@ val localProperties = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) file.inputStream().use { load(it) }
 }
-fun localProp(key: String): String = (localProperties.getProperty(key) ?: "").replace("\"", "\\\"")
+val signingProperties = Properties().apply {
+    val file = rootProject.file("signing.properties")
+    if (file.exists()) file.inputStream().use { load(it) }
+}
+val releaseVersion = Properties().apply {
+    rootProject.file("version.properties").inputStream().use { load(it) }
+}
+fun credential(environment: String, key: String): String =
+    providers.environmentVariable(environment).orNull ?: localProperties.getProperty(key).orEmpty()
+fun signingValue(environment: String, key: String): String =
+    providers.environmentVariable(environment).orNull ?: signingProperties.getProperty(key).orEmpty()
+fun quoted(value: String): String = "\"" + value.replace("\\", "\\\\")
+    .replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r") + "\""
+
+val telegramApiId = credential("TG_API_ID", "tg.api.id").toIntOrNull() ?: 0
+val telegramApiHash = credential("TG_API_HASH", "tg.api.hash")
+val tmdbApiKey = credential("TMDB_API_KEY", "tmdb.api.key")
+val releaseStorePath = signingValue("RELEASE_STORE_FILE", "storeFile")
+val releaseStorePassword = signingValue("RELEASE_STORE_PASSWORD", "storePassword")
+val releaseKeyAlias = signingValue("RELEASE_KEY_ALIAS", "keyAlias")
+val releaseKeyPassword = signingValue("RELEASE_KEY_PASSWORD", "keyPassword")
+val splitApks = providers.gradleProperty("splitApks").orNull == "true"
+val supportedAbis = listOf("arm64-v8a", "x86_64")
 
 android {
     namespace = "com.aeswox.arcplayer"
@@ -20,24 +42,46 @@ android {
         applicationId = "com.aeswox.arcplayer"
         minSdk = 31
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = releaseVersion.getProperty("VERSION_CODE").toInt()
+        versionName = releaseVersion.getProperty("VERSION_NAME")
 
-        // TDLib ships ~22 MB of native code per ABI; these are the only two we run on.
-        ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+        if (!splitApks) {
+            ndk { abiFilters += supportedAbis }
         }
 
-        buildConfigField("int", "TG_API_ID", localProp("tg.api.id").ifEmpty { "0" })
-        buildConfigField("String", "TG_API_HASH", "\"${localProp("tg.api.hash")}\"")
-        buildConfigField("String", "TMDB_API_KEY", "\"${localProp("tmdb.api.key")}\"")
+        buildConfigField("int", "TG_API_ID", telegramApiId.toString())
+        buildConfigField("String", "TG_API_HASH", quoted(telegramApiHash))
+        buildConfigField("String", "TMDB_API_KEY", quoted(tmdbApiKey))
+    }
+
+    splits {
+        abi {
+            isEnable = splitApks
+            reset()
+            include(*supportedAbis.toTypedArray())
+            isUniversalApk = true
+        }
+    }
+
+    packaging {
+        // Universal splits otherwise include every ABI bundled in the native dependencies.
+        jniLibs.excludes += setOf("lib/armeabi-v7a/**", "lib/x86/**")
+    }
+
+    signingConfigs {
+        create("release") {
+            if (releaseStorePath.isNotBlank()) storeFile = rootProject.file(releaseStorePath)
+            storePassword = releaseStorePassword
+            keyAlias = releaseKeyAlias
+            keyPassword = releaseKeyPassword
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -60,11 +104,28 @@ android {
     }
 }
 
+val validateReleaseInputs by tasks.registering {
+    doLast {
+        check(telegramApiId > 0 && telegramApiHash.isNotBlank() && tmdbApiKey.isNotBlank()) {
+            "Release builds require TG_API_ID, TG_API_HASH and TMDB_API_KEY (or local.properties)."
+        }
+        check(releaseStorePath.isNotBlank() && rootProject.file(releaseStorePath).isFile &&
+            releaseStorePassword.isNotBlank() && releaseKeyAlias.isNotBlank() &&
+            releaseKeyPassword.isNotBlank()) {
+            "Release builds require a private signing key. Configure signing.properties or RELEASE_* environment variables."
+        }
+    }
+}
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    dependsOn(validateReleaseInputs)
+}
+
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
     implementation(composeBom)
 
     implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.core:core-splashscreen:1.0.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.activity:activity-compose:1.9.3")

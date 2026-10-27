@@ -28,8 +28,10 @@ import android.os.CancellationSignal
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.LruCache
 import android.util.Rational
 import android.util.Size
@@ -47,12 +49,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedVisibilityScope
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.ExperimentalSharedTransitionApi
 import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationState
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.DecayAnimationSpec
 import androidx.compose.animation.core.EaseInOutSine
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -72,10 +76,11 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.shrinkHorizontally
-import androidx.compose.animation.rememberSplineBasedDecay
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.BorderStroke
@@ -86,23 +91,21 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.FlingBehavior
 import androidx.compose.foundation.gestures.Orientation
-import androidx.compose.foundation.gestures.ScrollScope
-import androidx.compose.foundation.gestures.ScrollableState
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -128,6 +131,7 @@ import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyGridScope
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -138,6 +142,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Favorite
@@ -145,11 +150,7 @@ import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -184,12 +185,14 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
@@ -207,8 +210,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.PointerEventPass
-import androidx.compose.ui.input.pointer.changedToDown
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
@@ -217,7 +219,9 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -231,19 +235,27 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import com.aeswox.arcplayer.ui.animations.headerActionRetreat
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.aeswox.arcplayer.ui.animations.StaggeredListItem
 import com.aeswox.arcplayer.ui.animations.jelly
 import com.aeswox.arcplayer.ui.animations.jellyClick
 import com.aeswox.arcplayer.ui.animations.rememberHeaderActionsVisible
 import com.aeswox.arcplayer.ui.animations.jellyCombinedClickable
 import com.aeswox.arcplayer.ui.animations.jellyTabCrossSlide
+import com.aeswox.arcplayer.ui.animations.jellySkeletonSweep
 import com.aeswox.arcplayer.ui.animations.physicsBounceOverscroll
+import com.aeswox.arcplayer.ui.components.ClapperIntroGate
 import com.aeswox.arcplayer.ui.components.FrostedDialog
 import com.aeswox.arcplayer.ui.components.FrostedModalPanel
+import com.aeswox.arcplayer.ui.components.HugeIcons
 import com.aeswox.arcplayer.ui.components.MorphingMenu
 import com.aeswox.arcplayer.ui.components.MorphingMenuItem
 import com.aeswox.arcplayer.ui.haptics.AppHaptics
@@ -255,7 +267,6 @@ import com.aeswox.arcplayer.ui.theme.OnBackground as JellyOnBackground
 import com.aeswox.arcplayer.ui.theme.OnPrimary as JellyOnPrimary
 import com.aeswox.arcplayer.ui.theme.OnSurface as JellyOnSurface
 import com.aeswox.arcplayer.ui.theme.OnSurfaceVariant as JellyOnSurfaceVariant
-import com.aeswox.arcplayer.ui.theme.Outline as JellyOutline
 import com.aeswox.arcplayer.ui.theme.Primary as JellyPrimary
 import com.aeswox.arcplayer.ui.theme.Surface as JellySurface
 import com.aeswox.arcplayer.ui.theme.SurfaceContainer as JellySurfaceContainer
@@ -272,8 +283,14 @@ import com.aeswox.arcplayer.cloud.CloudSession
 import com.aeswox.arcplayer.cloud.CloudVideoItem
 import com.aeswox.arcplayer.cloud.CloudWindowPlanner
 import com.aeswox.arcplayer.cloud.CodeHint
+import com.aeswox.arcplayer.cloud.DownloadEntry
+import com.aeswox.arcplayer.cloud.DownloadLedger
+import com.aeswox.arcplayer.cloud.DownloadNotifier
+import com.aeswox.arcplayer.cloud.DownloadNotices
+import com.aeswox.arcplayer.cloud.KeptMedia
 import com.aeswox.arcplayer.cloud.CloudProgress
 import com.aeswox.arcplayer.cloud.SHELF_CHANNEL_TITLE
+import com.aeswox.arcplayer.cloud.formatCloudBytes
 import com.aeswox.arcplayer.metadata.AbsoluteSeasons
 import com.aeswox.arcplayer.metadata.EpisodeDetail
 import com.aeswox.arcplayer.metadata.LookupRequest
@@ -300,18 +317,19 @@ import com.aeswox.arcplayer.playback.ResumeOutcome
 import com.aeswox.arcplayer.playback.ResumeRules
 import com.aeswox.arcplayer.playback.SeekHold
 import com.aeswox.arcplayer.playback.TrackChoice
-import com.aeswox.arcplayer.scroll.HeaderFling
 import com.aeswox.arcplayer.stream.ByteRate
 import com.aeswox.arcplayer.stream.BufferGuard
 import dev.chrisbanes.haze.HazeState
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import java.io.File
 import java.util.Locale
 import kotlin.coroutines.coroutineContext
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
@@ -322,6 +340,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
@@ -343,8 +362,16 @@ class MainActivity : ComponentActivity() {
     var autoPipEnabled: Boolean = true
     var isInPipState by mutableStateOf(false)
 
+    private var introNotDrawnYet = true
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        val systemPanel = installSplashScreen()
         super.onCreate(savedInstanceState)
+        // Android's own splash panel would show the launcher icon and then crossfade into the app — a
+        // second, frozen clapperboard stacked on top of the one the intro draws. It is not removed, only
+        // kept up until the app has drawn its first frame: the handover is black onto black, and the
+        // only mark ever on screen is the animated one.
+        systemPanel.setKeepOnScreenCondition { introNotDrawnYet }
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(
                 scrim = android.graphics.Color.TRANSPARENT
@@ -355,7 +382,11 @@ class MainActivity : ComponentActivity() {
         )
         setContent {
             ArcPlayerTheme {
-                ArcPlayerHomeScreen()
+                ClapperIntroGate(
+                    onFirstFrame = { introNotDrawnYet = false }
+                ) {
+                    ArcPlayerHomeScreen()
+                }
             }
         }
     }
@@ -401,7 +432,9 @@ private val OneUiSelectedFill = JellyPrimary
 private val OneUiOnSelectedFill = JellyOnPrimary
 private val OneUiAccent = JellyAccent
 private val OneUiDestructive = JellyError
-private val OneUiPlaceholderGray = JellyOutline
+
+/** A flat grey block reads as a finished, empty cell; this is the surface the skeleton sweep crosses. */
+private val SlotWaitingTint = Color.White.copy(alpha = 0.06f)
 
 private const val CARD_ASPECT_RATIO = 0.78f
 private val CardCornerShape = RoundedCornerShape(22.dp)
@@ -438,6 +471,17 @@ fun ArcPlayerTheme(content: @Composable () -> Unit) {
 // ============================================================================
 // PERSISTENT PREFERENCES, WATCH HISTORY, FAVORITES & PLAYLISTS STORE
 // ============================================================================
+
+/** Subtitle lift is asked for as a share of the picture's height, and 40 % is already most of a line. */
+private const val SUBTITLE_LIFT_MAX_PERCENT = 40
+
+/** The band the size control is allowed to move inside, measured against the size the player uses today. */
+private const val SUBTITLE_SIZE_MIN_PERCENT = 60
+private const val SUBTITLE_SIZE_MAX_PERCENT = 200
+
+/** One tap on either control. Small enough that a viewer can stop on the look they came for. */
+private const val SUBTITLE_LIFT_STEP_PERCENT = 4
+private const val SUBTITLE_SIZE_STEP_PERCENT = 20
 
 @Immutable
 enum class VideoSortOrder(val label: String) {
@@ -500,7 +544,18 @@ class ArcPreferencesStore(context: Context) {
         private set
     var autoPipEnabled by mutableStateOf(true)
         private set
-    var defaultPlaybackSpeed by mutableFloatStateOf(1.0f)
+
+    /**
+     * How the viewer wants their subtitles: a lift off the bottom of the picture as a share of its
+     * height, and a font size as a share of the one the player draws by default.
+     *
+     * Kept here rather than in the engine because the engine is thrown away every time the player
+     * closes, and because libVLC reads both numbers only as a media opens — so the next film has to be
+     * able to pick the answer up without anything else having to remember to hand it over.
+     */
+    var subtitleLiftPercent by mutableIntStateOf(0)
+        private set
+    var subtitleSizePercent by mutableIntStateOf(100)
         private set
 
     /**
@@ -530,14 +585,15 @@ class ArcPreferencesStore(context: Context) {
         private set
 
     /**
-     * When each cloud file was last played, keyed by its stable id.
+     * When each file was last played, keyed by its stable id — from the channel or off this phone.
      *
-     * The order the app throws its local copies away in, and the only reason it can say how many bytes
-     * of watched video it is holding without asking Telegram about every file on the shelf. Keyed by
-     * the server-derived id rather than by TDLib's file id, which is handed out again whenever the
-     * database is rebuilt: a trim order built from that restarts from nothing on the next launch.
+     * The one figure that lets a shelf card say "Resume" instead of "Play" when the copy the viewer last
+     * reached for is not the one its name ranks best, and the reason the Continue Watching rail can order
+     * itself by what was watched rather than by what was uploaded. Keyed by the id the file is played
+     * under — MediaStore's own for a device file, the derived one for a Telegram copy — so both sorts land
+     * in the same map and a locally watched film moves the rail exactly as a channel one does.
      */
-    val cloudWatchedAt = mutableStateMapOf<Long, Long>()
+    val watchedAt = mutableStateMapOf<Long, Long>()
 
     /**
      * How long each file runs, keyed by the id it was played under, as the player reported it.
@@ -560,7 +616,8 @@ class ArcPreferencesStore(context: Context) {
             gridColumns = prefs.getInt("grid_columns", 3).coerceIn(2, 4)
             backgroundAudioEnabled = prefs.getBoolean("bg_audio", false)
             autoPipEnabled = prefs.getBoolean("auto_pip", true)
-            defaultPlaybackSpeed = prefs.getFloat("default_speed", 1.0f).coerceIn(0.5f, 2.0f)
+            subtitleLiftPercent = prefs.getInt("subtitle_lift_pct", 0).coerceIn(0, SUBTITLE_LIFT_MAX_PERCENT)
+            subtitleSizePercent = prefs.getInt("subtitle_size_pct", 100).coerceIn(SUBTITLE_SIZE_MIN_PERCENT, SUBTITLE_SIZE_MAX_PERCENT)
 
             hapticsEnabled = prefs.getBoolean("haptics_enabled", true)
             hapticIntensity = HapticIntensity.fromName(prefs.getString("haptic_intensity", null))
@@ -577,7 +634,7 @@ class ArcPreferencesStore(context: Context) {
             watchedJson.keys().forEach { key ->
                 val id = key.toLongOrNull()
                 val at = watchedJson.optLong(key, 0L)
-                if (id != null && at > 0L) cloudWatchedAt[id] = at
+                if (id != null && at > 0L) watchedAt[id] = at
             }
 
             val posJson = JSONObject(prefs.getString("resume_positions", "{}") ?: "{}")
@@ -636,7 +693,10 @@ class ArcPreferencesStore(context: Context) {
                         logoUrl = card.optString("logo").nullIfBlank(),
                         logoKnown = card.optBoolean("logoKnown"),
                         providerId = card.optInt("providerId").takeIf { it > 0 },
-                        isSeries = card.optBoolean("isSeries")
+                        isSeries = card.optBoolean("isSeries"),
+                        // Absent on every card written before the stamp existed, which reads as 0 and
+                        // so counts as an answer owed a second look.
+                        rules = card.optInt("rules")
                     )
                 }
             }
@@ -674,6 +734,7 @@ class ArcPreferencesStore(context: Context) {
                     .put("logoKnown", card.logoKnown)
                     .put("providerId", card.providerId ?: JSONObject.NULL)
                     .put("isSeries", card.isSeries)
+                    .put("rules", card.rules)
             )
         }
         prefs.edit().putString("media_cards", obj.toString()).apply()
@@ -686,15 +747,17 @@ class ArcPreferencesStore(context: Context) {
     /**
      * Remembers what the catalogue said about one title.
      *
-     * Only ever written when a page is opened, so the store grows with the titles actually looked at
-     * rather than with every card on the shelf — and a second open of the same film costs no request.
+     * A shelf warming pass writes every title it holds, so the wide artwork is known before a card is
+     * tapped; `persist` is false there because thirty separate writes of the whole blob is thirty times
+     * the disk work one batched write costs.
      */
-    fun rememberTitleDetail(providerId: Int, isSeries: Boolean, detail: TitleDetail) {
+    fun rememberTitleDetail(providerId: Int, isSeries: Boolean, detail: TitleDetail, persist: Boolean = true) {
         titleDetails[titleDetailKey(providerId, isSeries)] = detail
-        persistTitleDetails()
+        if (persist) persistTitleDetails()
     }
 
-    private fun persistTitleDetails() {
+    /** The whole detail store as one blob, so a warm pass writes it once rather than thirty times. */
+    fun persistTitleDetails() {
         val obj = JSONObject()
         titleDetails.forEach { (key, detail) -> obj.put(key, detail.toJson()) }
         prefs.edit().putString("title_details", obj.toString()).apply()
@@ -713,16 +776,19 @@ class ArcPreferencesStore(context: Context) {
     }
 
     /**
-     * Marks a cloud file as the most recently watched thing on the device.
+     * Mark a file as the most recently watched thing on the device.
      *
      * Written when playback opens rather than when it closes: a film abandoned two minutes in is still
      * the film the viewer last reached for, and it is the one most likely to be reached for again
      * tonight.
+     *
+     * The stored key still says "cloud" from when only a Telegram copy could be watched. Renaming it
+     * would cost every install its place in the rail.
      */
-    fun rememberCloudWatched(videoId: Long) {
-        cloudWatchedAt[videoId] = System.currentTimeMillis()
+    fun rememberWatchedAt(videoId: Long) {
+        watchedAt[videoId] = System.currentTimeMillis()
         val obj = JSONObject()
-        cloudWatchedAt.forEach { (id, at) -> obj.put(id.toString(), at) }
+        watchedAt.forEach { (id, at) -> obj.put(id.toString(), at) }
         prefs.edit().putString("cloud_watched_at", obj.toString()).apply()
     }
 
@@ -747,9 +813,13 @@ class ArcPreferencesStore(context: Context) {
         prefs.edit().putBoolean("auto_pip", enabled).apply()
     }
 
-    fun updateDefaultSpeed(speed: Float) {
-        defaultPlaybackSpeed = speed
-        prefs.edit().putFloat("default_speed", speed).apply()
+    fun updateSubtitleStyle(liftPercent: Int, sizePercent: Int) {
+        subtitleLiftPercent = liftPercent.coerceIn(0, SUBTITLE_LIFT_MAX_PERCENT)
+        subtitleSizePercent = sizePercent.coerceIn(SUBTITLE_SIZE_MIN_PERCENT, SUBTITLE_SIZE_MAX_PERCENT)
+        prefs.edit()
+            .putInt("subtitle_lift_pct", subtitleLiftPercent)
+            .putInt("subtitle_size_pct", subtitleSizePercent)
+            .apply()
     }
 
     fun updateHaptics(enabled: Boolean) {
@@ -920,14 +990,36 @@ class ArcPreferencesStore(context: Context) {
 data class VideoItem(
     val id: Long,
     val uri: Uri,
-    val title: String,
+    override val title: String,
     val bucketId: String,
     val folderName: String,
-    val durationMs: Long,
+    override val durationMs: Long,
     val durationFormatted: String,
-    val sizeBytes: Long,
-    val dateAddedSec: Long
-)
+    override val sizeBytes: Long,
+    val dateAddedSec: Long,
+    /**
+     * MediaStore's own path, like `Movies/` or `DCIM/Camera/`.
+     *
+     * Kept because the leaf name alone cannot tell a film from a messenger's saved clip: one lives a
+     * whole floor down, in `Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video/`.
+     */
+    val relativePath: String = "",
+    override val frameHeight: Int = 0,
+) : Playable {
+    override val stableId: Long get() = id
+    override val arrivedAtSec: Long get() = dateAddedSec
+    override val sizeFormatted: String get() = formatCloudBytes(sizeBytes)
+
+    /**
+     * A grid row is not proof of where the file lives, only of the key it is filed under: a Telegram
+     * video is presented as one of these, and [CloudIds] gives it a negative key for exactly this
+     * reason. So the sign answers the question even when the row came off the channel.
+     */
+    override val isOnPhone: Boolean get() = id >= 0L
+
+    override fun withLength(learnedMs: Long): VideoItem =
+        copy(durationMs = maxOf(durationMs, learnedMs))
+}
 
 @Immutable
 data class VideoFolderItem(
@@ -951,7 +1043,8 @@ enum class BottomNavTab(val label: String) {
 }
 
 private enum class LibraryPage(val headerTitle: String) {
-    VIDEOS("All videos"), FOLDERS("On Device"), CLOUD("Collection"), MENU("Settings")
+    VIDEOS("All videos"), FOLDERS("On Device"), CLOUD("Collection"), MENU("Settings"),
+    DOWNLOADS("Downloads")
 }
 
 /**
@@ -1014,7 +1107,8 @@ suspend fun scanDeviceVideos(context: Context): MediaLibrarySnapshot = withConte
         MediaStore.Video.Media.DURATION,
         MediaStore.Video.Media.SIZE,
         MediaStore.Video.Media.DATE_ADDED,
-        MediaStore.Video.Media.RELATIVE_PATH
+        MediaStore.Video.Media.RELATIVE_PATH,
+        MediaStore.MediaColumns.HEIGHT
     )
 
     val sortOrder = "${MediaStore.Video.Media.DATE_ADDED} DESC"
@@ -1036,6 +1130,11 @@ suspend fun scanDeviceVideos(context: Context): MediaLibrarySnapshot = withConte
             val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
             val dateAddedCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)
             val relativePathCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.RELATIVE_PATH)
+            // Height tells the shelf whether a file whose name says nothing is a 1080p rip or a 480p one,
+            // which is the same evidence Telegram's own frame size gives for a channel file. It is asked
+            // leniently because it is a bonus rather than a requirement: some scanners publish video rows
+            // with no dimensions at all, and a missing column is worth less than the whole library.
+            val heightCol = cursor.getColumnIndex(MediaStore.MediaColumns.HEIGHT)
 
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idCol)
@@ -1077,17 +1176,31 @@ suspend fun scanDeviceVideos(context: Context): MediaLibrarySnapshot = withConte
                         durationMs = durationMs,
                         durationFormatted = formatDuration(durationMs),
                         sizeBytes = sizeBytes,
-                        dateAddedSec = dateAddedSec
+                        dateAddedSec = dateAddedSec,
+                        relativePath = relativePath,
+                        frameHeight = if (heightCol >= 0) cursor.getInt(heightCol) else 0
                     )
                 )
             }
         }
     }
 
-    val nowSec = System.currentTimeMillis() / 1000L
-    val recentThresholdSec = nowSec - 86_400L
+    MediaLibrarySnapshot(
+        videos = videos,
+        folders = foldersOf(videos)
+    )
+}
 
-    val folders = videos
+/**
+ * The folders one pile of files fills, in the order the browser shows them.
+ *
+ * Rebuilt from a pile rather than filtered from the folders of a bigger one, because a folder's count,
+ * cover and "recent" tick all belong to the files actually standing in it. Narrow the library by
+ * dropping half the rows and a card still saying "12 videos" over a grid of three is a card that lies.
+ */
+private fun foldersOf(videos: List<VideoItem>): List<VideoFolderItem> {
+    val recentThresholdSec = System.currentTimeMillis() / 1000L - 86_400L
+    return videos
         .groupBy { it.bucketId }
         .map { (bucketId, bucketVideos) ->
             val first = bucketVideos.first()
@@ -1108,11 +1221,19 @@ suspend fun scanDeviceVideos(context: Context): MediaLibrarySnapshot = withConte
                 .thenByDescending { it.title.equals("Download", ignoreCase = true) || it.title.equals("Downloads", ignoreCase = true) }
                 .thenBy { it.title.lowercase(Locale.ROOT) }
         )
+}
 
-    MediaLibrarySnapshot(
-        videos = videos,
-        folders = folders
-    )
+/**
+ * This library narrowed to the files that belong to a film or an episode.
+ *
+ * The phone's video table is the camera roll, the screen recordings and last Tuesday's clip together
+ * with the movies, and the viewer has asked to be shown the movies. Which rows those are is not decided
+ * twice: [kept] is the shelf's own answer — the one pass that reads a file name against a catalogue —
+ * so this is a filter over the ids it recognised, with the folders rebuilt from what survived.
+ */
+internal fun MediaLibrarySnapshot.filmsOnly(kept: Set<Long>): MediaLibrarySnapshot {
+    val films = videos.filter { it.id in kept }
+    return if (films.size == videos.size) this else copy(videos = films, folders = foldersOf(films))
 }
 
 fun sortVideos(videos: List<VideoItem>, order: VideoSortOrder): List<VideoItem> {
@@ -1354,23 +1475,77 @@ data class VlcTrackOption(
 @Stable
 class ArcVlcPlayerEngine(
     context: Context,
-    initialRate: Float = 1.0f
+    initialSubtitleLiftPercent: Int = 0,
+    initialSubtitleSizePercent: Int = 100
 ) : IVLCVout.OnNewVideoLayoutListener {
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private val libVlc: LibVLC = LibVLC(
-        appContext,
-        arrayListOf(
+    /**
+     * The viewer's subtitle placement: a lift off the bottom of the picture and a size against
+     * VLC's own.
+     *
+     * Declared above [libVlc] because its numbers go into the arguments that instance is built with,
+     * and a property read before its own initialiser runs reads zero rather than what the viewer asked.
+     */
+    var subtitleLiftPercent by mutableIntStateOf(
+        initialSubtitleLiftPercent.coerceIn(0, SUBTITLE_LIFT_MAX_PERCENT)
+    )
+        private set
+    var subtitleSizePercent by mutableIntStateOf(
+        initialSubtitleSizePercent.coerceIn(SUBTITLE_SIZE_MIN_PERCENT, SUBTITLE_SIZE_MAX_PERCENT)
+    )
+        private set
+
+    /** Asked to remember the two numbers above, so the next film — and the next launch — starts with them. */
+    var onSubtitleStyleChange: ((liftPercent: Int, sizePercent: Int) -> Unit)? = null
+
+    /** Height of the surface the picture is drawn into, which is what a lift in percent is measured against. */
+    private var subtitleSurfaceHeightPx = 0
+
+    /**
+     * The picture height a subtitle lift is measured against.
+     *
+     * VLC counts the margin in pixels from the bottom of what it draws into, so the surface itself is
+     * the honest answer. Before the first layout there is none, and the shorter edge of the screen is
+     * used — the same number a full-screen landscape player hands back a moment later.
+     */
+    private fun subtitleWindowHeightPx(): Int =
+        if (subtitleSurfaceHeightPx > 0) subtitleSurfaceHeightPx
+        else minOf(
+            appContext.resources.displayMetrics.widthPixels,
+            appContext.resources.displayMetrics.heightPixels
+        )
+
+    /**
+     * Every argument this libVLC instance is built with, the two subtitle numbers among them.
+     *
+     * They can only be said here. VLC reads a caption's margin and text scale when it makes the
+     * subpicture thread that belongs to an instance, and never asks the media about them again — a
+     * `:sub-margin` or `:sub-text-scale` handed to a [Media] is dropped on the floor, which is how
+     * both first looked wired up and did nothing. So a style change builds a new instance rather than
+     * a new media, which is what [restartVlcInstance] is for.
+     */
+    private fun vlcInstanceArgs(): ArrayList<String> {
+        val args = arrayListOf(
             "--avcodec-hw=any",
             "--android-display-chroma=RV32",
             "--no-drop-late-frames",
-            "--no-skip-frames",
-            "--freetype-rel-fontsize=16"
+            "--no-skip-frames"
         )
-    )
+        if (subtitleLiftPercent > 0) {
+            args += "--sub-margin=${subtitleWindowHeightPx() * subtitleLiftPercent / 100}"
+        }
+        if (subtitleSizePercent != 100) {
+            args += "--sub-text-scale=$subtitleSizePercent"
+        }
+        return args
+    }
 
-    val mediaPlayer: MediaPlayer = MediaPlayer(libVlc)
+    private var libVlc: LibVLC = LibVLC(appContext, vlcInstanceArgs())
+
+    var mediaPlayer: MediaPlayer = MediaPlayer(libVlc)
+        private set
 
     private var activePfd: ParcelFileDescriptor? = null
     private var attachedTextureView: TextureView? = null
@@ -1416,6 +1591,20 @@ class ArcVlcPlayerEngine(
 
     var isFirstFrameRendered by mutableStateOf(false)
         private set
+
+    /**
+     * Whether the input itself refused the file being opened, rather than merely going quiet on it.
+     *
+     * Set only for a file that has never shown a picture, which is what separates the two: a copy of a
+     * film that has already painted and then hits an error is a download that fell over, and the
+     * watchdog's job is to re-open the same bytes. A copy that never painted at all is a file this
+     * player cannot read, and the shelf usually holds another one of the same part.
+     */
+    var openRefused by mutableStateOf(false)
+        private set
+
+    /** Whether the file currently loaded has painted once, kept across a stall re-open of the same file. */
+    private var hasPaintedForLoadedVideo = false
 
     var currentPositionMs by mutableLongStateOf(0L)
         private set
@@ -1509,7 +1698,14 @@ class ArcVlcPlayerEngine(
     var videoAspectRatio by mutableFloatStateOf(16f / 9f)
         private set
 
-    var playbackRate by mutableFloatStateOf(initialRate)
+    /**
+     * Whether [videoAspectRatio] is the film's own or the placeholder the layout is drawn against
+     * before libVLC has reported a video track.
+     *
+     * The placeholder is 16:9, so anything that decides orientation from the number alone would send a
+     * vertical clip to landscape and back again a few hundred milliseconds later.
+     */
+    var videoLayoutKnown by mutableStateOf(false)
         private set
 
     var softwareBoostPercent by mutableIntStateOf(100)
@@ -1549,6 +1745,14 @@ class ArcVlcPlayerEngine(
     private var loadedVideoId: Long? = null
 
     /**
+     * The item [loadAndPlay] was last handed, uri and all.
+     *
+     * Held because a subtitle style change has to reopen the same file to take effect, and by then the
+     * screen is showing the film, not deciding which copy of it to open.
+     */
+    private var currentVideo: VideoItem? = null
+
+    /**
      * The caption forwarded into the channel for whatever is playing, once Telegram has delivered it.
      *
      * Held here rather than passed once at the screen, because a stall re-opens the media on the
@@ -1561,6 +1765,16 @@ class ArcVlcPlayerEngine(
     private var captionIsOn = false
 
     init {
+        bindPlayerEvents()
+    }
+
+    /**
+     * Hand the player now owned by this engine its events.
+     *
+     * Kept out of the constructor because [restartVlcInstance] builds a new player, and a new player
+     * tells this engine nothing until it is told to listen again.
+     */
+    private fun bindPlayerEvents() {
         mediaPlayer.setEventListener { event ->
             when (event.type) {
                 MediaPlayer.Event.Playing -> {
@@ -1599,9 +1813,18 @@ class ArcVlcPlayerEngine(
                 MediaPlayer.Event.Vout -> {
                     if (event.voutCount > 0) {
                         isFirstFrameRendered = true
+                        hasPaintedForLoadedVideo = true
                         refreshTracks()
+                        publishVideoLayout()
                         mainHandler.post { applyContentFrameRate() }
                     }
+                }
+
+                // The one signal that separates a file this player cannot read from a download that has
+                // gone quiet: both leave the player equally still, and only the first is worth answering
+                // with a different copy of the same film.
+                MediaPlayer.Event.EncounteredError -> {
+                    if (!hasPaintedForLoadedVideo) openRefused = true
                 }
 
                 MediaPlayer.Event.TimeChanged -> {
@@ -1620,6 +1843,7 @@ class ArcVlcPlayerEngine(
     }
 
     fun loadAndPlay(video: VideoItem, startPositionMs: Long = 0L) {
+        currentVideo = video
         isFirstFrameRendered = false
         bufferedSeek?.cancel()
         seekHold = null
@@ -1627,6 +1851,7 @@ class ArcVlcPlayerEngine(
         pausedForSeek = false
         stoppedOnPurpose = false
         isBuffering = false
+        videoLayoutKnown = false
         lastTickAtMs = BufferGuard.NEVER
         playOwedSinceMs = BufferGuard.NEVER
         currentPositionMs = startPositionMs.coerceAtLeast(0L)
@@ -1639,6 +1864,10 @@ class ArcVlcPlayerEngine(
             preferredSubtitleTrackId = null
             subtitleDelayMs = 0L
             captionUri = null
+            // A different file is a different chance to paint, so the refusal recorded against the last
+            // one — and the fact that this one has not been seen yet — start from nothing.
+            hasPaintedForLoadedVideo = false
+            openRefused = false
         }
         // Whatever caption was on the last media went away with it, and this one has not been given one.
         captionIsOn = false
@@ -1665,7 +1894,6 @@ class ArcVlcPlayerEngine(
         mediaPlayer.media = media
         media.release()
 
-        mediaPlayer.rate = playbackRate
         mediaPlayer.volume = softwareBoostPercent
         // A new Media means a new input thread, and the player-level settings above do not follow it
         // across; the subtitle offset is one of them, so it is pushed back on with the rest.
@@ -1683,6 +1911,7 @@ class ArcVlcPlayerEngine(
         vout.setVideoView(textureView)
         if (textureView.width > 0 && textureView.height > 0) {
             vout.setWindowSize(textureView.width, textureView.height)
+            subtitleSurfaceHeightPx = textureView.height
         }
         vout.attachViews(this)
     }
@@ -1690,6 +1919,7 @@ class ArcVlcPlayerEngine(
     fun updateSurfaceSize(width: Int, height: Int) {
         if (width > 0 && height > 0 && mediaPlayer.vlcVout.areViewsAttached()) {
             mediaPlayer.vlcVout.setWindowSize(width, height)
+            subtitleSurfaceHeightPx = height
         }
     }
 
@@ -1719,8 +1949,36 @@ class ArcVlcPlayerEngine(
             if (ratio in 0.25f..4.0f) {
                 mainHandler.post {
                     videoAspectRatio = ratio
+                    videoLayoutKnown = true
                 }
             }
+        }
+    }
+
+    /**
+     * The film's own shape, read off the track the decoder is actually showing.
+     *
+     * [onNewVideoLayout] is the documented source for this and it never answers on a real phone:
+     * measured on a Note10+, every call it made carried six zeros, so the layout kept drawing against
+     * the 16:9 placeholder and nothing downstream ever learned the film was widescreen. The selected
+     * video track holds the same numbers — the coded size, plus the sample aspect ratio that says how
+     * wide each of those pixels is — and the player is already asked for it once the picture exists,
+     * which is why this runs from the same event rather than on a poll of its own.
+     */
+    private fun publishVideoLayout() {
+        val track = runCatching { mediaPlayer.currentVideoTrack }.getOrNull() ?: return
+        val width = track.width
+        val height = track.height
+        if (width <= 0 || height <= 0) return
+        val sar = if (track.sarNum > 0 && track.sarDen > 0) {
+            track.sarNum.toFloat() / track.sarDen.toFloat()
+        } else {
+            1f
+        }
+        val ratio = (width * sar) / height.toFloat()
+        if (ratio in 0.25f..4.0f) {
+            videoAspectRatio = ratio
+            videoLayoutKnown = true
         }
     }
 
@@ -1870,12 +2128,6 @@ class ArcVlcPlayerEngine(
         seekTo(currentPositionMs + deltaMs)
     }
 
-    fun setSpeed(rate: Float) {
-        val clamped = rate.coerceIn(0.25f, 3.0f)
-        playbackRate = clamped
-        mediaPlayer.rate = clamped
-    }
-
     fun setSoftwareBoost(percent: Int) {
         val clamped = percent.coerceIn(100, 200)
         softwareBoostPercent = clamped
@@ -1923,6 +2175,64 @@ class ArcVlcPlayerEngine(
         val nextMs = if (deltaMs == 0L) 0L else subtitleDelayMs + deltaMs
         subtitleDelayMs = nextMs
         mediaPlayer.setSpuDelay(nextMs * 1000L)
+    }
+
+    /** Push the subtitles further up from the bottom of the picture. */
+    fun adjustSubtitleLift(deltaPercent: Int) {
+        setSubtitleStyle(subtitleLiftPercent + deltaPercent, subtitleSizePercent)
+    }
+
+    /** Draw the subtitles bigger or smaller. */
+    fun adjustSubtitleSize(deltaPercent: Int) {
+        setSubtitleStyle(subtitleLiftPercent, subtitleSizePercent + deltaPercent)
+    }
+
+    fun resetSubtitleLift() {
+        setSubtitleStyle(0, subtitleSizePercent)
+    }
+
+    fun resetSubtitleSize() {
+        setSubtitleStyle(subtitleLiftPercent, 100)
+    }
+
+    private fun setSubtitleStyle(liftPercent: Int, sizePercent: Int) {
+        val nextLift = liftPercent.coerceIn(0, SUBTITLE_LIFT_MAX_PERCENT)
+        val nextSize = sizePercent.coerceIn(SUBTITLE_SIZE_MIN_PERCENT, SUBTITLE_SIZE_MAX_PERCENT)
+        if (nextLift == subtitleLiftPercent && nextSize == subtitleSizePercent) return
+        subtitleLiftPercent = nextLift
+        subtitleSizePercent = nextSize
+        onSubtitleStyleChange?.invoke(nextLift, nextSize)
+        restartVlcInstance()
+    }
+
+    /**
+     * Build a new libVLC around the same film, at the same second, so the two numbers above reach it.
+     *
+     * VLC speaks them once, when an instance makes the subpicture thread that draws captions, so a
+     * change needs a new instance — a new [Media] is not enough. Everything a re-open already carries
+     * survives: the resume point, the chosen tracks, the subtitle sync — which is what makes this a
+     * blink rather than a rewind. And like every other open it ends playing, so a film stopped on a
+     * frame starts moving again when its subtitles are moved.
+     *
+     * Nothing may outlive the instance it was made from, so the player is released before it, the
+     * surface goes with the player and comes back attached to its replacement.
+     */
+    private fun restartVlcInstance() {
+        val video = currentVideo ?: return
+        val positionMs = currentPositionMs
+        val textureView = attachedTextureView
+
+        detachTextureView()
+        runCatching { mediaPlayer.stop() }
+        mediaPlayer.release()
+        libVlc.release()
+
+        libVlc = LibVLC(appContext, vlcInstanceArgs())
+        mediaPlayer = MediaPlayer(libVlc)
+        bindPlayerEvents()
+        textureView?.let { attachTextureView(it) }
+
+        loadAndPlay(video, startPositionMs = positionMs)
     }
 
     fun refreshTracks() {
@@ -2005,291 +2315,6 @@ class ArcVlcPlayerEngine(
 }
 
 // ============================================================================
-// UNIFIED STATIONARY 120HZ SCROLL & FLING ENGINE
-// ============================================================================
-
-@Stable
-class OneUiHeaderState(
-    val maxOffsetPx: Float,
-    initialOffsetPx: Float
-) {
-    var offsetPx by mutableFloatStateOf(initialOffsetPx.coerceIn(0f, maxOffsetPx))
-
-    val expansionFraction: Float
-        get() = if (maxOffsetPx > 0f) (offsetPx / maxOffsetPx).coerceIn(0f, 1f) else 0f
-}
-
-@Composable
-fun rememberOneUiHeaderState(
-    expandedHeight: Dp = 250.dp,
-    startInOneHandedMode: Boolean = false
-): OneUiHeaderState {
-    val density = LocalDensity.current
-    val maxOffsetPx = with(density) { expandedHeight.toPx() }
-
-    return rememberSaveable(
-        maxOffsetPx,
-        saver = Saver(
-            save = { it.offsetPx },
-            restore = { savedOffset ->
-                OneUiHeaderState(
-                    maxOffsetPx = maxOffsetPx,
-                    initialOffsetPx = savedOffset
-                )
-            }
-        )
-    ) {
-        OneUiHeaderState(
-            maxOffsetPx = maxOffsetPx,
-            initialOffsetPx = if (startInOneHandedMode) maxOffsetPx else 0f
-        )
-    }
-}
-
-@Stable
-class OneUiUnifiedScrollController(
-    val headerState: OneUiHeaderState,
-    val gridState: LazyGridState,
-    private val decaySpec: DecayAnimationSpec<Float>
-) : ScrollableState, FlingBehavior {
-
-    var isExecutingFling: Boolean = false
-    var gestureStartedAtGridTop: Boolean = true
-
-    fun onTouchDown() {
-        isExecutingFling = false
-        gestureStartedAtGridTop = !gridState.canScrollBackward
-    }
-
-    private fun stepUnified(
-        gridScrollScope: ScrollScope,
-        deltaY: Float,
-        allowHeaderExpand: Boolean
-    ): Float {
-        if (abs(deltaY) < 0.0001f) return 0f
-
-        if (deltaY < 0f) {
-            val currentHeader = headerState.offsetPx
-            val headerConsumed = if (currentHeader > 0f) {
-                val nextHeader = (currentHeader + deltaY).coerceIn(0f, headerState.maxOffsetPx)
-                val diff = nextHeader - currentHeader
-                headerState.offsetPx = nextHeader
-                diff
-            } else {
-                0f
-            }
-
-            val remainingUpward = deltaY - headerConsumed
-            val gridConsumed = if (remainingUpward < -0.001f) {
-                -gridScrollScope.scrollBy(-remainingUpward)
-            } else {
-                0f
-            }
-            return headerConsumed + gridConsumed
-        } else {
-            val gridConsumed = if (gridState.canScrollBackward) {
-                -gridScrollScope.scrollBy(-deltaY)
-            } else {
-                0f
-            }
-
-            val remainingDownward = deltaY - gridConsumed
-            val headerConsumed = if (remainingDownward > 0.001f && !gridState.canScrollBackward && allowHeaderExpand) {
-                val currentHeader = headerState.offsetPx
-                val nextHeader = (currentHeader + remainingDownward).coerceIn(0f, headerState.maxOffsetPx)
-                val diff = nextHeader - currentHeader
-                headerState.offsetPx = nextHeader
-                diff
-            } else {
-                0f
-            }
-            return gridConsumed + headerConsumed
-        }
-    }
-
-    override suspend fun scroll(
-        scrollPriority: MutatePriority,
-        block: suspend ScrollScope.() -> Unit
-    ) {
-        gridState.scroll(scrollPriority) {
-            val gridScrollScope = this
-            val unifiedScope = object : ScrollScope {
-                override fun scrollBy(pixels: Float): Float {
-                    return stepUnified(
-                        gridScrollScope = gridScrollScope,
-                        deltaY = pixels,
-                        allowHeaderExpand = !isExecutingFling || gestureStartedAtGridTop
-                    )
-                }
-            }
-            unifiedScope.block()
-        }
-    }
-
-    override fun dispatchRawDelta(delta: Float): Float {
-        if (delta == 0f) return 0f
-        if (delta < 0f && headerState.offsetPx > 0f) {
-            val current = headerState.offsetPx
-            val next = (current + delta).coerceIn(0f, headerState.maxOffsetPx)
-            headerState.offsetPx = next
-            val headerConsumed = next - current
-            val rem = delta - headerConsumed
-            val gridConsumed = if (rem < 0f) -gridState.dispatchRawDelta(-rem) else 0f
-            return headerConsumed + gridConsumed
-        }
-        return -gridState.dispatchRawDelta(-delta)
-    }
-
-    override val isScrollInProgress: Boolean
-        get() = gridState.isScrollInProgress
-
-    override val canScrollForward: Boolean
-        get() = gridState.canScrollForward || headerState.offsetPx < headerState.maxOffsetPx
-
-    override val canScrollBackward: Boolean
-        get() = gridState.canScrollBackward || headerState.offsetPx > 0f
-
-    override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
-        isExecutingFling = true
-        try {
-            val currentHeader = headerState.offsetPx
-            val maxHeader = headerState.maxOffsetPx
-
-            if (HeaderFling.isOpen(currentHeader)) {
-                if (initialVelocity < -HeaderFling.MIN_FLICK_VELOCITY_PX) {
-                    if (initialVelocity < -HeaderFling.LIST_FLING_VELOCITY_PX && gridState.canScrollForward) {
-                        var lastVal = 0f
-                        var vel = initialVelocity
-                        AnimationState(
-                            initialValue = 0f,
-                            initialVelocity = initialVelocity
-                        ).animateDecay(decaySpec) {
-                            val delta = value - lastVal
-                            lastVal = value
-                            val consumed = scrollBy(delta)
-                            vel = this.velocity
-                            if (abs(delta - consumed) > 0.5f) {
-                                cancelAnimation()
-                            }
-                        }
-                        if (HeaderFling.isOpen(headerState.offsetPx)) {
-                            snapHeaderMonotonic(targetPx = 0f, initialVelocityPx = vel)
-                        }
-                        return 0f
-                    } else {
-                        snapHeaderMonotonic(targetPx = 0f, initialVelocityPx = initialVelocity)
-                        return 0f
-                    }
-                }
-
-                if (initialVelocity > HeaderFling.MIN_FLICK_VELOCITY_PX) {
-                    snapHeaderMonotonic(targetPx = maxHeader, initialVelocityPx = initialVelocity)
-                    return 0f
-                }
-
-                val target = HeaderFling.snapTargetPx(currentHeader, maxHeader)
-                snapHeaderMonotonic(targetPx = target, initialVelocityPx = initialVelocity)
-                return 0f
-            }
-
-            if (!gridState.canScrollBackward && initialVelocity > HeaderFling.OPEN_FLICK_VELOCITY_PX) {
-                snapHeaderMonotonic(targetPx = maxHeader, initialVelocityPx = initialVelocity)
-                return 0f
-            }
-
-            if (abs(initialVelocity) > HeaderFling.MIN_DECAY_VELOCITY_PX) {
-                var lastVal = 0f
-                var remainingVy = initialVelocity
-                AnimationState(
-                    initialValue = 0f,
-                    initialVelocity = initialVelocity
-                ).animateDecay(decaySpec) {
-                    val delta = value - lastVal
-                    lastVal = value
-                    val consumed = scrollBy(delta)
-                    remainingVy = this.velocity
-                    if (abs(delta - consumed) > 0.5f) {
-                        cancelAnimation()
-                    }
-                }
-
-                if (!gridState.canScrollBackward && remainingVy > HeaderFling.TAIL_EXPAND_VELOCITY_PX && headerState.offsetPx < maxHeader) {
-                    snapHeaderMonotonic(targetPx = maxHeader, initialVelocityPx = remainingVy)
-                    return 0f
-                }
-
-                return remainingVy
-            }
-
-            return 0f
-        } finally {
-            isExecutingFling = false
-        }
-    }
-
-    private suspend fun snapHeaderMonotonic(
-        targetPx: Float,
-        initialVelocityPx: Float
-    ) {
-        val startPx = headerState.offsetPx
-        val distance = targetPx - startPx
-        if (abs(distance) < 0.5f) {
-            headerState.offsetPx = targetPx
-            return
-        }
-
-        val stiffness = 550f
-        val omega0 = sqrt(stiffness)
-        val maxNoOvershootSpeed = omega0 * abs(distance)
-
-        val clampedVelocity = if (distance > 0f) {
-            initialVelocityPx.coerceIn(0f, maxNoOvershootSpeed)
-        } else {
-            initialVelocityPx.coerceIn(-maxNoOvershootSpeed, 0f)
-        }
-
-        var prev = startPx
-        AnimationState(
-            initialValue = startPx,
-            initialVelocity = clampedVelocity
-        ).animateTo(
-            targetValue = targetPx,
-            animationSpec = spring(
-                dampingRatio = Spring.DampingRatioNoBouncy,
-                stiffness = stiffness
-            )
-        ) {
-            val monotonicValue = if (distance > 0f) {
-                value.coerceIn(prev, targetPx)
-            } else {
-                value.coerceIn(targetPx, prev)
-            }
-            prev = monotonicValue
-            headerState.offsetPx = monotonicValue
-            if (abs(targetPx - monotonicValue) <= 0.5f) {
-                headerState.offsetPx = targetPx
-                cancelAnimation()
-            }
-        }
-        headerState.offsetPx = targetPx
-    }
-}
-
-private fun currentTopBarPillProgress(
-    gridState: LazyGridState,
-    headerState: OneUiHeaderState,
-    transitionDistancePx: Float
-): Float {
-    if (headerState.offsetPx > 2f || transitionDistancePx <= 0f) return 0f
-    val scrolledPx = if (gridState.firstVisibleItemIndex > 0) {
-        transitionDistancePx
-    } else {
-        gridState.firstVisibleItemScrollOffset.toFloat()
-    }
-    return (scrolledPx / transitionDistancePx).coerceIn(0f, 1f)
-}
-
-// ============================================================================
 // HOME SCREEN
 // ============================================================================
 
@@ -2318,7 +2343,18 @@ private data class ActiveVideoPlayback(
      * the first one had it. The player asks this first and falls back to the per-file card for a film
      * reached outside a shelf, where there is no title to inherit from.
      */
-    val titleCard: MediaCard? = null
+    val titleCard: MediaCard? = null,
+    /**
+     * Why the file now playing was handed over by a sibling that refused, and which files of this
+     * title have already been refused.
+     *
+     * Both ride this object rather than the player's own state because the switch remounts the player:
+     * its content is keyed on the playback it was opened with, so a new [video] is a new composition
+     * and everything it remembered is gone — including the count that keeps two broken copies from
+     * trading places forever, and the sentence that tells the viewer their tap did not go for nothing.
+     */
+    val switchReason: String? = null,
+    val refusedCopies: Set<Long> = emptySet()
 )
 
 @OptIn(ExperimentalSharedTransitionApi::class)
@@ -2341,10 +2377,26 @@ fun ArcPlayerHomeScreen() {
     var mainTabName by rememberSaveable { mutableStateOf(BottomNavTab.HOME.name) }
     val mainTab = BottomNavTab.valueOf(mainTabName)
     var libraryPageName by rememberSaveable { mutableStateOf<String?>(null) }
-    val selectedTab = if (mainTab == BottomNavTab.SETTINGS) LibraryPage.MENU
+    val livePage = if (mainTab == BottomNavTab.SETTINGS) LibraryPage.MENU
         else libraryPageName?.let(LibraryPage::valueOf) ?: LibraryPage.CLOUD
     val showingBrowser = mainTab == BottomNavTab.SETTINGS ||
         (mainTab == BottomNavTab.LIBRARY && libraryPageName != null)
+
+    // The browser's page, held even while the browser is gone. AnimatedContent keeps the leaving page
+    // composed and re-runs its lambda against whatever the enclosing scope now says, so tapping Home from
+    // the Settings menu used to rebuild the slide-away copy as the shelf: a different grid state, a
+    // different header title, and the whole browser pass over again between the tap and the first frame.
+    // A plain array, not a state holder — this scope writes it and reads it back in the same pass.
+    val lastBrowserPage = remember { arrayOf(LibraryPage.MENU) }
+    if (showingBrowser) lastBrowserPage[0] = livePage
+    val selectedTab = if (showingBrowser) livePage else lastBrowserPage[0]
+
+    // Settings is not a page of the tab stack — it is the browser wearing a tab, and CollectionScreens
+    // draws nothing for it. The stack still has to hold up the page you came from while the browser
+    // slides over it, so the last real tab is kept beside mainTab rather than read back out of it.
+    // Written here and read only deeper down, so the write cannot re-trigger this scope.
+    val stackTabName = remember { mutableStateOf(BottomNavTab.HOME.name) }
+    if (mainTab != BottomNavTab.SETTINGS) stackTabName.value = mainTab.name
 
     var openedFolderBucketId by rememberSaveable { mutableStateOf<String?>(null) }
     var openedPlaylistName by rememberSaveable { mutableStateOf<String?>(null) }
@@ -2382,6 +2434,24 @@ fun ArcPlayerHomeScreen() {
     var shelfTitle by remember { mutableStateOf<ShelfTitle?>(null) }
     var lastShelfTitle by remember { mutableStateOf<ShelfTitle?>(null) }
     LaunchedEffect(shelfTitle) { shelfTitle?.let { lastShelfTitle = it } }
+    // The shelf's own recede while a title page slides in over it. Frosted Jelly runs a detail push as
+    // two independent destination transitions rather than one linked number: the screen leaving dims on
+    // the shorter fade and shrinks on the longer slide, which is what gives the incoming page depth.
+    // Going back is not the same move played backwards — the reference lets the home screen spring the
+    // last stretch into place, so the shelf overshoots its full size a hair and settles.
+    val detailOpen = shelfTitle != null
+    val shelfRecede by animateFloatAsState(
+        targetValue = if (detailOpen) 1f else 0f,
+        animationSpec = if (detailOpen) tween(durationMillis = 600, easing = DetailPushEase)
+        else spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
+        label = "ShelfRecedeScale"
+    )
+    val shelfDim by animateFloatAsState(
+        targetValue = if (detailOpen) 1f else 0f,
+        animationSpec = if (detailOpen) tween(durationMillis = 400)
+        else spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessLow),
+        label = "ShelfRecedeFade"
+    )
     val cloudRepository = remember(
         prefsStore.telegramApiId,
         prefsStore.telegramApiHash,
@@ -2411,6 +2481,29 @@ fun ArcPlayerHomeScreen() {
     }
 
     var activePlayback by remember { mutableStateOf<ActiveVideoPlayback?>(null) }
+
+    // A page pushed over the search field does not take the field's focus away — it keeps sitting there
+    // behind the slide, so the keyboard it asked for stays standing over the page the tap just opened.
+    // The cover puts the keyboard down itself. Both halves, because dropping focus does not reliably
+    // recall an IME that another window is already holding.
+    val screenFocus = LocalFocusManager.current
+    val softwareKeyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(shelfTitle, activePlayback) {
+        if (shelfTitle != null || activePlayback != null) {
+            screenFocus.clearFocus(true)
+            softwareKeyboard?.hide()
+        }
+    }
+
+    /**
+     * Which copies this device is holding, read once for the whole screen.
+     *
+     * Collected here rather than inside the grid or a title page because both of those decide *which file
+     * to open*, and a shelf rebuilt around a stale answer would play the streamed copy of a film the
+     * viewer just saved. The ledger arrives from disk on its own guard, so this starts empty and fills in
+     * rather than blocking a frame to be certain.
+     */
+    val cloudDownloads by cloudRepository.downloads.collectAsState()
 
     /** The last cloud film handed to the player, so putting it down is something we can notice. */
     var lastCloudPlayback by remember { mutableStateOf<CloudVideoItem?>(null) }
@@ -2451,35 +2544,50 @@ fun ArcPlayerHomeScreen() {
      * swaps the video without ever going through the null the close effect watches. Skipping from one
      * part to the next is exactly when the last film's bytes stop being read, so a release keyed only to
      * closing the player would leave a trail of episodes behind.
+     *
+     * Only a channel copy is held. A file that was already on the phone has nothing to fetch and nothing
+     * to hand back, so moving onto one puts down whatever Telegram copy the player was reading — which is
+     * the point of the whole map, and the reason it goes empty rather than staying on the last download.
      */
-    fun holdCloudCopy(incoming: CloudVideoItem) {
+    fun holdShelfCopy(incoming: Playable) {
         val outgoing = lastCloudPlayback
-        if (outgoing != null && outgoing.fileId != incoming.fileId) forgetCloudCopySoon(outgoing)
-        cloudReleases.remove(incoming.fileId)?.cancel()
-        lastCloudPlayback = incoming
+        val incomingCopy = incoming as? CloudVideoItem
+        if (outgoing != null && outgoing.fileId != incomingCopy?.fileId) forgetCloudCopySoon(outgoing)
+        if (incomingCopy == null) {
+            lastCloudPlayback = null
+            return
+        }
+        cloudReleases.remove(incomingCopy.fileId)?.cancel()
+        lastCloudPlayback = incomingCopy
     }
 
     /**
-     * Hand a cloud file to the player.
+     * Hand a file to the player, from either place its bytes live.
      *
-     * There is no content Uri to hand over, and working out which bytes Telegram has on disk is the
-     * slow part — so it is not attempted here. The player is given an empty address, opens at once with
-     * the film's wordmark over a held frame, and asks Telegram for the path itself. The ◀▶ part skip has
-     * always launched this way; a Play button that resolved first only moved the same wait onto the
-     * info page, where it looked like the app had frozen.
+     * A Telegram copy has no content Uri to hand over, and working out which bytes the channel has on
+     * disk is the slow part — so it is not attempted here. The player is given an empty address, opens at
+     * once with the film's wordmark over a held frame, and asks Telegram for the path itself. A copy
+     * already on the phone comes with its own address and never enters that path.
+     *
+     * The ◀▶ part skip has always launched this way; a Play button that resolved first only moved the
+     * same wait onto the info page, where it looked like the app had frozen.
      */
-    val launchCloudVideo: (CloudVideoItem, List<CloudVideoItem>, List<List<Long>>, MediaCard?) -> Unit =
+    val launchShelfVideo: (Playable, List<Playable>, List<List<Long>>, MediaCard?) -> Unit =
         { item, list, slots, titleCard ->
             cloudNotice = null
-            holdCloudCopy(item)
-            val prefix = "cloud_${item.chatId}"
+            holdShelfCopy(item)
+            val prefix = item.morphPrefix()
             morphingVideoKey = "${prefix}_${item.stableId}"
-            prefsStore.rememberCloudWatched(item.stableId)
+            prefsStore.rememberWatchedAt(item.stableId)
+            // The queue is the whole work, and the player only ever sees rows of one shape: it opens a
+            // Uri when there is one, and asks the channel for the file behind a negative id when there
+            // is not. Which of those a given row needs is a question the row answers by itself.
+            val rows = list.map { it.toPlayerRow() }
             activePlayback = ActiveVideoPlayback(
-                video = item.toGridVideoItem(),
-                playlist = list.map { it.toGridVideoItem() },
+                video = rows.firstOrNull { it.id == item.stableId } ?: item.toPlayerRow(),
+                playlist = rows,
                 sharedKeyPrefix = prefix,
-                cloudSources = list,
+                cloudSources = list.filterIsInstance<CloudVideoItem>(),
                 copySlots = slots,
                 titleCard = titleCard
             )
@@ -2508,19 +2616,28 @@ fun ArcPlayerHomeScreen() {
      * Take a whole work off the shelf.
      *
      * Every copy of it, not the one file whose card was held: the card is the film, and deleting half
-     * of a group would leave the same poster on screen with a smaller pile behind it.
+     * of a group would leave the same poster on screen with a smaller pile behind it. Only the copies
+     * that came off the channel are in that group, though. A file the viewer put on this phone is not
+     * this app's to delete, and saying "taken off your shelf" while it sits on in `Movies/` would be a
+     * report about a shelf that still holds the thing.
      */
     val removeFromShelf: (ShelfTitle) -> Unit = { opened ->
         shelfTitle = null
         coroutineScope.launch {
             cloudResolving = true
             val folder = prefsStore.movieFolderChatId
-            val removed = runCatching {
-                opened.parts.forEach { cloudRepository.removeFromFolder(it, folder) }
+            val onChannel = opened.parts.filterIsInstance<CloudVideoItem>()
+            val removed = onChannel.isNotEmpty() && runCatching {
+                onChannel.forEach { cloudRepository.removeFromFolder(it, folder) }
             }.isSuccess
             if (removed) runCatching { cloudRepository.loadVideos(folder) }
             cloudResolving = false
-            cloudNotice = if (removed) "Taken off your shelf." else "Telegram would not delete that file."
+            cloudNotice = when {
+                !removed -> "Telegram would not delete that file."
+                opened.parts.size > onChannel.size ->
+                    "Taken off your shelf. The copy on this phone stays where you put it."
+                else -> "Taken off your shelf."
+            }
         }
     }
 
@@ -2550,9 +2667,14 @@ fun ArcPlayerHomeScreen() {
     BackHandler(enabled = activePlayback == null && mainTab != BottomNavTab.HOME && !showingBrowser) {
         mainTabName = BottomNavTab.HOME.name
     }
-    BackHandler(enabled = activePlayback == null && showingBrowser && !isSearchExpanded) {
+    // The heading's circle is the same exit as the system back, so both answer to the same rule rather
+    // than to two lists that drift apart when a page is added.
+    val leaveBrowser: () -> Unit = {
         if (mainTab == BottomNavTab.SETTINGS) mainTabName = BottomNavTab.HOME.name
         else leaveDetailScreen()
+    }
+    BackHandler(enabled = activePlayback == null && showingBrowser && !isSearchExpanded) {
+        leaveBrowser()
     }
 
     // Registered last so it wins over the screens underneath it, and disabled while the player is up:
@@ -2566,6 +2688,7 @@ fun ArcPlayerHomeScreen() {
     val allVideosGridState = rememberLazyGridState()
     val playlistsGridState = rememberLazyGridState()
     val menuGridState = rememberLazyGridState()
+    val downloadsGridState = rememberLazyGridState()
     val shelfGridState = key(prefsStore.movieFolderChatId) {
         rememberLazyGridState()
     }
@@ -2584,34 +2707,13 @@ fun ArcPlayerHomeScreen() {
         selectedTab == LibraryPage.CLOUD -> shelfGridState
         selectedTab == LibraryPage.VIDEOS -> allVideosGridState
         selectedTab == LibraryPage.MENU -> menuGridState
+        selectedTab == LibraryPage.DOWNLOADS -> downloadsGridState
         else -> foldersGridState
     }
 
-    val headerState = rememberOneUiHeaderState(
-        expandedHeight = 250.dp,
-        startInOneHandedMode = false
-    )
-
-    // Keep header consistent if user switches to a tab that is already scrolled down
-    LaunchedEffect(activeGridState) {
-        if (activeGridState.canScrollBackward && headerState.offsetPx > 0f) {
-            headerState.offsetPx = 0f
-        }
-    }
-
-    val decaySpec = rememberSplineBasedDecay<Float>()
-    val scrollController = remember(headerState, activeGridState, decaySpec) {
-        OneUiUnifiedScrollController(
-            headerState = headerState,
-            gridState = activeGridState,
-            decaySpec = decaySpec
-        )
-    }
-
-    val showScrollToTopButton by remember(activeGridState, headerState) {
+    val showScrollToTopButton by remember(activeGridState) {
         derivedStateOf {
-            headerState.offsetPx <= 2f &&
-                (activeGridState.firstVisibleItemIndex > 0 || activeGridState.firstVisibleItemScrollOffset > 300)
+            activeGridState.firstVisibleItemIndex > 0 || activeGridState.firstVisibleItemScrollOffset > 300
         }
     }
 
@@ -2657,6 +2759,14 @@ fun ArcPlayerHomeScreen() {
         }
     }
 
+    // The download row is what keeps a fetch alive once the screen is gone, and on Android 13 the viewer
+    // has to agree to see it. Asked when a download is actually started rather than on launch, so the
+    // question has a reason attached to it; the download runs either way, and the settings page says what
+    // refusing costs.
+    val notificationsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { }
+
     LaunchedEffect(Unit) {
         if (hasPermission) refreshMediaLibrary(false)
     }
@@ -2688,46 +2798,39 @@ fun ArcPlayerHomeScreen() {
 
     val statusBarTopPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val navBarBottomPadding = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
-    val actionBarHeight = 52.dp
-    val pillTransitionDistancePx = with(LocalDensity.current) { 42.dp.toPx() }
+    // Nothing is pinned above these grids any more, so the page starts at the status bar and the heading
+    // is the first thing in the scroll.
+    val browserTopPadding = statusBarTopPadding + 10.dp
 
-    val currentHeaderTitle: () -> String = {
-        when {
-            selectedTab == LibraryPage.FOLDERS && openedFolderBucketId != null ->
-                librarySnapshot.folders.find { it.bucketId == openedFolderBucketId }?.title ?: selectedTab.headerTitle
-            selectedTab == LibraryPage.CLOUD && openedPlaylistName != null -> openedPlaylistName!!
-            selectedTab == LibraryPage.CLOUD && cloudScreenName == CloudScreen.PLAYLISTS.name -> "Playlists"
-            selectedTab == LibraryPage.CLOUD -> "Library"
-            else -> selectedTab.headerTitle
+    val videoMenuItems = buildList {
+        VideoSortOrder.entries.forEachIndexed { index, order ->
+            add(
+                MorphingMenuItem(
+                    text = if (prefsStore.sortOrder == order) "✓ ${order.label}" else order.label,
+                    dividerAfter = index == VideoSortOrder.entries.lastIndex,
+                    onClick = { prefsStore.updateSortOrder(order) }
+                )
+            )
         }
-    }
-
-    val filteredFolders = remember(librarySnapshot.folders, searchQuery) {
-        if (searchQuery.isBlank()) {
-            librarySnapshot.folders
-        } else {
-            librarySnapshot.folders.filter { it.title.contains(searchQuery.trim(), ignoreCase = true) }
+        listOf(2, 3, 4).forEachIndexed { index, cols ->
+            add(
+                MorphingMenuItem(
+                    text = if (prefsStore.gridColumns == cols) "✓ $cols Columns" else "$cols Columns",
+                    dividerAfter = index == 2,
+                    onClick = { prefsStore.updateGridColumns(cols) }
+                )
+            )
         }
+        add(MorphingMenuItem(text = "Rescan storage", onClick = { refreshMediaLibrary(false) }))
     }
-
-    val sortedFilteredAllVideos = remember(librarySnapshot.videos, searchQuery, prefsStore.sortOrder) {
-        val base = if (searchQuery.isBlank()) {
-            librarySnapshot.videos
-        } else {
-            librarySnapshot.videos.filter {
-                it.title.contains(searchQuery.trim(), ignoreCase = true) ||
-                    it.folderName.contains(searchQuery.trim(), ignoreCase = true)
-            }
-        }
-        sortVideos(base, prefsStore.sortOrder)
-    }
-
-    val lastResumableVideo = remember(librarySnapshot.videos, prefsStore.watchHistoryIds, prefsStore.resumePositions.size) {
-        val videoById = librarySnapshot.videos.associateBy { it.id }
-        prefsStore.watchHistoryIds.firstNotNullOfOrNull { id ->
-            if (prefsStore.resumePositions.containsKey(id)) videoById[id] else null
-        }
-    }
+    val deviceSearch = BrowserSearch(
+        expanded = isSearchExpanded,
+        query = searchQuery,
+        onQueryChange = { searchQuery = it },
+        onExpand = { isSearchExpanded = true },
+        onClose = { isSearchExpanded = false; searchQuery = "" },
+        menuItems = videoMenuItems
+    )
 
     SharedTransitionLayout(modifier = Modifier.fillMaxSize()) {
         val sharedTransitionScope = this
@@ -2749,12 +2852,69 @@ fun ArcPlayerHomeScreen() {
                 Box(modifier = Modifier.fillMaxSize()) {
                 Box(
                     modifier = Modifier.fillMaxSize()
-                        .jellySource(hazeState = jellyHazeState, backdrop = jellyBackdrop)
+                        // Recording stops while the info page is up, because the page records itself for
+                        // its own back circle. Two live full-screen blur targets is the one thing this
+                        // device's scroll budget cannot pay for, and the only consumer of this source —
+                        // the floating bar — is under the page anyway.
+                        .jellySource(
+                            hazeState = if (shelfTitle == null) jellyHazeState else null,
+                            backdrop = if (shelfTitle == null) jellyBackdrop else null
+                        )
                         .background(OneUiBackground)
                 ) {
-                if (!showingBrowser) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = 1f - 0.08f * shelfRecede
+                            scaleY = 1f - 0.08f * shelfRecede
+                            alpha = 1f - shelfDim
+                        }
+                ) {
+                // Built above both branches, not inside one. Leaving for the browser used to throw the
+                // shelf away with the page that held it, and rebuilding it re-ran the catalogue passes,
+                // which write back into the same prefs a rebuild reads from: measured on the Note as
+                // three full library parses of ~260 ms each between the tap and the first moved pixel.
+                val shelfState = rememberCollectionShelf(cloudRepository, prefsStore, librarySnapshot)
+                // The library every screen below reads. The raw scan is the camera roll as much as it is
+                // the collection, and the shelf is the one pass that can tell a film from a clip, so the
+                // device screens, the playlists and the Settings counts all work off this narrowed copy
+                // rather than each deciding for itself what counts as a movie.
+                val library = remember(librarySnapshot, shelfState.value.deviceIds) {
+                    librarySnapshot.filmsOnly(shelfState.value.deviceIds)
+                }
+                val filteredFolders = remember(library.folders, searchQuery) {
+                    if (searchQuery.isBlank()) {
+                        library.folders
+                    } else {
+                        library.folders.filter { it.title.contains(searchQuery.trim(), ignoreCase = true) }
+                    }
+                }
+                val sortedFilteredAllVideos = remember(library.videos, searchQuery, prefsStore.sortOrder) {
+                    val base = if (searchQuery.isBlank()) {
+                        library.videos
+                    } else {
+                        library.videos.filter {
+                            it.title.contains(searchQuery.trim(), ignoreCase = true) ||
+                                it.folderName.contains(searchQuery.trim(), ignoreCase = true)
+                        }
+                    }
+                    sortVideos(base, prefsStore.sortOrder)
+                }
+                AnimatedContent(
+                    targetState = showingBrowser,
+                    transitionSpec = {
+                        val (enter, exit) = jellyTabCrossSlide(targetState)
+                        enter togetherWith exit
+                    },
+                    label = "browser_switch"
+                ) { browser ->
+                if (!browser) {
+                    // Built above the transition, not inside it: the entering page is composed in the same
+                    // frame the slide is supposed to start in, so anything the page worked out for itself
+                    // was worked out between the lifted finger and the first frame.
                     AnimatedContent(
-                        targetState = mainTab,
+                        targetState = BottomNavTab.valueOf(stackTabName.value),
                         transitionSpec = {
                             val (enter, exit) = jellyTabCrossSlide(targetState.ordinal > initialState.ordinal)
                             enter togetherWith exit
@@ -2764,599 +2924,317 @@ fun ArcPlayerHomeScreen() {
                     destinationState.SaveableStateProvider("collection:${tab.name}") {
                     CollectionScreens(
                         tab = tab,
-                        repository = cloudRepository,
+                        shelfState = shelfState,
                         prefsStore = prefsStore,
-                        snapshot = librarySnapshot,
+                        snapshot = library,
                         topInset = statusBarTopPadding,
                         bottomInset = navBarBottomPadding,
                         onOpenTitle = { shelfTitle = it },
-                        onCloudPlay = launchCloudVideo,
+                        onShelfPlay = launchShelfVideo,
                         onLocalPlay = { video, videos ->
+                            prefsStore.rememberWatchedAt(video.id)
                             activePlayback = ActiveVideoPlayback(video, videos, "home_local")
                         },
                         onOpenDevice = { openLibraryBrowser(LibraryPage.FOLDERS, CloudScreen.SHELF) },
                         onOpenAllVideos = { openLibraryBrowser(LibraryPage.VIDEOS, CloudScreen.SHELF) },
                         onOpenPlaylists = { openLibraryBrowser(LibraryPage.CLOUD, CloudScreen.PLAYLISTS) },
-                        onManageCollection = { openLibraryBrowser(LibraryPage.CLOUD, CloudScreen.SHELF) }
+                        onManageCollection = { openLibraryBrowser(LibraryPage.CLOUD, CloudScreen.SHELF) },
+                        // A count rather than the progress map: the byte ticks land many times a second,
+                        // and a Library tab that recomposes with them is a Library tab that drops frames
+                        // while a film is arriving.
+                        activeDownloads = cloudDownloads.values.count { !it.isComplete },
+                        onOpenDownloads = { openLibraryBrowser(LibraryPage.DOWNLOADS, CloudScreen.SHELF) }
                     )
                     }
                     }
                 } else {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        // The two-stop controller spends a gesture on the list, then the header, and
-                        // only hands back what neither of them can take — so this stretches the
-                        // surface exactly where the reference app runs out of things to scroll.
-                        .physicsBounceOverscroll()
-                        .pointerInput(scrollController) {
-                            awaitPointerEventScope {
-                                while (true) {
-                                    val event = awaitPointerEvent(PointerEventPass.Initial)
-                                    val change = event.changes.firstOrNull() ?: continue
-                                    if (change.changedToDown()) {
-                                        scrollController.onTouchDown()
-                                    }
+                Box(modifier = Modifier.fillMaxSize()) {
+                    val browsingDevice = selectedTab == LibraryPage.FOLDERS || selectedTab == LibraryPage.VIDEOS
+                    when {
+                        browsingDevice && !hasPermission -> {
+                            PermissionRequestView(
+                                onGrantClick = {
+                                    permissionLauncher.launch(requiredVideoPermissions())
                                 }
-                            }
+                            )
                         }
-                        .scrollable(
-                            state = scrollController,
-                            orientation = Orientation.Vertical,
-                            flingBehavior = scrollController,
-                            reverseDirection = false
-                        )
-                ) {
-                    OneUiCollapsibleScaffold(
-                        headerState = headerState,
-                        statusBarTopPadding = statusBarTopPadding,
-                        actionBarHeight = actionBarHeight,
-                        expandedHeader = {
+
+                        browsingDevice && library.videos.isEmpty() && (isScanning || shelfState.value.loading) -> {
                             Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .background(OneUiBackground)
-                                    .graphicsLayer {
-                                        val fraction = headerState.expansionFraction
-                                        alpha = ((fraction - 0.22f) / 0.78f).coerceIn(0f, 1f)
-                                        translationY = -(1f - fraction) * 28.dp.toPx()
-                                    },
+                                modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
                             ) {
-                                AnimatedContent(
-                                    targetState = currentHeaderTitle(),
-                                    transitionSpec = {
-                                        (fadeIn(tween(200)) + scaleIn(initialScale = 0.94f, animationSpec = tween(200)))
-                                            .togetherWith(fadeOut(tween(150)))
-                                    },
-                                    label = "HeaderTitleTransition"
-                                ) { title ->
-                                    Text(
-                                        text = title,
-                                        fontSize = 34.sp,
-                                        fontWeight = FontWeight.Normal,
-                                        color = OneUiTextPrimary,
-                                        letterSpacing = (-0.3).sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.padding(horizontal = 24.dp)
-                                    )
-                                }
-                            }
-                        },
-                        actionBar = {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(actionBarHeight)
-                                    .padding(horizontal = 14.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                if (isSearchExpanded) {
-                                    Surface(
-                                        shape = TopActionPillShape,
-                                        color = Color.Transparent,
-                                        shadowElevation = 6.dp,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .height(42.dp)
-                                            .jellyGlass(
-                                                hazeState = null, // pill lives inside the haze source; real blur would smear its own content
-                                                backdrop = null,
-                                                tintTransparency = 0.4f,
-                                                noiseFactor = 0.06f,
-                                                shape = TopActionPillShape
-                                            )
-                                    ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            modifier = Modifier
-                                                .fillMaxSize()
-                                                .padding(horizontal = 6.dp)
-                                        ) {
-                                            IconButton(
-                                                onClick = {
-                                                    isSearchExpanded = false
-                                                    searchQuery = ""
-                                                },
-                                                modifier = Modifier.size(36.dp)
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                                    contentDescription = "Close search",
-                                                    tint = OneUiTextPrimary,
-                                                    modifier = Modifier.size(20.dp)
-                                                )
-                                            }
-                                            Box(
-                                                modifier = Modifier
-                                                    .weight(1f)
-                                                    .padding(horizontal = 4.dp),
-                                                contentAlignment = Alignment.CenterStart
-                                            ) {
-                                                if (searchQuery.isEmpty()) {
-                                                    Text(
-                                                        text = "Search folders & videos...",
-                                                        fontSize = 14.sp,
-                                                        color = OneUiTextSecondary
-                                                    )
-                                                }
-                                                BasicTextField(
-                                                    value = searchQuery,
-                                                    onValueChange = { searchQuery = it },
-                                                    singleLine = true,
-                                                    textStyle = TextStyle(
-                                                        fontSize = 14.sp,
-                                                        color = OneUiTextPrimary
-                                                    ),
-                                                    cursorBrush = SolidColor(OneUiTextPrimary),
-                                                    modifier = Modifier.fillMaxWidth()
-                                                )
-                                            }
-                                            if (searchQuery.isNotEmpty()) {
-                                                IconButton(
-                                                    onClick = { searchQuery = "" },
-                                                    modifier = Modifier.size(36.dp)
-                                                ) {
-                                                    Icon(
-                                                        imageVector = Icons.Default.Close,
-                                                        contentDescription = "Clear search",
-                                                        tint = OneUiTextSecondary,
-                                                        modifier = Modifier.size(18.dp)
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    val showBackTitle = showingBrowser
-
-                                    Box(modifier = Modifier.weight(1f)) {
-                                        androidx.compose.animation.AnimatedVisibility(
-                                            visible = showBackTitle,
-                                            enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.85f, animationSpec = tween(180)),
-                                            exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.85f, animationSpec = tween(140))
-                                        ) {
-                                            Box(
-                                                contentAlignment = Alignment.CenterStart,
-                                                modifier = Modifier.height(42.dp)
-                                            ) {
-                                                Spacer(
-                                                    modifier = Modifier
-                                                        .matchParentSize()
-                                                        .graphicsLayer {
-                                                            shadowElevation = currentTopBarPillProgress(
-                                                                gridState = activeGridState,
-                                                                headerState = headerState,
-                                                                transitionDistancePx = pillTransitionDistancePx
-                                                            ) * 8.dp.toPx()
-                                                            shape = TopActionPillShape
-                                                            clip = true
-                                                        }
-                                                        .jellyGlass(
-                                                            hazeState = null, // pill lives inside the haze source; real blur would smear its own content
-                                                            backdrop = null,
-                                                            tintTransparency = 1f - 0.6f * currentTopBarPillProgress(
-                                                                gridState = activeGridState,
-                                                                headerState = headerState,
-                                                                transitionDistancePx = pillTransitionDistancePx
-                                                            ),
-                                                            noiseFactor = 0.06f,
-                                                            shape = TopActionPillShape
-                                                        )
-                                                )
-
-                                                Row(
-                                                    verticalAlignment = Alignment.CenterVertically,
-                                                    modifier = Modifier.padding(start = 2.dp, end = 14.dp)
-                                                ) {
-                                                    val backSource = remember { MutableInteractionSource() }
-                                                    IconButton(
-                                                        interactionSource = backSource,
-                                                        onClick = {
-                                                            if (mainTab == BottomNavTab.SETTINGS) mainTabName = BottomNavTab.HOME.name
-                                                            else leaveDetailScreen()
-                                                        },
-                                                        modifier = Modifier
-                                                            .size(38.dp)
-                                                            .jelly(backSource, scaleDownTo = 0.88f)
-                                                    ) {
-                                                        Icon(
-                                                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                                            contentDescription = "Back",
-                                                            tint = OneUiTextPrimary,
-                                                            modifier = Modifier.size(22.dp)
-                                                        )
-                                                    }
-                                                    Text(
-                                                        text = currentHeaderTitle(),
-                                                        fontSize = 17.sp,
-                                                        fontWeight = FontWeight.SemiBold,
-                                                        color = OneUiTextPrimary,
-                                                        maxLines = 1,
-                                                        overflow = TextOverflow.Ellipsis,
-                                                        modifier = Modifier.graphicsLayer {
-                                                            alpha = (1f - headerState.expansionFraction * 1.5f).coerceIn(0f, 1f)
-                                                        }
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if (selectedTab == LibraryPage.FOLDERS || selectedTab == LibraryPage.VIDEOS) Box(
-                                        contentAlignment = Alignment.Center,
-                                        modifier = Modifier.height(42.dp)
-                                    ) {
-                                        Spacer(
-                                            modifier = Modifier
-                                                .matchParentSize()
-                                                .graphicsLayer {
-                                                    val progress = currentTopBarPillProgress(
-                                                        gridState = activeGridState,
-                                                        headerState = headerState,
-                                                        transitionDistancePx = pillTransitionDistancePx
-                                                    )
-                                                    alpha = progress
-                                                    val scale = 0.92f + 0.08f * progress
-                                                    scaleX = scale
-                                                    scaleY = scale
-                                                    shadowElevation = progress * 8.dp.toPx()
-                                                    shape = TopActionPillShape
-                                                    clip = true
-                                                }
-                                                .drawBehind {
-                                                    drawRect(color = OneUiPillSurface)
-                                                }
-                                        )
-
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            modifier = Modifier.padding(horizontal = 4.dp)
-                                        ) {
-                                            val searchSource = remember { MutableInteractionSource() }
-                                            IconButton(
-                                                interactionSource = searchSource,
-                                                onClick = { isSearchExpanded = true },
-                                                modifier = Modifier
-                                                    .size(38.dp)
-                                                    .jelly(searchSource, scaleDownTo = 0.88f)
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Outlined.Search,
-                                                    contentDescription = "Search videos",
-                                                    tint = OneUiTextPrimary,
-                                                    modifier = Modifier.size(22.dp)
-                                                )
-                                            }
-                                            MorphingMenu(
-                                                items = buildList {
-                                                    VideoSortOrder.entries.forEachIndexed { index, order ->
-                                                        add(
-                                                            MorphingMenuItem(
-                                                                text = if (prefsStore.sortOrder == order) "✓ ${order.label}" else order.label,
-                                                                dividerAfter = index == VideoSortOrder.entries.lastIndex,
-                                                                onClick = { prefsStore.updateSortOrder(order) }
-                                                            )
-                                                        )
-                                                    }
-                                                    listOf(2, 3, 4).forEachIndexed { index, cols ->
-                                                        add(
-                                                            MorphingMenuItem(
-                                                                text = if (prefsStore.gridColumns == cols) "✓ $cols Columns" else "$cols Columns",
-                                                                dividerAfter = index == 2,
-                                                                onClick = { prefsStore.updateGridColumns(cols) }
-                                                            )
-                                                        )
-                                                    }
-                                                    add(
-                                                        MorphingMenuItem(
-                                                            text = "Rescan storage",
-                                                            onClick = { refreshMediaLibrary(false) }
-                                                        )
-                                                    )
-                                                }
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        content = {
-                            val browsingDevice = selectedTab == LibraryPage.FOLDERS || selectedTab == LibraryPage.VIDEOS
-                            when {
-                                browsingDevice && !hasPermission -> {
-                                    PermissionRequestView(
-                                        onGrantClick = {
-                                            permissionLauncher.launch(requiredVideoPermissions())
-                                        }
-                                    )
-                                }
-
-                                browsingDevice && isScanning && librarySnapshot.videos.isEmpty() -> {
-                                    Box(
-                                        modifier = Modifier.fillMaxSize(),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        CircularProgressIndicator(
-                                            color = OneUiTextPrimary,
-                                            strokeWidth = 2.5.dp,
-                                            modifier = Modifier.size(32.dp)
-                                        )
-                                    }
-                                }
-
-                                browsingDevice && librarySnapshot.videos.isEmpty() -> {
-                                    EmptyMediaStateView(onRescanClick = { refreshMediaLibrary(false) })
-                                }
-
-                                else -> {
-                                    val topContentPad = statusBarTopPadding + actionBarHeight + 6.dp
-                                    val bottomContentPad = 128.dp + navBarBottomPadding
-
-                                    when (selectedTab) {
-                                        LibraryPage.FOLDERS -> {
-                                            AnimatedContent(
-                                                targetState = openedFolderBucketId,
-                                                transitionSpec = {
-                                                    (fadeIn(animationSpec = tween(240, easing = FastOutSlowInEasing)) +
-                                                        scaleIn(initialScale = 0.96f, animationSpec = tween(240, easing = FastOutSlowInEasing)))
-                                                        .togetherWith(
-                                                            fadeOut(animationSpec = tween(200, easing = FastOutSlowInEasing)) +
-                                                                scaleOut(targetScale = 0.96f, animationSpec = tween(200, easing = FastOutSlowInEasing))
-                                                        )
-                                                },
-                                                label = "FolderSharedContainerMorph"
-                                            ) { bucketId ->
-                                                val folderVisibilityScope = this
-                                                val targetFolder = bucketId?.let { id -> librarySnapshot.folders.find { it.bucketId == id } }
-                                                if (targetFolder != null) {
-                                                    val folderVideos = remember(
-                                                        librarySnapshot.videos,
-                                                        targetFolder.bucketId,
-                                                        searchQuery,
-                                                        prefsStore.sortOrder
-                                                    ) {
-                                                        val raw = librarySnapshot.videos.filter { it.bucketId == targetFolder.bucketId }
-                                                        val searched = if (searchQuery.isBlank()) raw else raw.filter {
-                                                            it.title.contains(searchQuery.trim(), ignoreCase = true)
-                                                        }
-                                                        sortVideos(searched, prefsStore.sortOrder)
-                                                    }
-                                                    with(sharedTransitionScope) {
-                                                        Box(
-                                                            modifier = Modifier
-                                                                .fillMaxSize()
-                                                                .sharedBounds(
-                                                                    sharedContentState = rememberSharedContentState(
-                                                                        key = "folder_container_${targetFolder.bucketId}"
-                                                                    ),
-                                                                    animatedVisibilityScope = folderVisibilityScope,
-                                                                    boundsTransform = { _, _ ->
-                                                                        spring(
-                                                                            dampingRatio = Spring.DampingRatioNoBouncy,
-                                                                            stiffness = 380f
-                                                                        )
-                                                                    },
-                                                                    clipInOverlayDuringTransition = OverlayClip(
-                                                                        CardCornerShape
-                                                                    )
-                                                                )
-                                                                .background(OneUiBackground)
-                                                        ) {
-                                                            VideoGridContent(
-                                                                videos = folderVideos,
-                                                                columns = prefsStore.gridColumns,
-                                                                gridState = openedFolderGridState,
-                                                                topPadding = topContentPad,
-                                                                bottomPadding = bottomContentPad,
-                                                                sharedKeyPrefix = "folder_${targetFolder.bucketId}",
-                                                                morphingVideoKey = morphingVideoKey,
-                                                                resumePositions = prefsStore.resumePositions,
-                                                                favoriteIds = prefsStore.favoriteIds,
-                                                                sharedTransitionScope = sharedTransitionScope,
-                                                                playerAnimatedVisibilityScope = playerAnimatedVisibilityScope,
-                                                                onVideoClick = { video ->
-                                                                    val vKey = "folder_${targetFolder.bucketId}_${video.id}"
-                                                                    morphingVideoKey = vKey
-                                                                    activePlayback = ActiveVideoPlayback(
-                                                                        video = video,
-                                                                        playlist = folderVideos,
-                                                                        sharedKeyPrefix = "folder_${targetFolder.bucketId}"
-                                                                    )
-                                                                },
-                                                                onVideoLongClick = { video ->
-                                                                    AppHaptics.grab()
-                                                                    longPressedVideo = video
-                                                                }
-                                                            )
-                                                        }
-                                                    }
-                                                } else {
-                                                    FolderGridContent(
-                                                        folders = filteredFolders,
-                                                        columns = prefsStore.gridColumns,
-                                                        gridState = foldersGridState,
-                                                        topPadding = topContentPad,
-                                                        bottomPadding = bottomContentPad,
-                                                        morphingFolderBucketId = morphingFolderBucketId,
-                                                        sharedTransitionScope = sharedTransitionScope,
-                                                        folderAnimatedVisibilityScope = folderVisibilityScope,
-                                                        onFolderClick = { folder ->
-                                                            morphingFolderBucketId = folder.bucketId
-                                                            openedFolderBucketId = folder.bucketId
-                                                        }
-                                                    )
-                                                }
-                                            }
-                                        }
-
-                                        LibraryPage.VIDEOS -> {
-                                            VideoGridContent(
-                                                videos = sortedFilteredAllVideos,
-                                                columns = prefsStore.gridColumns,
-                                                gridState = allVideosGridState,
-                                                topPadding = topContentPad,
-                                                bottomPadding = bottomContentPad,
-                                                sharedKeyPrefix = "all_videos",
-                                                morphingVideoKey = morphingVideoKey,
-                                                resumePositions = prefsStore.resumePositions,
-                                                favoriteIds = prefsStore.favoriteIds,
-                                                sharedTransitionScope = sharedTransitionScope,
-                                                playerAnimatedVisibilityScope = playerAnimatedVisibilityScope,
-                                                onVideoClick = { video ->
-                                                    morphingVideoKey = "all_videos_${video.id}"
-                                                    activePlayback = ActiveVideoPlayback(
-                                                        video = video,
-                                                        playlist = sortedFilteredAllVideos,
-                                                        sharedKeyPrefix = "all_videos"
-                                                    )
-                                                },
-                                                onVideoLongClick = { video ->
-                                                    AppHaptics.grab()
-                                                    longPressedVideo = video
-                                                }
-                                            )
-                                        }
-
-                                        LibraryPage.CLOUD -> {
-                                            CloudTabContent(
-                                                repository = cloudRepository,
-                                                prefsStore = prefsStore,
-                                                allVideos = librarySnapshot.videos,
-                                                columns = prefsStore.gridColumns,
-                                                gridState = activeGridState,
-                                                topPadding = topContentPad,
-                                                bottomPadding = bottomContentPad,
-                                                screen = cloudScreen,
-                                                openedPlaylistName = openedPlaylistName,
-                                                statusText = cloudStatus,
-                                                morphingVideoKey = morphingVideoKey,
-                                                sharedTransitionScope = sharedTransitionScope,
-                                                playerAnimatedVisibilityScope = playerAnimatedVisibilityScope,
-                                                onScreenChange = { next ->
-                                                    cloudScreenName = next.name
-                                                    openedPlaylistName = null
-                                                    cloudNotice = null
-                                                },
-                                                onOpenShelfTitle = { opened -> shelfTitle = opened },
-                                                onOpenPlaylist = { name -> openedPlaylistName = name },
-                                                onLongPressCustomPlaylist = { name -> playlistToDelete = name },
-                                                onCreatePlaylistClick = {
-                                                    pendingPlaylistVideoId = null
-                                                    newPlaylistNameInput = ""
-                                                    showCreatePlaylistDialog = true
-                                                },
-                                                onVideoClick = { video, list, prefix ->
-                                                    morphingVideoKey = "${prefix}_${video.id}"
-                                                    activePlayback = ActiveVideoPlayback(
-                                                        video = video,
-                                                        playlist = list,
-                                                        sharedKeyPrefix = prefix
-                                                    )
-                                                },
-                                                onCloudVideoClick = { item, list ->
-                                                    launchCloudVideo(item, list, emptyList(), null)
-                                                },
-                                                onShelfPlay = { item, list, slots, card ->
-                                                    launchCloudVideo(item, list, slots, card)
-                                                },
-                                                onVideoLongClick = { video ->
-                                                    AppHaptics.grab()
-                                                    longPressedVideo = video
-                                                }
-                                            )
-                                        }
-
-                                        LibraryPage.MENU -> {
-                                            SettingsContent(
-                                                snapshot = librarySnapshot,
-                                                prefsStore = prefsStore,
-                                                repository = cloudRepository,
-                                                onManageCollection = { openLibraryBrowser(LibraryPage.CLOUD, CloudScreen.SHELF) },
-                                                gridState = menuGridState,
-                                                topPadding = topContentPad,
-                                                bottomPadding = bottomContentPad
-                                            )
-                                        }
-                                    }
-                                }
+                                CircularProgressIndicator(
+                                    color = OneUiTextPrimary,
+                                    strokeWidth = 2.5.dp,
+                                    modifier = Modifier.size(32.dp)
+                                )
                             }
                         }
-                    )
-                }
-                }
-                }
 
-                    AnimatedVisibility(
-                        visible = showingBrowser && selectedTab != LibraryPage.MENU && lastResumableVideo != null && !showScrollToTopButton,
-                        enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.9f, animationSpec = tween(180)),
-                        exit = fadeOut(tween(140)),
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 86.dp + navBarBottomPadding)
-                    ) {
-                        lastResumableVideo?.let { resumeVideo ->
-                            val posMs = prefsStore.resumePositions[resumeVideo.id] ?: 0L
-                            Surface(
-                                onClick = {
-                                    morphingVideoKey = "all_videos_${resumeVideo.id}"
-                                    activePlayback = ActiveVideoPlayback(
-                                        video = resumeVideo,
-                                        playlist = librarySnapshot.videos,
-                                        sharedKeyPrefix = "all_videos"
+                        browsingDevice && library.videos.isEmpty() -> {
+                            EmptyMediaStateView(onRescanClick = { refreshMediaLibrary(false) })
+                        }
+
+                        else -> {
+                            // Bar footprint is 12.dp bottom inset + its 56.dp height, so this
+                            // keeps the same 46.dp of air above the glass after the labels left.
+                            val bottomContentPad = 114.dp + navBarBottomPadding
+
+                            when (selectedTab) {
+                                LibraryPage.FOLDERS -> {
+                                    AnimatedContent(
+                                        targetState = openedFolderBucketId,
+                                        transitionSpec = {
+                                            (fadeIn(animationSpec = tween(240, easing = FastOutSlowInEasing)) +
+                                                scaleIn(initialScale = 0.96f, animationSpec = tween(240, easing = FastOutSlowInEasing)))
+                                                .togetherWith(
+                                                    fadeOut(animationSpec = tween(200, easing = FastOutSlowInEasing)) +
+                                                        scaleOut(targetScale = 0.96f, animationSpec = tween(200, easing = FastOutSlowInEasing))
+                                                )
+                                        },
+                                        label = "FolderSharedContainerMorph"
+                                    ) { bucketId ->
+                                        val folderVisibilityScope = this
+                                        val targetFolder = bucketId?.let { id -> library.folders.find { it.bucketId == id } }
+                                        if (targetFolder != null) {
+                                            val folderVideos = remember(
+                                                library.videos,
+                                                targetFolder.bucketId,
+                                                searchQuery,
+                                                prefsStore.sortOrder
+                                            ) {
+                                                val raw = library.videos.filter { it.bucketId == targetFolder.bucketId }
+                                                val searched = if (searchQuery.isBlank()) raw else raw.filter {
+                                                    it.title.contains(searchQuery.trim(), ignoreCase = true)
+                                                }
+                                                sortVideos(searched, prefsStore.sortOrder)
+                                            }
+                                            with(sharedTransitionScope) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .fillMaxSize()
+                                                        .sharedBounds(
+                                                            sharedContentState = rememberSharedContentState(
+                                                                key = "folder_container_${targetFolder.bucketId}"
+                                                            ),
+                                                            animatedVisibilityScope = folderVisibilityScope,
+                                                            boundsTransform = { _, _ ->
+                                                                spring(
+                                                                    dampingRatio = Spring.DampingRatioNoBouncy,
+                                                                    stiffness = 380f
+                                                                )
+                                                            },
+                                                            clipInOverlayDuringTransition = OverlayClip(
+                                                                CardCornerShape
+                                                            )
+                                                        )
+                                                        .background(OneUiBackground)
+                                                ) {
+                                                    VideoGridContent(
+                                                        videos = folderVideos,
+                                                        columns = prefsStore.gridColumns,
+                                                        gridState = openedFolderGridState,
+                                                        header = {
+                                                            BrowserHeading(
+                                                                title = targetFolder.title,
+                                                                onBack = leaveBrowser,
+                                                                search = deviceSearch
+                                                            )
+                                                        },
+                                                        topPadding = browserTopPadding,
+                                                        bottomPadding = bottomContentPad,
+                                                        sharedKeyPrefix = "folder_${targetFolder.bucketId}",
+                                                        morphingVideoKey = morphingVideoKey,
+                                                        resumePositions = prefsStore.resumePositions,
+                                                        favoriteIds = prefsStore.favoriteIds,
+                                                        sharedTransitionScope = sharedTransitionScope,
+                                                        playerAnimatedVisibilityScope = playerAnimatedVisibilityScope,
+                                                        onVideoClick = { video ->
+                                                            val vKey = "folder_${targetFolder.bucketId}_${video.id}"
+                                                            morphingVideoKey = vKey
+                                                            prefsStore.rememberWatchedAt(video.id)
+                                                            activePlayback = ActiveVideoPlayback(
+                                                                video = video,
+                                                                playlist = folderVideos,
+                                                                sharedKeyPrefix = "folder_${targetFolder.bucketId}"
+                                                            )
+                                                        },
+                                                        onVideoLongClick = { video ->
+                                                            AppHaptics.grab()
+                                                            longPressedVideo = video
+                                                        }
+                                                    )
+                                                }
+                                            }
+                                        } else {
+                                            FolderGridContent(
+                                                folders = filteredFolders,
+                                                columns = prefsStore.gridColumns,
+                                                gridState = foldersGridState,
+                                                header = {
+                                                    BrowserHeading(
+                                                        title = LibraryPage.FOLDERS.headerTitle,
+                                                        onBack = leaveBrowser,
+                                                        search = deviceSearch
+                                                    )
+                                                },
+                                                topPadding = browserTopPadding,
+                                                bottomPadding = bottomContentPad,
+                                                morphingFolderBucketId = morphingFolderBucketId,
+                                                sharedTransitionScope = sharedTransitionScope,
+                                                folderAnimatedVisibilityScope = folderVisibilityScope,
+                                                onFolderClick = { folder ->
+                                                    morphingFolderBucketId = folder.bucketId
+                                                    openedFolderBucketId = folder.bucketId
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+
+                                LibraryPage.VIDEOS -> {
+                                    VideoGridContent(
+                                        videos = sortedFilteredAllVideos,
+                                        columns = prefsStore.gridColumns,
+                                        gridState = allVideosGridState,
+                                        header = {
+                                            BrowserHeading(
+                                                title = LibraryPage.VIDEOS.headerTitle,
+                                                onBack = leaveBrowser,
+                                                search = deviceSearch
+                                            )
+                                        },
+                                        topPadding = browserTopPadding,
+                                        bottomPadding = bottomContentPad,
+                                        sharedKeyPrefix = "all_videos",
+                                        morphingVideoKey = morphingVideoKey,
+                                        resumePositions = prefsStore.resumePositions,
+                                        favoriteIds = prefsStore.favoriteIds,
+                                        sharedTransitionScope = sharedTransitionScope,
+                                        playerAnimatedVisibilityScope = playerAnimatedVisibilityScope,
+                                        onVideoClick = { video ->
+                                            morphingVideoKey = "all_videos_${video.id}"
+                                            prefsStore.rememberWatchedAt(video.id)
+                                            activePlayback = ActiveVideoPlayback(
+                                                video = video,
+                                                playlist = sortedFilteredAllVideos,
+                                                sharedKeyPrefix = "all_videos"
+                                            )
+                                        },
+                                        onVideoLongClick = { video ->
+                                            AppHaptics.grab()
+                                            longPressedVideo = video
+                                        }
                                     )
-                                },
-                                shape = RoundedCornerShape(24.dp),
-                                color = OneUiPillSurface,
-                                modifier = Modifier
-                                    .height(38.dp)
-                                    .shadow(8.dp, RoundedCornerShape(24.dp))
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(horizontal = 14.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.PlayArrow,
-                                        contentDescription = null,
-                                        tint = OneUiAccent,
-                                        modifier = Modifier.size(18.dp)
+                                }
+
+                                LibraryPage.CLOUD -> {
+                                    CloudTabContent(
+                                        repository = cloudRepository,
+                                        prefsStore = prefsStore,
+                                        allVideos = library.videos,
+                                        columns = prefsStore.gridColumns,
+                                        gridState = activeGridState,
+                                        topPadding = browserTopPadding,
+                                        bottomPadding = bottomContentPad,
+                                        screen = cloudScreen,
+                                        openedPlaylistName = openedPlaylistName,
+                                        statusText = cloudStatus,
+                                        morphingVideoKey = morphingVideoKey,
+                                        sharedTransitionScope = sharedTransitionScope,
+                                        playerAnimatedVisibilityScope = playerAnimatedVisibilityScope,
+                                        onScreenChange = { next ->
+                                            cloudScreenName = next.name
+                                            openedPlaylistName = null
+                                            cloudNotice = null
+                                        },
+                                        onBack = leaveBrowser,
+                                        onOpenShelfTitle = { shelfTitle = it },
+                                        onOpenPlaylist = { name -> openedPlaylistName = name },
+                                        onLongPressCustomPlaylist = { name -> playlistToDelete = name },
+                                        onCreatePlaylistClick = {
+                                            pendingPlaylistVideoId = null
+                                            newPlaylistNameInput = ""
+                                            showCreatePlaylistDialog = true
+                                        },
+                                        onVideoClick = { video, list, prefix ->
+                                            morphingVideoKey = "${prefix}_${video.id}"
+                                            prefsStore.rememberWatchedAt(video.id)
+                                            activePlayback = ActiveVideoPlayback(
+                                                video = video,
+                                                playlist = list,
+                                                sharedKeyPrefix = prefix
+                                            )
+                                        },
+                                        onCloudVideoClick = { item, list ->
+                                            launchShelfVideo(item, list, emptyList(), null)
+                                        },
+                                        onShelfPlay = { item, list, slots, card ->
+                                            launchShelfVideo(item, list, slots, card)
+                                        },
+                                        onVideoLongClick = { video ->
+                                            AppHaptics.grab()
+                                            longPressedVideo = video
+                                        }
                                     )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = "Resume ${resumeVideo.title} (${formatDuration(posMs)})",
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Medium,
-                                        color = OneUiTextPrimary,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
+                                }
+
+                                LibraryPage.MENU -> {
+                                    SettingsContent(
+                                        snapshot = library,
+                                        prefsStore = prefsStore,
+                                        repository = cloudRepository,
+                                        onManageCollection = { openLibraryBrowser(LibraryPage.CLOUD, CloudScreen.SHELF) },
+                                        onAskNotifications = {
+                                            notificationsLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                                        },
+                                        gridState = menuGridState,
+                                        header = {
+                                            BrowserHeading(
+                                                title = LibraryPage.MENU.headerTitle,
+                                                onBack = leaveBrowser,
+                                                search = null
+                                            )
+                                        },
+                                        topPadding = browserTopPadding,
+                                        bottomPadding = bottomContentPad
+                                    )
+                                }
+
+                                LibraryPage.DOWNLOADS -> {
+                                    DownloadsContent(
+                                        shelf = shelfState.value,
+                                        downloads = cloudDownloads,
+                                        progress = cloudRepository.progress,
+                                        prefsStore = prefsStore,
+                                        gridState = downloadsGridState,
+                                        header = {
+                                            BrowserHeading(
+                                                title = LibraryPage.DOWNLOADS.headerTitle,
+                                                onBack = leaveBrowser,
+                                                search = null
+                                            )
+                                        },
+                                        topPadding = browserTopPadding,
+                                        bottomPadding = bottomContentPad,
+                                        onOpenTitle = { shelfTitle = it },
+                                        onCancelDownload = { file ->
+                                            coroutineScope.launch { cloudRepository.cancelDownload(file) }
+                                        },
+                                        onRemoveDownload = { file ->
+                                            coroutineScope.launch { cloudRepository.removeDownload(file) }
+                                        }
                                     )
                                 }
                             }
                         }
                     }
+                }
+                }
+                }
+                }
+                }
 
                     AnimatedVisibility(
                         visible = showingBrowser && showScrollToTopButton,
@@ -3373,9 +3251,9 @@ fun ArcPlayerHomeScreen() {
                         ),
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
-                            .padding(bottom = 86.dp + navBarBottomPadding)
+                            .padding(bottom = 72.dp + navBarBottomPadding)
                     ) {
-                        OneUiScrollToTopButton(
+                        ScrollToTopCircle(
                             onClick = {
                                 coroutineScope.launch {
                                     activeGridState.animateScrollToItem(index = 0, scrollOffset = 0)
@@ -3386,7 +3264,7 @@ fun ArcPlayerHomeScreen() {
 
                     Box(
                         Modifier.align(Alignment.BottomCenter).fillMaxWidth()
-                            .height(106.dp + navBarBottomPadding)
+                            .height(92.dp + navBarBottomPadding)
                             .background(Brush.verticalGradient(
                                 0f to OneUiBackground.copy(alpha = 0f),
                                 0.25f to OneUiBackground.copy(alpha = 0.28f),
@@ -3410,19 +3288,20 @@ fun ArcPlayerHomeScreen() {
                         },
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
-                            .padding(
-                                start = 24.dp,
-                                end = 24.dp,
-                                bottom = 12.dp + navBarBottomPadding
-                            )
+                            .padding(bottom = 12.dp + navBarBottomPadding)
                     )
 
                     // The page a shelf poster opens. It sits over everything, including the bar,
                     // because the reference page carries its own back arrow and owns the whole screen.
+                    // It arrives the way a detail screen arrives in the reference app: pushed in from the
+                    // right on the smooth-deceleration curve while the shelf behind it dims and recedes,
+                    // and it leaves back the way it came.
                     AnimatedVisibility(
                         visible = shelfTitle != null,
-                        enter = fadeIn(tween(200)),
-                        exit = fadeOut(tween(150)),
+                        enter = fadeIn(tween(400)) +
+                            slideInHorizontally(tween(600, easing = DetailPushEase)) { it },
+                        exit = fadeOut(tween(400)) +
+                            slideOutHorizontally(tween(600, easing = DetailPushEase)) { it },
                         modifier = Modifier.fillMaxSize()
                     ) {
                         (shelfTitle ?: lastShelfTitle)?.let { opened ->
@@ -3431,11 +3310,21 @@ fun ArcPlayerHomeScreen() {
                                 prefsStore = prefsStore,
                                 statusText = cloudStatus,
                                 isResolving = cloudResolving,
+                                downloads = cloudDownloads,
+                                downloadProgress = cloudRepository.progress,
                                 topInset = statusBarTopPadding,
                                 bottomInset = navBarBottomPadding,
                                 onBack = { shelfTitle = null },
-                                onPlay = { item, list, slots -> launchCloudVideo(item, list, slots, opened.card) },
-                                onRemove = removeFromShelf
+                                onPlay = { item, list, slots -> launchShelfVideo(item, list, slots, opened.card) },
+                                onRemove = removeFromShelf,
+                                onDownload = { file ->
+                                    if (DownloadNotifier.needsPermissionAsk(context)) {
+                                        notificationsLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                                    }
+                                    coroutineScope.launch { cloudRepository.download(file) }
+                                },
+                                onCancelDownload = { file -> coroutineScope.launch { cloudRepository.cancelDownload(file) } },
+                                onRemoveDownload = { file -> coroutineScope.launch { cloudRepository.removeDownload(file) } }
                             )
                         }
                     }
@@ -3448,11 +3337,36 @@ fun ArcPlayerHomeScreen() {
                     animatedVisibilityScope = playerAnimatedVisibilityScope,
                     cloudRepository = if (currentPlayback.cloudSources.isEmpty()) null else cloudRepository,
                     onSelectAdjacentVideo = { nextVideo ->
-                        currentPlayback.cloudSources
-                            .firstOrNull { it.stableId == nextVideo.id }
-                            ?.let { holdCloudCopy(it) }
+                        // A step onto a file that was already here puts down the download the player was
+                        // reading; a step to another channel copy releases the one it is leaving.
+                        holdShelfCopy(
+                            currentPlayback.cloudSources.firstOrNull { it.stableId == nextVideo.id }
+                                ?: nextVideo
+                        )
                         morphingVideoKey = "${currentPlayback.sharedKeyPrefix}_${nextVideo.id}"
-                        activePlayback = currentPlayback.copy(video = nextVideo)
+                        // A step is a fresh question, so the refusals that answered the last one are
+                        // dropped with it: the next part gets its own try at its own copies.
+                        activePlayback = currentPlayback.copy(
+                            video = nextVideo,
+                            switchReason = null,
+                            refusedCopies = emptySet()
+                        )
+                    },
+                    onFallToAnotherCopy = { nextVideo, reason ->
+                        holdShelfCopy(
+                            currentPlayback.cloudSources.firstOrNull { it.stableId == nextVideo.id }
+                                ?: nextVideo
+                        )
+                        // The copy that refused is dropped from the shelf's memory of what was watched
+                        // last, because leaving its stamp the newest one would send Resume and the
+                        // Continue Watching row straight back to the file that just failed.
+                        prefsStore.rememberWatchedAt(nextVideo.id)
+                        morphingVideoKey = "${currentPlayback.sharedKeyPrefix}_${nextVideo.id}"
+                        activePlayback = currentPlayback.copy(
+                            video = nextVideo,
+                            switchReason = reason,
+                            refusedCopies = currentPlayback.refusedCopies + currentPlayback.video.id
+                        )
                     },
                     onDismiss = { activePlayback = null }
                 )
@@ -3635,6 +3549,8 @@ private fun PlaylistsTabContent(
     prefsStore: ArcPreferencesStore,
     columns: Int,
     gridState: LazyGridState,
+    heading: String,
+    onBack: () -> Unit,
     topPadding: Dp,
     bottomPadding: Dp,
     openedPlaylistName: String?,
@@ -3647,6 +3563,7 @@ private fun PlaylistsTabContent(
     onVideoClick: (VideoItem, List<VideoItem>, String) -> Unit,
     onVideoLongClick: (VideoItem) -> Unit
 ) {
+    val header: @Composable () -> Unit = { BrowserHeading(heading, onBack, null) }
     val videoById = remember(allVideos) { allVideos.associateBy { it.id } }
 
     if (openedPlaylistName != null) {
@@ -3661,6 +3578,7 @@ private fun PlaylistsTabContent(
             videos = playlistVideos,
             columns = columns,
             gridState = gridState,
+            header = header,
             topPadding = topPadding,
             bottomPadding = bottomPadding,
             sharedKeyPrefix = "playlist_$openedPlaylistName",
@@ -3687,8 +3605,7 @@ private fun PlaylistsTabContent(
     LazyVerticalGrid(
         state = gridState,
         columns = GridCells.Fixed(columns),
-        userScrollEnabled = false,
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.physicsBounceOverscroll().fillMaxSize(),
         contentPadding = PaddingValues(
             start = 14.dp,
             end = 14.dp,
@@ -3698,6 +3615,10 @@ private fun PlaylistsTabContent(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        item(key = "playlists_heading", span = { GridItemSpan(maxLineSpan) }) {
+            header()
+        }
+
         item(key = "builtin_history") {
             VideoFolderCard(
                 folder = VideoFolderItem(
@@ -3814,6 +3735,27 @@ private fun CloudVideoItem.toGridVideoItem(streamUri: Uri? = null, card: MediaCa
 )
 
 /**
+ * The row the player builds its labels from, for a file of either origin.
+ *
+ * A Telegram copy is presented as if it were a local one so the card, the hero transition and the player
+ * all work unchanged; a device file already is that row. Reaching the file itself is the case
+ * [Playable] was documented to leave for a cast, and it is the only thing here that cares which of the
+ * two a given copy turned out to be.
+ */
+private fun Playable.toPlayerRow(): VideoItem =
+    if (this is CloudVideoItem) toGridVideoItem() else this as VideoItem
+
+/**
+ * The shelf whose card this file morphs from.
+ *
+ * Only the Telegram shelf keys its shared elements by chat, and only that shelf morphs into the player at
+ * all, so a device file gets a prefix of its own: the ◀▶ skip has to be able to name the key it started
+ * from, and nothing will ever register it.
+ */
+private fun Playable.morphPrefix(): String =
+    if (this is CloudVideoItem) "cloud_$chatId" else "phone_$stableId"
+
+/**
  * The Cloud tab: the shelf, and the on-device playlists a pill on it opens.
  *
  * Dispatch only: each screen owns its own grid, because a shelf of cards grouped out of file names has
@@ -3836,6 +3778,7 @@ private fun CloudTabContent(
     sharedTransitionScope: SharedTransitionScope,
     playerAnimatedVisibilityScope: AnimatedVisibilityScope,
     onScreenChange: (CloudScreen) -> Unit,
+    onBack: () -> Unit,
     onOpenShelfTitle: (ShelfTitle) -> Unit,
     onOpenPlaylist: (String) -> Unit,
     onLongPressCustomPlaylist: (String) -> Unit,
@@ -3845,6 +3788,11 @@ private fun CloudTabContent(
     onShelfPlay: (CloudVideoItem, List<CloudVideoItem>, List<List<Long>>, MediaCard?) -> Unit,
     onVideoLongClick: (VideoItem) -> Unit
 ) {
+    val heading = when {
+        openedPlaylistName != null -> openedPlaylistName!!
+        screen == CloudScreen.PLAYLISTS -> "Playlists"
+        else -> "Library"
+    }
     val authState by repository.authState.collectAsState()
     if (screen == CloudScreen.SHELF && authState.stage != CloudAuthStage.AUTHORIZED) {
         CloudAuthGrid(
@@ -3852,6 +3800,7 @@ private fun CloudTabContent(
             prefsStore = prefsStore,
             state = authState,
             gridState = gridState,
+            header = { BrowserHeading(heading, onBack, null) },
             topPadding = topPadding,
             bottomPadding = bottomPadding
         )
@@ -3862,6 +3811,7 @@ private fun CloudTabContent(
         prefsStore = prefsStore,
         columns = columns,
         gridState = gridState,
+        header = { BrowserHeading(heading, onBack, null) },
         topPadding = topPadding,
         bottomPadding = bottomPadding,
         statusText = statusText,
@@ -3879,6 +3829,8 @@ private fun CloudTabContent(
             prefsStore = prefsStore,
             columns = columns,
             gridState = gridState,
+            heading = heading,
+            onBack = onBack,
             topPadding = topPadding,
             bottomPadding = bottomPadding,
             openedPlaylistName = openedPlaylistName,
@@ -3905,6 +3857,7 @@ private class CloudGridArgs(
     val prefsStore: ArcPreferencesStore,
     val columns: Int,
     val gridState: LazyGridState,
+    val header: @Composable () -> Unit,
     val topPadding: Dp,
     val bottomPadding: Dp,
     val statusText: String?,
@@ -3929,6 +3882,7 @@ private fun CloudAuthGrid(
     prefsStore: ArcPreferencesStore,
     state: CloudAuthState,
     gridState: LazyGridState,
+    header: @Composable () -> Unit,
     topPadding: Dp,
     bottomPadding: Dp
 ) {
@@ -3936,10 +3890,12 @@ private fun CloudAuthGrid(
     LazyVerticalGrid(
         state = gridState,
         columns = GridCells.Fixed(1),
-        userScrollEnabled = false,
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.physicsBounceOverscroll().fillMaxSize(),
         contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = topPadding, bottom = bottomPadding)
     ) {
+        item(key = "cloud_auth_heading") {
+            header()
+        }
         item(key = "cloud_auth_panel") {
             CloudAuthPanel(
                 state = state,
@@ -3967,10 +3923,11 @@ private fun CloudShelfGrid(
     val videosByChat by repository.videos.collectAsState()
     val thumbnails by repository.thumbnails.collectAsState()
     val progressByFile by repository.progress.collectAsState()
+    val downloads by repository.downloads.collectAsState()
 
     val folderChatId = grid.prefsStore.movieFolderChatId
     var shelfGone by remember { mutableStateOf(false) }
-    var reloadToken by remember { mutableStateOf(0) }
+    var reloadToken by remember { mutableIntStateOf(0) }
     var loading by remember { mutableStateOf(folderChatId != 0L) }
     var creating by remember { mutableStateOf(false) }
     var createFailed by remember { mutableStateOf(false) }
@@ -4062,7 +4019,12 @@ private fun CloudShelfGrid(
     // Only the file a card hangs on is asked about. The copies underneath it are searched when someone
     // opens them, which stops a shelf of duplicates spending the catalogue's quota on artwork nobody
     // is looking at.
-    TitleSearchPass(groups.mapNotNull { videoById[it.representative.id] }, grid.prefsStore)
+    //
+    // This screen is the channel alone, so its cards are keyed the same way the merged shelf keys them —
+    // which is the same id, because a channel-only group's [ShelfTitle.cardKey] is one of its own files.
+    val storedCards = grid.prefsStore.mediaCards.toMap()
+    val shelfTitles = remember(shelfVideos, groups, storedCards) { shelfCards(shelfVideos, groups, storedCards) }
+    TitleSearchPass(shelfTitles, grid.prefsStore)
 
     /**
      * Each card cut down to what the Continue Watching row has to ask of it: which files are copies of
@@ -4097,13 +4059,15 @@ private fun CloudShelfGrid(
     // The positions themselves change when a film is put down, while the shelf's shape only changes when
     // Telegram hands back a different list, so only this half re-runs.
     val resumeMs = grid.prefsStore.resumePositions
-    val lastPlayedMs = grid.prefsStore.cloudWatchedAt
+    val lastPlayedMs = grid.prefsStore.watchedAt
+    val savedIds = DownloadLedger.completeIds(downloads)
     val unfinished = playables.mapNotNull { playable ->
         val progress = PlayOrder.progress(
             playable.slots,
             resumeMs,
             playable.lengthsWithWatched(grid.prefsStore.knownLengths),
-            lastPlayedMs
+            lastPlayedMs,
+            savedIds
         ) ?: return@mapNotNull null
         playable to progress
     }.sortedByDescending { (_, progress) -> lastPlayedMs[progress.partId] ?: 0L }
@@ -4113,8 +4077,7 @@ private fun CloudShelfGrid(
     LazyVerticalGrid(
         state = grid.gridState,
         columns = GridCells.Fixed(grid.columns),
-        userScrollEnabled = false,
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.physicsBounceOverscroll().fillMaxSize(),
         contentPadding = PaddingValues(
             start = 14.dp,
             end = 14.dp,
@@ -4124,6 +4087,10 @@ private fun CloudShelfGrid(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        item(key = "shelf_heading", span = { GridItemSpan(maxLineSpan) }) {
+            grid.header()
+        }
+
         item(key = "shelf_actions", span = { GridItemSpan(maxLineSpan) }) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 CloudPill(text = "Add from Telegram", onClick = handOffToTelegram)
@@ -4458,7 +4425,8 @@ private fun ShelfRail(
         // a rail of at most a dozen posters is nothing to defer.
         Row(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
-            modifier = Modifier.horizontalScroll(rememberScrollState())
+            modifier = Modifier.physicsBounceOverscroll(isHorizontal = true)
+                .horizontalScroll(rememberScrollState())
         ) {
             entries.forEach { (playable, progress) ->
                 key(playable.group.key) {
@@ -4541,7 +4509,7 @@ private fun ShelfRailCard(
  * behind it is not that.
  */
 private fun TitleGroup.toShelfCard(
-    representative: CloudVideoItem,
+    representative: Playable,
     card: MediaCard?
 ): VideoItem = VideoItem(
     id = representative.stableId,
@@ -4559,20 +4527,31 @@ private fun TitleGroup.toShelfCard(
     dateAddedSec = 0L
 )
 
-/** Ask the catalogues what these files are, once each, while the screen holding them is on screen. */
+/** Ask the catalogues what these works are, once each, while the screen holding them is on screen. */
 @Composable
-internal fun TitleSearchPass(videos: List<CloudVideoItem>, prefsStore: ArcPreferencesStore) {
-    LaunchedEffect(videos) {
-        if (videos.isEmpty()) return@LaunchedEffect
+internal fun TitleSearchPass(titles: List<ShelfTitle>, prefsStore: ArcPreferencesStore) {
+    LaunchedEffect(titles) {
+        if (titles.isEmpty()) return@LaunchedEffect
         MediaLibrary.search(
-            requests = videos
+            requests = titles
                 // A card from before wordmarks were fetched still needs the second half of the lookup,
                 // and only that half: the name it carries is settled.
                 .filter {
-                    val card = prefsStore.mediaCards[it.stableId]
-                    card == null || (card.source == "tmdb" && !card.logoKnown)
+                    val card = prefsStore.mediaCards[it.cardKey]
+                    // Older rules get one more ask, but only for the files left with nothing to look
+                    // at. A card that already carries a poster is worth more than the chance the
+                    // scoring changed since, and re-opening those would spend a request per film to
+                    // possibly replace a good answer with a worse one. A name rescued from Wikipedia
+                    // counts as nothing to look at: it is the one source whose answer has no artwork,
+                    // so the card reads as a grey box until a rule change lets the chain try the
+                    // catalogues that do have the poster.
+                    card == null ||
+                        (card.posterUrl.isNullOrBlank() && card.rules < MediaCard.RULES) ||
+                        (card.source == "tmdb" && !card.logoKnown)
                 }
-                .map { LookupRequest(it.stableId, it.title) },
+                // Asked under the work's key and with the name of the file that key belongs to, so a
+                // film the phone also holds still spends one request rather than one per copy.
+                .map { LookupRequest(it.cardKey, it.asker.title) },
             apiKey = BuildConfig.TMDB_API_KEY,
             onFound = { id, card -> prefsStore.rememberMediaCard(id, card) }
         )
@@ -4580,18 +4559,23 @@ internal fun TitleSearchPass(videos: List<CloudVideoItem>, prefsStore: ArcPrefer
 }
 
 /**
- * One shelf card opened as a page: the work, every file of it the shelf holds, and what the catalogue
+ * One shelf card opened as a page: the work, every file of it the library holds, and what the catalogue
  * said about it.
  *
  * The card carries its files along because the page has to answer two unrelated questions at once —
- * "what is this" from the catalogue, and "what can actually be played" from Telegram — and the second
- * answer is never as wide as the first. A show whose eight episodes are all on the shelf has one
- * playable file per catalogue row; a film uploaded by three groups has three rows and one page.
+ * "what is this" from the catalogue, and "what can actually be played" from the phone and from
+ * Telegram — and the second answer is never as wide as the first. A show whose eight episodes are all
+ * on the shelf has one playable file per catalogue row; a film uploaded by three groups has three rows
+ * and one page.
+ *
+ * [parts] are files from either place, and the page is allowed to know only that: what a copy is called,
+ * how big and how long it is, and whether it is already here. Which of them gets deleted off a shelf, or
+ * fetched through a chat, is decided at the one place that casts back to the concrete type.
  */
 internal class ShelfTitle(
     val group: TitleGroup,
-    val parts: List<CloudVideoItem>,
-    val representative: CloudVideoItem,
+    val parts: List<Playable>,
+    val representative: Playable,
     val card: MediaCard?
 ) {
     val name: String = card?.title?.nullIfBlank() ?: group.displayTitle
@@ -4599,6 +4583,26 @@ internal class ShelfTitle(
     val providerId: Int? = card?.providerId
     val posterUrl: String? = card?.posterUrl
     val wordmarkUrl: String? = card?.logoUrl
+
+    /**
+     * The id this work's catalogue answer is filed under.
+     *
+     * Not simply the representative's, because the best copy of a film the viewer also owns is now the
+     * one on the phone — and an answer that was looked up for a channel file would be orphaned the
+     * moment that file stopped heading its own card. So the card stays with a copy that came off
+     * Telegram wherever one exists, which keeps every answer this install already paid for, and only a
+     * work nothing but the phone holds has to be asked about from scratch.
+     */
+    val cardKey: Long = parts.firstOrNull { !it.isOnPhone }?.stableId ?: representative.stableId
+
+    /** The file whose name the catalogues are asked with, which is the one [cardKey] answers for. */
+    val asker: Playable = parts.firstOrNull { it.stableId == cardKey } ?: representative
+
+    /** Whether this work exists on the channel at all, which is what decides if it can be taken off a shelf. */
+    val heldOnChannel: Boolean = parts.any { !it.isOnPhone }
+
+    /** The same title wearing a newer catalogue answer, which is the only thing that differs. */
+    fun withCard(fresh: MediaCard?): ShelfTitle = ShelfTitle(group, parts, representative, fresh)
 
     /** Watch order, as the grouping left it. */
     val partIds: List<Long> = group.parts.map { it.id }
@@ -4625,7 +4629,7 @@ internal class ShelfTitle(
      * a show carried by two groups arrives with two files per number, and the row that hides one of them
      * leaves the other to be read as an episode of its own.
      */
-    val filesByEpisode: Map<Int, Map<Int, List<CloudVideoItem>>> = run {
+    val filesByEpisode: Map<Int, Map<Int, List<Playable>>> = run {
         val byId = parts.associateBy { it.stableId }
         group.parts.mapNotNull { part ->
             val season = part.season ?: return@mapNotNull null
@@ -4643,7 +4647,7 @@ internal class ShelfTitle(
      * long show reaches a shelf. Which season one of these belongs to is not in the file name, so it
      * is answered from the catalogue's season lengths rather than guessed at here.
      */
-    val filesByAbsolute: Map<Int, List<CloudVideoItem>> = run {
+    val filesByAbsolute: Map<Int, List<Playable>> = run {
         val byId = parts.associateBy { it.stableId }
         group.parts.mapNotNull { part ->
             if (part.season != null) return@mapNotNull null
@@ -4654,22 +4658,207 @@ internal class ShelfTitle(
     }
 }
 
+/**
+ * The cards one pile of files makes, each wearing the catalogue answer its key was filed under.
+ *
+ * Both shelves build through here: the collection screens hand over the channel and the phone together,
+ * the manage-collection screen hands over the channel alone. One place to cut a group into a card is what
+ * keeps a work's key the same number on both screens, which is the only reason an answer paid for in one
+ * tab is still there when the other opens.
+ */
+internal fun shelfCards(
+    files: List<Playable>,
+    groups: List<TitleGroup>,
+    cards: Map<Long, MediaCard>
+): List<ShelfTitle> {
+    val byId = files.associateBy { it.stableId }
+    return groups.mapNotNull { group ->
+        val parts = group.parts.mapNotNull { byId[it.id] }
+        if (parts.isEmpty()) return@mapNotNull null
+        val representative = byId[group.representative.id] ?: parts.first()
+        // Built once with no card, so the work can report its own key before the answer is read with it.
+        val bare = ShelfTitle(group, parts, representative, null)
+        bare.withCard(cards[bare.cardKey])
+    }
+}
+
 /** How long a closed player is given to let go of its file before the bytes are handed back. */
 private const val PLAYER_RELEASE_SETTLE_MS = 1_500L
 
-private const val INFO_HERO_HEIGHT_DP = 300
-private const val INFO_HERO_COLLAPSE_DP = 210
+/** Frosted Jelly's smooth-deceleration curve: the one every detail push in the design system lands on. */
+private val DetailPushEase = CubicBezierEasing(0.22f, 1f, 0.36f, 1f)
 
-/** Frosted Artwork Parallax Fade: the picture travels at six tenths of the column's own speed. */
+// The picture hands the screen to the page over this much of its own height, and the fade finishes
+// exactly where the shared scrim turns to page colour, so the handover never shows a seam.
+private const val INFO_HERO_COLLAPSE_FRACTION = 0.84f
+
+/** Frosted Artwork Parallax Fade: the picture recedes at six tenths of the column's own speed. */
 private const val INFO_ARTWORK_PARALLAX = 0.6f
+
+/** How much page colour feathers in over the picture's bottom edge before it turns solid. */
+private const val INFO_HERO_FEATHER_DP = 64
+
+/**
+ * The circle that keeps a film on this phone.
+ *
+ * Three readings of one glass disc, so the row never shifts under a finger: an arrow to start, the same
+ * arrow ringed while the bytes come, a tick once they have landed. Pressing the ring takes the promise
+ * back — a viewer watching a bar grow has already said what they want, so a second press means "stop"
+ * rather than "ask me again" — while the tick opens a menu, because wiping a four gigabyte film off a
+ * device is not a thing a mis-tap should be allowed to do.
+ *
+ * The progress is a flow rather than a map handed down by the page, and it is collected here: the pump
+ * publishes several times a second while anything is arriving, and a read above the page would
+ * recompose the hero, the copies list and the metadata with every one of those.
+ */
+@Composable
+private fun DownloadCircle(
+    file: CloudVideoItem,
+    entry: DownloadEntry?,
+    progress: StateFlow<Map<Int, CloudProgress>>,
+    onDownload: (CloudVideoItem) -> Unit,
+    onCancel: (CloudVideoItem) -> Unit,
+    onRemove: (CloudVideoItem) -> Unit
+) {
+    val saved = entry?.isComplete == true
+    val arriving = entry != null && !saved
+    DownloadCircleTarget(
+        size = 56.dp,
+        saved = saved,
+        arriving = arriving,
+        // The id the fetch was started under, which is the one the pump publishes against. The shelf's own
+        // id is the fallback: an entry and its file are the same copy, and a re-listed document can name
+        // the pair differently than the row that asked for it.
+        progressKey = entry?.fileId ?: file.fileId,
+        progress = progress,
+        onClick = { if (arriving) onCancel(file) else onDownload(file) },
+        onRemove = { onRemove(file) }
+    )
+}
+
+/**
+ * The disc itself, at whatever size the row carrying it can hold.
+ *
+ * The size is a parameter rather than a second control because the same promise is drawn in more than one
+ * place — the info page's action row at 56 dp and a Downloads row at 38 — and a film's download state that
+ * looks different depending on where you happened to look it up reads as three different states.
+ */
+@Composable
+private fun DownloadCircleTarget(
+    size: Dp,
+    saved: Boolean,
+    arriving: Boolean,
+    progressKey: Int,
+    progress: StateFlow<Map<Int, CloudProgress>>,
+    onClick: () -> Unit,
+    onRemove: () -> Unit
+) {
+    val published by progress.collectAsState()
+    val fraction = published[progressKey]?.fraction ?: 0f
+    val stroke = if (size >= 44.dp) 3.dp else 2.dp
+    // Half the disc, floored where a smaller glyph would be a smudge rather than a download arrow.
+    val glyph = (size * 0.4f).coerceAtLeast(12.dp)
+
+    Box(
+        modifier = Modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(OneUiPillSurface),
+        contentAlignment = Alignment.Center
+    ) {
+        if (saved) {
+            MorphingMenu(
+                items = listOf(
+                    MorphingMenuItem(
+                        text = "Remove download",
+                        icon = Icons.Default.Delete,
+                        isDestructive = true,
+                        onClick = {
+                            AppHaptics.destructive()
+                            onRemove()
+                        }
+                    )
+                ),
+                buttonSize = size,
+                contentDescription = "Available offline",
+                icon = Icons.Default.Check,
+                tint = OneUiTextPrimary
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(size)
+                    .then(
+                        if (arriving) {
+                            Modifier.drawBehind {
+                                val ring = stroke.toPx()
+                                val radius = this.size.minDimension / 2f - ring
+                                val ringSize = ComposeSize(radius * 2f, radius * 2f)
+                                val ringTopLeft = Offset(
+                                    (this.size.width - ringSize.width) / 2f,
+                                    (this.size.height - ringSize.height) / 2f
+                                )
+                                // The track is drawn whole under the part that has landed, so a fetch that
+                                // has not reported a single byte yet still reads as working.
+                                drawArc(
+                                    color = OneUiTextPrimary.copy(alpha = 0.16f),
+                                    startAngle = 0f,
+                                    sweepAngle = 360f,
+                                    useCenter = false,
+                                    topLeft = ringTopLeft,
+                                    size = ringSize,
+                                    style = Stroke(width = ring)
+                                )
+                                if (fraction > 0f) {
+                                    drawArc(
+                                        color = OneUiTextPrimary,
+                                        startAngle = -90f,
+                                        sweepAngle = 360f * fraction,
+                                        useCenter = false,
+                                        topLeft = ringTopLeft,
+                                        size = ringSize,
+                                        style = Stroke(width = ring, cap = StrokeCap.Round)
+                                    )
+                                }
+                            }
+                        } else {
+                            Modifier
+                        }
+                    )
+                    .jellyClick(
+                        interactionSource = null,
+                        indication = null,
+                        onClickLabel = if (arriving) "Cancel download" else null
+                    ) {
+                        AppHaptics.click()
+                        onClick()
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = HugeIcons.Download,
+                    contentDescription = if (arriving) "Downloading, tap to cancel" else "Keep offline",
+                    tint = OneUiTextPrimary,
+                    // The glyph the disc's other two readings get: the tick this becomes and the overflow
+                    // circle beside it. A download that lands would otherwise be seen to shrink, and a
+                    // promise about the row holding still has to cover what is in it.
+                    modifier = Modifier.size(glyph)
+                )
+            }
+        }
+    }
+}
 
 /**
  * The page a shelf poster opens.
  *
- * It scrolls as one column with the artwork drifting behind it at 0.6x, because the reference's hero
- * is not a header that disappears — the picture slides away and the film's own lettering goes with it,
- * leaving the plain title in the bar. Nothing here is a second copy of the grid's card: the page is
- * about the work, and the grid is about finding it.
+ * Its hero is the collection home's hero with one title instead of a carousel: the same height rule,
+ * the same scrim, and the same stack of wordmark, one metadata line and a single pill standing on the
+ * picture. The page scrolls as one column with the artwork drifting behind it at 0.6x, because the
+ * reference's hero is not a header that disappears — the picture slides away and the film's own
+ * lettering goes with it, leaving no bar behind: just a short scrim under the status bar and the back
+ * arrow in its own floating glass. The picture is the card's own: the shelf
+ * and this page wear the same shot, so the push carries no change of artwork across it.
  */
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
@@ -4678,36 +4867,105 @@ private fun CloudTitleInfoPage(
     prefsStore: ArcPreferencesStore,
     statusText: String?,
     isResolving: Boolean,
+    downloads: Map<Long, DownloadEntry>,
+    downloadProgress: StateFlow<Map<Int, CloudProgress>>,
     topInset: Dp,
     bottomInset: Dp,
     onBack: () -> Unit,
-    onPlay: (CloudVideoItem, List<CloudVideoItem>, List<List<Long>>) -> Unit,
-    onRemove: (ShelfTitle) -> Unit
+    onPlay: (Playable, List<Playable>, List<List<Long>>) -> Unit,
+    onRemove: (ShelfTitle) -> Unit,
+    onDownload: (CloudVideoItem) -> Unit,
+    onCancelDownload: (CloudVideoItem) -> Unit,
+    onRemoveDownload: (CloudVideoItem) -> Unit
 ) {
-    val detail = TitleDetailFetch(title.providerId, title.isSeries, prefsStore)
-    val scrollState = rememberScrollState()
-    val collapsePx = with(LocalDensity.current) { INFO_HERO_COLLAPSE_DP.dp.toPx() }
-    val lifted = (scrollState.value / collapsePx).coerceIn(0f, 1f)
-    val barOpaque = lifted > 0.55f
-    val actionsStanding = rememberHeaderActionsVisible(scrollState)
+    // The card arrives with the tap, so it is a snapshot; the store is the live one, and this page
+    // starts a lookup of its own. Everything the page says about the work is read through [shown],
+    // while the keys below stay on [title] so a landing answer neither replays the entrance nor
+    // throws away the season the viewer picked.
+    val storedCard = prefsStore.mediaCards[title.cardKey]
+    val shown = remember(title, storedCard) { title.withCard(storedCard ?: title.card) }
 
-    val backdrop = rememberCachedArt(detail?.backdropUrl ?: title.posterUrl, 1_100)
-    val wordmark = rememberCachedArt(title.wordmarkUrl, PosterCache.WORDMARK_WIDTH_PX)
+    // A file the catalogues drew a blank on is otherwise refused for good, since the pass only re-asks
+    // a refusal when the matching rules change. Opening its page is the moment the viewer says they
+    // care about this title, so it asks once more — and only while there is no artwork to show.
+    LaunchedEffect(title.cardKey) {
+        val card = prefsStore.mediaCards[title.cardKey]
+        if (card == null || card.posterUrl.isNullOrBlank()) {
+            MediaLibrary.askNow(
+                videoId = title.cardKey,
+                fileName = title.asker.title,
+                apiKey = BuildConfig.TMDB_API_KEY,
+                onFound = { id, found -> prefsStore.rememberMediaCard(id, found) }
+            )
+        }
+    }
+
+    val detail = TitleDetailFetch(shown.providerId, shown.isSeries, prefsStore)
+    val scrollState = rememberScrollState()
+    val heroHeight = rememberCollectionHeroHeight()
+    val collapsePx = with(LocalDensity.current) { (heroHeight * INFO_HERO_COLLAPSE_FRACTION).toPx() }
+    // The top scrim rides the artwork out. It lights in proportion to how far the picture has fallen
+    // and only reaches full strength at `collapsePx`, the same distance over which the picture's own
+    // alpha goes to zero — so the shade is complete exactly when there is no artwork left to shade
+    // over, and holds there for the rest of the page.
+    val topScrim = (scrollState.value / collapsePx).coerceIn(0f, 1f)
+
+    // The one picture this title wears everywhere, including on the card this page was opened from.
+    val artUrl = rememberShelfArtUrl(shown, prefsStore)
+    val art = rememberCachedArt(artUrl, PosterCache.HERO_WIDTH_PX)
+    val wordmark = rememberCachedArt(shown.wordmarkUrl, PosterCache.WORDMARK_WIDTH_PX)
+    // The page arrives as a whole screen, so its own lettering and controls come in a beat behind it
+    // rather than all at once on the first frame.
+    val contentReveal = remember(title) { Animatable(0f) }
+    LaunchedEffect(title) {
+        if (contentReveal.value < 1f) {
+            contentReveal.animateTo(1f, tween(durationMillis = 220, delayMillis = 160, easing = FastOutSlowInEasing))
+        }
+    }
+    val revealRisePx = with(LocalDensity.current) { 14.dp.toPx() }
 
     val resumeByPart = title.partIds.associateWith { prefsStore.resumePositions[it] ?: 0L }
     // Twenty minutes spent on one copy are twenty minutes into the part, so every copy of it shows and
     // opens at the same place. The player only ever reads the file it was handed.
     val resumeByCopy = PlayOrder.positionByCopy(title.copySlots, resumeByPart)
+    // The copies this device has been made to hold on to, byte for byte. One read of the ledger for the
+    // whole page: it decides which copy Play opens, which rows say "Offline", and which circle wears a
+    // tick instead of an arrow.
+    val savedIds = DownloadLedger.completeIds(downloads)
     val playChoice = PlayOrder.nextCopy(
         slots = title.copySlots,
         resumeMs = resumeByCopy,
         lengthsMs = title.lengths,
-        lastPlayedMs = prefsStore.cloudWatchedAt
+        lastPlayedMs = prefsStore.watchedAt,
+        savedIds = savedIds
     )
     val playFile = title.parts.firstOrNull { it.stableId == playChoice?.partId } ?: title.representative
     val playLabel = if ((playChoice?.resumeMs ?: 0L) > 0L) "Resume" else "Play"
 
-    val playCopy: (CloudVideoItem) -> Unit = { file ->
+    // The circle keeps exactly the copy Play opens — the best upload when nothing has been watched, the
+    // one last watched when it has — so the two buttons can never disagree about which file this title is.
+    // A device file answers null: it is already offline, and a button promising offline viewing of a film
+    // that never left the phone is a second word for nothing. That is also why this gate is not the shelf
+    // removal one — a purely local card has no shelf to remove, but it has no fetch to make either.
+    val downloadTarget = playFile as? CloudVideoItem
+    // The circle belongs to whichever copy of this title is live: the one Play opens, unless one of its
+    // siblings is being fetched right now. A ring that disappeared because the viewer pressed Play on a
+    // different copy of the same film would leave that fetch running with nothing on screen saying so,
+    // and a fetch nobody can see is a fetch nobody can stop.
+    val downloadFile = (title.parts.firstOrNull { downloads[it.stableId]?.isComplete == false } as? CloudVideoItem)
+        ?: downloadTarget
+
+    // One line under the title, in the home hero's order: when, what, how long, how it landed. Built
+    // here rather than below the picture because it belongs to the artwork, not to the facts column.
+    val heroMeta = listOfNotNull(
+        infoYearLine(detail, title.group.year).takeIf { it.isNotEmpty() },
+        if (shown.isSeries) "Series" else "Movie",
+        infoRuntimeLine(detail, shown).takeIf { it.isNotEmpty() },
+        detail?.maturity?.takeIf { it.isNotBlank() },
+        detail?.voteScore?.takeIf { it > 0.0 }?.let { "★ " + String.format(Locale.US, "%.1f", it) }
+    ).joinToString(" · ")
+
+    val playCopy: (Playable) -> Unit = { file ->
         prefsStore.rememberResumePosition(file.stableId, resumeByCopy[file.stableId] ?: 0L)
         onPlay(file, title.parts, title.copySlots)
     }
@@ -4715,7 +4973,7 @@ private fun CloudTitleInfoPage(
     // Every file the shelf holds, filed under the season and number it covers. The run-numbered files
     // can only be placed once the catalogue's season lengths are known, so this waits on `detail` and
     // simply leaves them out until it arrives.
-    val filesBySeason: Map<Int, Map<Int, List<CloudVideoItem>>> = remember(title, detail) {
+    val filesBySeason: Map<Int, Map<Int, List<Playable>>> = remember(title, detail) {
         val filed = title.filesByEpisode.toMutableMap()
         detail?.seasons?.let { seasons ->
             title.filesByAbsolute.forEach { (number, files) ->
@@ -4736,7 +4994,7 @@ private fun CloudTitleInfoPage(
     val playSeason = playPart?.season
         ?: playPart?.episode?.let { AbsoluteSeasons.seasonFor(it, detail?.seasons.orEmpty()) }
     var season by remember(title) {
-        mutableStateOf(
+        mutableIntStateOf(
             playSeason?.takeIf { it in shelfSeasons }
                 ?: shelfSeasons.minOrNull()
                 ?: detail?.seasons?.firstOrNull { it.number > 0 }?.number
@@ -4752,305 +5010,424 @@ private fun CloudTitleInfoPage(
         if (seasonChosen || playSeason == null || playSeason == season) return@LaunchedEffect
         if (playSeason in shelfSeasons) season = playSeason
     }
-    val cataloguedEpisodes = SeasonEpisodeFetch(title.providerId, season, prefsStore)
+    // Only a show has seasons to ask for. Handed a film's id, the season endpoint answers 404, and the
+    // answer would be thrown away anyway — the episode list below renders for a series alone.
+    val cataloguedEpisodes = SeasonEpisodeFetch(shown.providerId.takeIf { shown.isSeries }, season, prefsStore)
 
     // The episode a copies sheet was opened for. It holds the row's own files rather than a number to
     // look up, because switching season behind the sheet would change what that number means.
     var copiesSheet by remember(title) { mutableStateOf<EpisodeCopiesSheet?>(null) }
 
-    Box(modifier = Modifier.fillMaxSize().background(OneUiBackground)) {
-        Column(modifier = Modifier.physicsBounceOverscroll().fillMaxSize().verticalScroll(scrollState)) {
+    val heroPx = with(LocalDensity.current) { heroHeight.toPx() }
+    val featherPx = with(LocalDensity.current) { INFO_HERO_FEATHER_DP.dp.toPx() }
+    val seamPx = with(LocalDensity.current) { 3.dp.toPx() }
+    val heroPull = remember { Animatable(0f) }
+
+    // The page's own frosted source. The back circle used to sample the shelf's, which meant it frosted
+    // the dimmed grid *behind the whole page* — a static blur that never moved no matter what scrolled
+    // past it — instead of this page's own artwork.
+    val pageHaze = remember { HazeState() }
+    val pageBackdrop = rememberLayerBackdrop()
+
+    // A glass consumer cannot sit inside the node it samples: it would draw its own content back into
+    // itself, and on API 31-33 it cycles the render tree. So the picture, the cover sheet and the
+    // scrolling column are recorded here, and the chrome below is their sibling — the same arrangement
+    // the floating bar has with the shelf.
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .jellySource(hazeState = pageHaze, backdrop = pageBackdrop)
+                .background(OneUiBackground)
+        ) {
+            // The picture lives outside the scrolling column, exactly as it does on the collection home.
+            // The bounce overscroll translates the whole column — wordmark, metadata and pill ride it
+            // down — so a picture inside that column is dragged with them and opens bare page colour above
+            // the top edge mid-stretch. This layer follows only the real scroll, so the picture holds the
+            // top of the screen while the content gives way.
             Box(
                 modifier = Modifier
+                    .align(Alignment.TopStart)
                     .fillMaxWidth()
-                    .height(INFO_HERO_HEIGHT_DP.dp)
-                    .graphicsLayer { clip = true }
+                    .height(heroHeight)
+                    .graphicsLayer {
+                        clip = true
+                        val travel = scrollState.value
+                        translationY = -travel * INFO_ARTWORK_PARALLAX
+                        alpha = (1f - travel / collapsePx).coerceIn(0f, 1f)
+                    }
             ) {
-                val art = backdrop
-                if (art != null) {
+                // The home hero's framing, to the pixel: same frame, same 1.18 overzoom. The picture and its
+                // frame translate together now that the layer is pinned, so the old oversized-and-lifted box
+                // bought no headroom at all — it only asked Crop to fit a taller destination, which printed
+                // this same film noticeably tighter than the page above it.
+                val picture = art
+                if (picture != null) {
                     Image(
-                        bitmap = art.asImageBitmap(),
+                        bitmap = picture.asImageBitmap(),
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
-                        // Oversized and pulled up so the drift never uncovers an edge: the picture
-                        // travels at 0.6x the column and dissolves as the hero collapses, so what
-                        // shows through at the end of that is the page colour, not a gap.
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height((INFO_HERO_HEIGHT_DP + 180).dp)
-                            .offset(y = (-90).dp)
-                            .graphicsLayer {
-                                val travel = scrollState.value
-                                translationY = travel * INFO_ARTWORK_PARALLAX
-                                alpha = (1f - travel / collapsePx).coerceIn(0f, 1f)
-                            }
+                        modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = 1.18f; scaleY = 1.18f }
                     )
                 } else {
                     PlaceholderThumbnailBox(modifier = Modifier.fillMaxSize())
                 }
-
-                Spacer(
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .fillMaxWidth()
-                        .height(96.dp)
-                        .background(
-                            Brush.verticalGradient(
-                                listOf(Color.Black.copy(alpha = 0.34f), Color.Transparent)
-                            )
-                        )
-                )
-                // Wordmarks are white artwork, so they need a dark band to sit on: without it a
-                // light backdrop or the page colour behind it swallows the logo completely.
-                Spacer(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .height(220.dp)
-                        .background(
-                            Brush.verticalGradient(
-                                0f to Color.Transparent,
-                                0.55f to Color.Black.copy(alpha = 0.42f),
-                                1f to Color.Black.copy(alpha = 0.6f)
-                            )
-                        )
-                )
-                Spacer(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .height(90.dp)
-                        .background(
-                            Brush.verticalGradient(
-                                0f to Color.Transparent,
-                                1f to OneUiBackground
-                            )
-                        )
-                )
-
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(start = 18.dp, end = 18.dp, bottom = 96.dp)
-                ) {
-                    val logo = wordmark
-                    if (logo != null) {
-                        Image(
-                            bitmap = logo.asImageBitmap(),
-                            contentDescription = title.name,
-                            contentScale = ContentScale.Fit,
-                            modifier = Modifier
-                                .fillMaxWidth(0.62f)
-                                .heightIn(max = 82.dp)
-                        )
-                    } else {
-                        Text(
-                            text = title.name,
-                            fontSize = 26.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White,
-                            maxLines = 3,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
+                // The scrim rides the picture, not the column, so the shade a white wordmark sits on stays
+                // where the artwork is rather than sliding off it.
+                Box(modifier = Modifier.fillMaxSize().background(HeroScrim))
             }
 
-            Column(modifier = Modifier.padding(horizontal = 18.dp)) {
-                val genreLine = detail?.genres?.joinToString("   ·   ")
-                if (!genreLine.isNullOrBlank()) {
-                    Text(
-                        text = genreLine,
-                        fontSize = 13.sp,
-                        color = OneUiTextSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(top = 2.dp)
-                    )
-                }
+            // The home hero's cover sheet, same recipe: page colour feathered in over the last 64 dp and
+            // then solid, riding the hero's edge at 1:1 with the column plus the stretch. It is what closes
+            // the picture under the page as the list comes up, and it is why the pinned layer's own clip
+            // edge never prints a bright line of raw artwork across the seam.
+            Column(
+                modifier = Modifier
+                    .graphicsLayer {
+                        translationY = heroPx - scrollState.value + heroPull.value.coerceAtMost(0f) - seamPx - featherPx
+                    }
+                    .fillMaxSize()
+            ) {
+                Box(modifier = Modifier.fillMaxWidth().height(INFO_HERO_FEATHER_DP.dp).background(HeroFeather))
+                Box(modifier = Modifier.fillMaxWidth().weight(1f).background(OneUiBackground))
+            }
 
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 14.dp)
-                ) {
-                    val playSource = remember { MutableInteractionSource() }
-                    Box(
-                        contentAlignment = Alignment.Center,
+            Column(
+                modifier = Modifier
+                    .physicsBounceOverscroll(displacement = heroPull)
+                    .fillMaxSize()
+                    .verticalScroll(scrollState)
+            ) {
+                // The hero's slot in the column carries only what the stretch is meant to move. It comes in
+                // a beat after the picture, so the hero reads as a still first and then starts talking.
+                Box(modifier = Modifier.fillMaxWidth().height(heroHeight)) {
+                    Column(
                         modifier = Modifier
-                            .weight(1f)
-                            .height(46.dp)
-                            .background(OneUiPillSurface, TopActionPillShape)
-                            .jellyClick(
-                                interactionSource = playSource,
-                                indication = null,
-                                scaleDownTo = 0.96f,
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .padding(start = 24.dp, end = 24.dp)
+                            .graphicsLayer {
+                                alpha = contentReveal.value
+                                translationY = (1f - contentReveal.value) * revealRisePx
+                            },
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        val logo = wordmark
+                        if (logo != null) {
+                            Image(
+                                bitmap = logo.asImageBitmap(),
+                                contentDescription = shown.name,
+                                contentScale = ContentScale.Fit,
+                                alignment = Alignment.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth(0.78f)
+                                    .heightIn(max = 76.dp)
+                            )
+                        } else {
+                            Text(
+                                text = shown.name,
+                                color = Color.White,
+                                fontSize = 30.sp,
+                                lineHeight = 36.sp,
+                                textAlign = TextAlign.Center,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Text(
+                            text = heroMeta,
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            CollectionPill(
+                                modifier = Modifier.width(158.dp).height(56.dp),
                                 onClick = {
                                     AppHaptics.click()
                                     playCopy(playFile)
                                 }
-                            )
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (isResolving) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(18.dp),
-                                    strokeWidth = 2.dp,
-                                    color = OneUiTextPrimary
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Default.PlayArrow,
-                                    contentDescription = null,
-                                    tint = OneUiTextPrimary,
-                                    modifier = Modifier.size(22.dp)
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = playLabel,
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = OneUiTextPrimary
-                            )
-                        }
-                    }
-                    MorphingMenu(
-                        items = listOf(
-                            MorphingMenuItem(
-                                text = "Remove from shelf",
-                                icon = Icons.Default.Delete,
-                                isDestructive = true,
-                                onClick = {
-                                    // No confirmation follows this, so the thud is the only warning
-                                    // that the whole work is leaving the shelf rather than one file.
-                                    AppHaptics.destructive()
-                                    onRemove(title)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (isResolving) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(18.dp),
+                                            strokeWidth = 2.dp,
+                                            color = OneUiTextPrimary
+                                        )
+                                    } else {
+                                        Icon(
+                                            imageVector = Icons.Default.PlayArrow,
+                                            contentDescription = null,
+                                            tint = OneUiTextPrimary,
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = playLabel,
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = OneUiTextPrimary
+                                    )
                                 }
-                            )
-                        ),
-                        buttonSize = 46.dp,
-                        menuWidth = 210.dp
-                    )
-                }
-
-                statusText?.let { message ->
-                    Text(
-                        text = message,
-                        fontSize = 12.sp,
-                        color = OneUiTextSecondary,
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
-                }
-
-                InfoMetaRow(title, detail)
-
-                if (title.providerId == null) {
-                    Text(
-                        text = "No catalogue entry — the name on this card came from the file itself.",
-                        fontSize = 12.sp,
-                        color = OneUiTextSecondary,
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
-                }
-
-                detail?.let { info ->
-                    info.directors.joinToString(", ").takeIf { it.isNotBlank() }?.let { names ->
-                        InfoCreditLine(if (info.isSeries) "Creator" else "Director", names)
-                    }
-                    info.writers.joinToString(", ").takeIf { it.isNotBlank() }?.let { names ->
-                        InfoCreditLine("Writer", names)
-                    }
-
-                    if (info.overview.isNotBlank()) {
-                        InfoSynopsis(info.overview)
-                    }
-
-                    if (info.cast.isNotEmpty()) {
-                        InfoSectionHeading("Cast")
-                        InfoCastRail(info)
-                    }
-
-                    if (info.isSeries) {
-                        if (info.seasons.isNotEmpty()) {
-                            InfoSectionHeading("Seasons")
-                            InfoSeasonRail(info, season) {
-                                seasonChosen = true
-                                season = it
+                            }
+                            downloadFile?.let { file ->
+                                DownloadCircle(
+                                    file = file,
+                                    entry = downloads[file.stableId],
+                                    progress = downloadProgress,
+                                    onDownload = onDownload,
+                                    onCancel = onCancelDownload,
+                                    onRemove = onRemoveDownload
+                                )
+                            }
+                            // The one destructive thing this page can do rides beside the action rather
+                            // than under it, so the picture holds both choices the moment the page opens.
+                            //
+                            // Only a work the channel actually carries can be taken off it. A card the phone
+                            // alone fills has nothing on the shelf to remove, and a pill that deletes nothing
+                            // is a lie about what the button does.
+                            if (title.heldOnChannel) Box(
+                                modifier = Modifier
+                                    .size(56.dp)
+                                    .clip(CircleShape)
+                                    .background(OneUiPillSurface)
+                            ) {
+                                MorphingMenu(
+                                    items = listOf(
+                                        MorphingMenuItem(
+                                            text = "Remove from shelf",
+                                            icon = Icons.Default.Delete,
+                                            isDestructive = true,
+                                            onClick = {
+                                                // No confirmation follows this, so the thud is the only warning
+                                                // that the whole work is leaving the shelf rather than one file.
+                                                AppHaptics.destructive()
+                                                onRemove(title)
+                                            }
+                                        )
+                                    ),
+                                    buttonSize = 56.dp,
+                                    tint = OneUiTextPrimary
+                                )
                             }
                         }
-                        InfoSectionHeading("Season $season")
-                        InfoEpisodeList(
-                            season = season,
-                            episodes = cataloguedEpisodes,
-                            title = title,
-                            filesBySeason = filesBySeason,
-                            onPlay = { file -> playCopy(file) },
-                            onShowCopies = { episode -> copiesSheet = EpisodeCopiesSheet(season, episode) }
-                        )
                     }
                 }
 
-                // Several copies of one film are one card, and the pile behind that card is the only place
-                // where the difference between them shows. Telegram hands over an exact size and, for a video
-                // sent as a video, an exact frame size; everything else a viewer chooses with — codec, where
-                // it was ripped from, Dolby, burn-in subtitles — was typed into the file name.
-                if (!title.isSeries && title.parts.size > 1) {
-                    InfoSectionHeading("Copies")
-                    InfoCopyList(title.parts, playFile.stableId, resumeByCopy) { file -> playCopy(file) }
-                }
-            }
+                // Home assembles its cards in order; this page was lifting its entire body in one beat,
+                // which reads as a wall appearing rather than a page being read. Each section now takes the
+                // same slot Home takes, on a key that belongs to this title alone, so a title opened a
+                // second time opens already filled.
+                val arrivalKey = "info:${title.group.key}"
+                Column(modifier = Modifier.padding(horizontal = 18.dp)) {
+                    val genreLine = detail?.genres?.joinToString("   ·   ")
+                    if (!genreLine.isNullOrBlank()) {
+                        StaggeredListItem(0, "$arrivalKey:genres") {
+                            Text(
+                                text = genreLine,
+                                fontSize = 13.sp,
+                                color = OneUiTextSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(top = 24.dp)
+                            )
+                        }
+                    }
 
-            Spacer(modifier = Modifier.height(36.dp + bottomInset))
+                    statusText?.let { message ->
+                        StaggeredListItem(1, "$arrivalKey:status") {
+                            Text(
+                                text = message,
+                                fontSize = 12.sp,
+                                color = OneUiTextSecondary,
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                    }
+
+                    StaggeredListItem(2, "$arrivalKey:shelf") { InfoShelfLine(title) }
+
+                    if (shown.providerId == null) {
+                        StaggeredListItem(3, "$arrivalKey:nocat") {
+                            // Two different reasons for an empty picture, which the box itself cannot tell
+                            // apart. A card carrying a source is a catalogue that knows the film and has no
+                            // poster for it — Wikipedia leaves the fair-use ones out of its API by design —
+                            // while a card with no source is the file name standing in for an answer nobody
+                            // gave. Saying the wrong one sends the viewer looking for a naming bug.
+                            val namedByACatalogue = shown.card?.source?.let { it != MediaCard.NONE } == true
+                            Text(
+                                text = if (namedByACatalogue) {
+                                    "The catalogues know this title and have no artwork for it."
+                                } else {
+                                    "No catalogue entry — the name on this card came from the file itself."
+                                },
+                                fontSize = 12.sp,
+                                color = OneUiTextSecondary,
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                    }
+
+                    detail?.let { info ->
+                        StaggeredListItem(4, "$arrivalKey:credits") {
+                            Column {
+                                info.directors.joinToString(", ").takeIf { it.isNotBlank() }?.let { names ->
+                                    InfoCreditLine(if (info.isSeries) "Creator" else "Director", names)
+                                }
+                                info.writers.joinToString(", ").takeIf { it.isNotBlank() }?.let { names ->
+                                    InfoCreditLine("Writer", names)
+                                }
+                            }
+                        }
+
+                        if (info.overview.isNotBlank()) {
+                            StaggeredListItem(5, "$arrivalKey:synopsis") { InfoSynopsis(info.overview) }
+                        }
+
+                        if (info.cast.isNotEmpty()) {
+                            StaggeredListItem(6, "$arrivalKey:cast") {
+                                Column {
+                                    InfoSectionHeading("Cast")
+                                    InfoCastRail(info)
+                                }
+                            }
+                        }
+
+                        if (info.isSeries) {
+                            if (info.seasons.isNotEmpty()) {
+                                StaggeredListItem(7, "$arrivalKey:seasons") {
+                                    Column {
+                                        InfoSectionHeading("Seasons")
+                                        InfoSeasonRail(info, season) {
+                                            seasonChosen = true
+                                            season = it
+                                        }
+                                    }
+                                }
+                            }
+                            StaggeredListItem(8, "$arrivalKey:episodes") {
+                                Column {
+                                    InfoSectionHeading("Season $season")
+                                    InfoEpisodeList(
+                                        season = season,
+                                        episodes = cataloguedEpisodes,
+                                        title = title,
+                                        filesBySeason = filesBySeason,
+                                        onPlay = { file -> playCopy(file) },
+                                        onShowCopies = { episode -> copiesSheet = EpisodeCopiesSheet(season, episode) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Several copies of one film are one card, and the pile behind that card is the only place
+                    // where the difference between them shows. Telegram hands over an exact size and, for a video
+                    // sent as a video, an exact frame size; everything else a viewer chooses with — codec, where
+                    // it was ripped from, Dolby, burn-in subtitles — was typed into the file name.
+                    if (!shown.isSeries && title.parts.size > 1) {
+                        StaggeredListItem(9, "$arrivalKey:copies") {
+                            Column {
+                                InfoSectionHeading("Copies")
+                                InfoCopyList(title.parts, playFile.stableId, resumeByCopy, savedIds) { file -> playCopy(file) }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(36.dp + bottomInset))
+            }
         }
 
-        // The bar the hero becomes: a plain title fading up over the picture as it leaves.
+        // What the picture leaves behind as it goes is not a bar. A full-width slab of page colour
+        // reads as a header this page never asked for, and its bottom edge prints a line straight
+        // across the content. This is a SHORT scrim: a plateau across the status bar and an 18.dp
+        // dissolve, nothing more. It exists for the clock and the icons, and a band that reaches
+        // past them starts eating the artwork.
+        //
+        // Two things it has to get right. It starts at y=0, not at the status bar's lower edge — the
+        // icons are white over whatever scrolls past, so the shade belongs behind them. And it is lit
+        // by the artwork's own exit, so it never outshines the picture it is standing under.
+        val scrimBandHeight = topInset + 18.dp
+        val statusBarFraction = (topInset / scrimBandHeight).coerceIn(0.05f, 0.85f)
         Box(
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .fillMaxWidth()
-                .background(OneUiBackground.copy(alpha = lifted))
+                .height(scrimBandHeight)
+                .background(Brush.verticalGradient(
+                    0f to OneUiBackground.copy(alpha = 0.88f * topScrim),
+                    statusBarFraction to OneUiBackground.copy(alpha = 0.74f * topScrim),
+                    1f to OneUiBackground.copy(alpha = 0f)
+                ))
+        )
+
+        // The back arrow stands in its own frosted circle — the nav bar's glass and the same outline
+        // border, so it reads as one object resting on the page rather than a control fitted into a
+        // header. Nothing else lives up here: the hero's own lettering is the title.
+        //
+        // It steps aside on the Immersive Header Action Visibility rule: fade, shrink to 0.7 and slide
+        // half its own width off the leading edge, all three on the same medium-bouncy spring, and the
+        // same way back. Direction decides when it goes, never position, so a fling coasting past a
+        // point cannot bring it back on its own.
+        val actionsStanding = rememberHeaderActionsVisible(scrollState)
+        AnimatedVisibility(
+            visible = actionsStanding,
+            enter = fadeIn(spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow)) +
+                slideInHorizontally(
+                    spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
+                    initialOffsetX = { -it / 2 }
+                ) +
+                scaleIn(
+                    spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
+                    initialScale = 0.7f
+                ),
+            exit = fadeOut(spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow)) +
+                slideOutHorizontally(
+                    spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
+                    targetOffsetX = { -it / 2 }
+                ) +
+                scaleOut(
+                    spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
+                    targetScale = 0.7f
+                ),
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(start = 14.dp, top = topInset + 10.dp)
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
+            val backSource = remember { MutableInteractionSource() }
+            Box(
+                contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .height(52.dp + topInset)
-                    .padding(top = topInset, start = 10.dp, end = 16.dp)
-            ) {
-                val backSource = remember { MutableInteractionSource() }
-                IconButton(
-                    interactionSource = backSource,
-                    onClick = {
-                        AppHaptics.click()
-                        onBack()
-                    },
-                    // A retired action has to stop being tappable as well as invisible, or the viewer
-                    // presses a button they cannot see and the page leaves without saying why.
-                    enabled = actionsStanding,
-                    modifier = Modifier
-                        .size(40.dp)
-                        .headerActionRetreat(standing = actionsStanding)
-                        .jelly(backSource, scaleDownTo = 0.88f)
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Back",
-                        tint = if (barOpaque) OneUiTextPrimary else Color.White,
-                        modifier = Modifier.size(23.dp)
+                    .size(44.dp)
+                    .jelly(backSource, scaleDownTo = 0.88f)
+                    .clip(CircleShape)
+                    .jellyGlass(hazeState = pageHaze, backdrop = pageBackdrop, shape = CircleShape)
+                    // Without an edge the circle disappears into the black page, exactly like the bar did.
+                    .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
+                    .clickable(
+                        interactionSource = backSource,
+                        indication = null,
+                        onClick = {
+                            AppHaptics.click()
+                            onBack()
+                        }
                     )
-                }
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = title.name,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = OneUiTextPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.graphicsLayer { alpha = ((lifted - 0.5f) / 0.5f).coerceIn(0f, 1f) }
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Back",
+                    tint = OneUiTextPrimary,
+                    modifier = Modifier.size(22.dp)
                 )
             }
         }
@@ -5093,7 +5470,8 @@ private fun CloudTitleInfoPage(
                         InfoCopyList(
                             files = sheet.episode.copies,
                             autoPlayId = sheet.episode.file?.stableId,
-                            resumeByCopy = resumeByCopy
+                            resumeByCopy = resumeByCopy,
+                            savedIds = savedIds
                         ) { file ->
                             copiesSheet = null
                             playCopy(file)
@@ -5105,53 +5483,23 @@ private fun CloudTitleInfoPage(
     }
 }
 
-/** Year, certificate, length and score — the line under the buttons, in the order the reference gives it. */
+/** The years a title goes by, folded into a range once the catalogue knows where it ended. */
+private fun infoYearLine(detail: TitleDetail?, fileYear: Int?): String {
+    val year = detail?.startYear ?: fileYear ?: return ""
+    return if (detail?.endYear != null && detail.endYear != year) "$year–${detail.endYear}" else year.toString()
+}
+
+/** What the catalogue calls a running time, and what the file itself says when the catalogue is silent. */
+private fun infoRuntimeLine(detail: TitleDetail?, title: ShelfTitle): String = when {
+    detail != null && detail.runtimeMinutes > 0 ->
+        formatRuntime(detail.runtimeMinutes) + if (title.isSeries) " per episode" else ""
+    title.representative.durationMs > 0L -> formatDuration(title.representative.durationMs)
+    else -> ""
+}
+
+/** What your own shelf holds of this title — the one fact the artwork can't carry. */
 @Composable
-private fun InfoMetaRow(title: ShelfTitle, detail: TitleDetail?) {
-    val year = detail?.startYear ?: title.group.year
-    val yearLine = when {
-        year == null -> ""
-        detail?.endYear != null && detail.endYear != year -> "$year–${detail.endYear}"
-        else -> year.toString()
-    }
-    val runtime = when {
-        detail != null && detail.runtimeMinutes > 0 ->
-            formatRuntime(detail.runtimeMinutes) + if (title.isSeries) " per episode" else ""
-        title.representative.durationMs > 0L -> formatDuration(title.representative.durationMs)
-        else -> ""
-    }
-
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(9.dp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 14.dp)
-    ) {
-        if (yearLine.isNotBlank()) {
-            Text(text = yearLine, fontSize = 13.sp, fontWeight = FontWeight.Medium, color = OneUiTextPrimary)
-        }
-        detail?.maturity?.takeIf { it.isNotBlank() }?.let { rating ->
-            Box(
-                modifier = Modifier
-                    .border(1.dp, OneUiTextSecondary.copy(alpha = 0.55f), RoundedCornerShape(4.dp))
-                    .padding(horizontal = 5.dp, vertical = 1.dp)
-            ) {
-                Text(text = rating, fontSize = 11.sp, color = OneUiTextSecondary)
-            }
-        }
-        if (runtime.isNotBlank()) {
-            Text(text = runtime, fontSize = 13.sp, color = OneUiTextPrimary)
-        }
-        detail?.voteScore?.let { score ->
-            Text(
-                text = "★ " + String.format(Locale.US, "%.1f", score),
-                fontSize = 13.sp,
-                color = OneUiTextPrimary
-            )
-        }
-    }
-
+private fun InfoShelfLine(title: ShelfTitle) {
     Text(
         text = if (title.parts.size == 1) {
             "1 file on your shelf · ${formatFileSize(title.group.sizeBytes)}"
@@ -5217,6 +5565,7 @@ private fun InfoCastRail(detail: TitleDetail) {
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         modifier = Modifier
             .fillMaxWidth()
+            .physicsBounceOverscroll(isHorizontal = true)
             .horizontalScroll(rememberScrollState())
     ) {
         detail.cast.forEach { member ->
@@ -5263,6 +5612,7 @@ private fun InfoSeasonRail(detail: TitleDetail, selected: Int, onSelect: (Int) -
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         modifier = Modifier
             .fillMaxWidth()
+            .physicsBounceOverscroll(isHorizontal = true)
             .horizontalScroll(rememberScrollState())
     ) {
         detail.seasons.forEach { seasonCard ->
@@ -5305,10 +5655,10 @@ private class ShelfEpisode(
     val overview: String,
     val stillUrl: String?,
     val runtimeMinutes: Int,
-    val copies: List<CloudVideoItem>
+    val copies: List<Playable>
 ) {
     /** What a tap on the row plays. */
-    val file: CloudVideoItem? = copies.firstOrNull()
+    val file: Playable? = copies.firstOrNull()
 }
 
 /** Which episode's copies a sheet was opened for, so the sheet can say so in its own heading. */
@@ -5322,8 +5672,8 @@ private fun InfoEpisodeList(
     season: Int,
     episodes: List<EpisodeDetail>?,
     title: ShelfTitle,
-    filesBySeason: Map<Int, Map<Int, List<CloudVideoItem>>>,
-    onPlay: (CloudVideoItem) -> Unit,
+    filesBySeason: Map<Int, Map<Int, List<Playable>>>,
+    onPlay: (Playable) -> Unit,
     onShowCopies: (ShelfEpisode) -> Unit
 ) {
     if (episodes == null) {
@@ -5378,7 +5728,7 @@ private fun InfoEpisodeList(
 @Composable
 private fun InfoEpisodeRow(
     row: ShelfEpisode,
-    onPlay: (CloudVideoItem) -> Unit,
+    onPlay: (Playable) -> Unit,
     onShowCopies: (ShelfEpisode) -> Unit
 ) {
     val file = row.file
@@ -5489,10 +5839,11 @@ private fun InfoEpisodeRow(
  */
 @Composable
 private fun InfoCopyList(
-    files: List<CloudVideoItem>,
+    files: List<Playable>,
     autoPlayId: Long?,
     resumeByCopy: Map<Long, Long>,
-    onPlay: (CloudVideoItem) -> Unit
+    savedIds: Set<Long>,
+    onPlay: (Playable) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         files.forEach { file ->
@@ -5500,6 +5851,7 @@ private fun InfoCopyList(
                 file = file,
                 isAutoPlay = file.stableId == autoPlayId,
                 resumeMs = resumeByCopy[file.stableId] ?: 0L,
+                isOffline = file.stableId in savedIds,
                 onPlay = onPlay
             )
         }
@@ -5511,16 +5863,20 @@ private fun InfoCopyList(
  *
  * The box on the left carries the resolution rather than artwork because three copies of one film share
  * one poster and one backdrop, and the thing that differs between them is the picture. Where no name
- * states one, the exact size stands in — the only quality figure Telegram cannot get wrong.
+ * states one, the exact size stands in — the only quality figure a file cannot get wrong.
+ *
+ * The line underneath says where the copy lives, because that is the one difference between two rows
+ * that otherwise claim the same picture: this one opens now, and that one has to be fetched first.
  */
 @Composable
 private fun InfoCopyRow(
-    file: CloudVideoItem,
+    file: Playable,
     isAutoPlay: Boolean,
     resumeMs: Long,
-    onPlay: (CloudVideoItem) -> Unit
+    isOffline: Boolean,
+    onPlay: (Playable) -> Unit
 ) {
-    val read = remember(file.title, file.height) { ReleaseInfo.parse(file.title, file.height) }
+    val read = remember(file.title, file.frameHeight) { ReleaseInfo.parse(file.title, file.frameHeight) }
     Row(
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -5557,6 +5913,14 @@ private fun InfoCopyRow(
                 overflow = TextOverflow.Ellipsis
             )
             val footer = listOfNotNull(
+                // "Offline" is said only by the ledger, never by Telegram's record of the file: a channel
+                // copy can report bytes on disk that the launch sweep has already handed back, and a row
+                // that promised a flight-proof film on the strength of that record would be lying.
+                when {
+                    file.isOnPhone -> "On this phone"
+                    isOffline -> "Offline"
+                    else -> "On Telegram"
+                },
                 file.sizeFormatted.takeIf { read.quality != null },
                 formatDuration(file.durationMs).takeIf { file.durationMs > 0L },
                 read.group?.let { "@$it" },
@@ -5626,12 +5990,17 @@ private fun ArtSlot(art: Bitmap?, contentDescription: String?, modifier: Modifie
     }
 }
 
-/** One catalogue image, decoded down before it reaches the screen. Null until it lands, or if it never does. */
+/**
+ * One catalogue image, decoded down before it reaches the screen. Null until it lands, or if it never does.
+ *
+ * Seeded from the memory cache rather than from null, so an image already decoded for another card
+ * appears on this one in the same frame instead of flashing an empty slot for a beat first.
+ */
 @Composable
 internal fun rememberCachedArt(url: String?, targetWidthPx: Int): Bitmap? {
     val context = LocalContext.current
-    var bitmap by remember(url) { mutableStateOf<Bitmap?>(null) }
-    LaunchedEffect(url) {
+    var bitmap by remember(url, targetWidthPx) { mutableStateOf(PosterCache.cached(url, targetWidthPx)) }
+    LaunchedEffect(url, targetWidthPx) {
         bitmap = url?.let {
             runCatching { PosterCache.bitmap(context, it, targetWidthPx) }.getOrNull()
         }
@@ -5656,6 +6025,47 @@ internal fun TitleDetailFetch(providerId: Int?, isSeries: Boolean, prefsStore: A
         if (fetched != null) prefsStore.rememberTitleDetail(id, isSeries, fetched)
     }
     return prefsStore.titleDetail(providerId, isSeries)
+}
+
+/**
+ * The one picture a shelf title wears everywhere: the catalogue's wide shot once the shelf knows it,
+ * the poster until then.
+ *
+ * The card, the rails and the info page's hero all ask this. They used to ask different things — a card
+ * drew the portrait poster while its page drew a wide shot from a different photograph entirely — so
+ * opening a title read as a change of subject rather than as the same film seen closer.
+ */
+internal fun shelfArtUrl(title: ShelfTitle, detail: TitleDetail?): String? =
+    detail?.backdropUrl ?: title.posterUrl
+
+/** The same, read through the store so a card redraws the moment its detail lands. */
+@Composable
+internal fun rememberShelfArtUrl(title: ShelfTitle, prefsStore: ArcPreferencesStore): String? =
+    shelfArtUrl(title, prefsStore.titleDetail(title.providerId, title.isSeries))
+
+/**
+ * Asks the catalogue about every title on the shelf, once, so each card can wear the shot its page will.
+ *
+ * The detail request is the one that carries the wide backdrop, and until now it only ran when a page was
+ * opened. Serial rather than concurrent: the shelf holds dozens of titles, the answers persist for the
+ * install, and a burst of thirty calls is how a free key gets rate limited.
+ */
+@Composable
+internal fun ShelfArtworkWarmPass(titles: List<ShelfTitle>, prefsStore: ArcPreferencesStore) {
+    val wanted = remember(titles) {
+        titles.mapNotNull { title -> title.providerId?.let { it to title.isSeries } }.distinct()
+    }
+    LaunchedEffect(wanted, prefsStore) {
+        val missing = wanted.filter { (id, series) -> prefsStore.titleDetail(id, series) == null }
+        if (missing.isEmpty()) return@LaunchedEffect
+        missing.forEach { (id, series) ->
+            val fetched = withContext(Dispatchers.IO) {
+                runCatching { TmdbDetails.title(BuildConfig.TMDB_API_KEY, id, series) }.getOrNull()
+            }
+            if (fetched != null) prefsStore.rememberTitleDetail(id, series, fetched, persist = false)
+        }
+        prefsStore.persistTitleDetails()
+    }
 }
 
 /** One season's episodes, asked when the page shows that season and kept only for the session. */
@@ -5988,33 +6398,432 @@ private fun cloudCodeLabel(hint: CodeHint?): String = when {
     else -> "Code words"
 }
 
+/**
+ * Whether the system has promised not to put this install to sleep.
+ *
+ * A question the app asks the device rather than remembers answering: the viewer can revoke it from the
+ * battery screen at any time, and a settings page that said "off" while the system said "on" would be
+ * worse than no page at all.
+ */
+private fun isExemptFromSleep(context: Context): Boolean {
+    val power = ContextCompat.getSystemService(context, PowerManager::class.java) ?: return false
+    return runCatching { power.isIgnoringBatteryOptimizations(context.packageName) }.getOrDefault(false)
+}
+
+/**
+ * Ask the system to stop putting this install to sleep.
+ *
+ * Two ways in, because the door is not in the same place on every build: the direct request is answered
+ * by the system with a dialog naming this app, and on installs that refuse it the list of optimised apps
+ * is the same switch with a person in front of it. The `package:` data is what makes the first dialog
+ * about Arc Player rather than about the battery screen in general.
+ */
+private fun askToSkipSleep(context: Context) {
+    val asked = runCatching {
+        context.startActivity(
+            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                .setData(Uri.parse("package:${context.packageName}"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }.isSuccess || runCatching {
+        context.startActivity(
+            Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }.isSuccess
+    if (!asked) {
+        Toast.makeText(context, "This device has no battery optimisation settings.", Toast.LENGTH_LONG).show()
+    }
+}
+
+/**
+ * The app's own page inside system settings, which is where Samsung hides its second sleeper.
+ *
+ * One UI puts an app to sleep on its own schedule as well as through the optimisation asked about above,
+ * and no public intent lands on that screen. The nearest honest route is this app's page, one entry short
+ * of Battery, and the row says which switch to look for rather than pretending a button reaches it.
+ */
+private fun openAppSettings(context: Context) {
+    val opened = runCatching {
+        context.startActivity(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                .setData(Uri.parse("package:${context.packageName}"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }.isSuccess
+    if (!opened) {
+        Toast.makeText(context, "This device has no app settings to open.", Toast.LENGTH_LONG).show()
+    }
+}
+
+/**
+ * One line of the ledger with the shelf next to it: what this install is keeping, what the viewer calls
+ * it, and how much of it has landed.
+ *
+ * A promise records a file — where it lives and how long it was told to be — and nothing about what it is
+ * called, so every row on the Downloads page is a join with the shelf. The join can miss: a post can fall
+ * out of the shelf walk between the tap and the next launch, and a promise nobody can name is still a
+ * promise holding bytes. It gets a row rather than vanishing quietly off a page whose whole job is to say
+ * what is kept.
+ */
+private class KeptFilm(
+    val entry: DownloadEntry,
+    val title: ShelfTitle?,
+    val name: String,
+    /** Bytes on the device, against the length the shelf promised — the same pair the shade draws. */
+    val landed: Long,
+    val fraction: Float,
+) {
+    val arriving: Boolean get() = !entry.isComplete
+    val percent: Int get() = (fraction * 100f).roundToInt()
+
+    /**
+     * The copy a cancel or a removal is aimed at.
+     *
+     * The shelf's own whenever it still carries the file. Otherwise built out of the promise, because both
+     * actions need only the chat, the message and TDLib's number for the file — which is exactly what the
+     * ledger writes down — and a row nobody can act on is a film the viewer is keeping with no way to stop
+     * keeping it.
+     */
+    val target: CloudVideoItem
+        get() = (title?.parts?.firstOrNull { it.stableId == entry.stableId } as? CloudVideoItem)
+            ?: CloudVideoItem(
+                stableId = entry.stableId,
+                chatId = entry.chatId,
+                chatTitle = SHELF_CHANNEL_TITLE,
+                messageId = entry.messageId,
+                fileId = entry.fileId,
+                title = name,
+                sizeBytes = entry.sizeBytes,
+                durationMs = 0L,
+                width = 0,
+                height = 0,
+                mimeType = "video/*",
+                supportsStreaming = false,
+            )
+}
+
+/** The page's rows: every promise, joined to the shelf, in the order the promises were made. */
+private fun keptFilms(
+    shelf: CollectionShelf,
+    entries: Map<Long, DownloadEntry>,
+    progress: Map<Int, CloudProgress>,
+): List<KeptFilm> {
+    val byCopy = HashMap<Long, ShelfTitle>()
+    for (title in shelf.resolved) {
+        for (part in title.parts) byCopy[part.stableId] = title
+    }
+    return entries.values.map { entry ->
+        val title = byCopy[entry.stableId]
+        val fileTitle = title?.parts?.firstOrNull { it.stableId == entry.stableId }?.title
+        val landed = DownloadNotices.landedBytes(entry.sizeBytes, progress[entry.fileId])
+        KeptFilm(
+            entry = entry,
+            title = title,
+            name = title?.name?.takeIf { it.isNotBlank() }
+                ?: fileTitle?.takeIf { it.isNotBlank() }
+                ?: "A kept film the shelf no longer names",
+            // A film the ledger calls whole is whole; its row does not need Telegram to still be
+            // reporting bytes for it, and after a restart nothing is.
+            landed = if (entry.isComplete) entry.sizeBytes else landed,
+            fraction = DownloadNotices.progressOf(entry.sizeBytes, landed),
+        )
+    }
+}
+
+/**
+ * The Downloads page: every film this install is keeping, with the fetches still moving at the top.
+ *
+ * Built as a page of the browser rather than as another hand-rolled overlay, which is what gives it the
+ * collapsing header, the glass back pill and the slide the rest of the app uses between screens without
+ * this file writing a single line of transition code.
+ */
+@Composable
+private fun DownloadsContent(
+    shelf: CollectionShelf,
+    downloads: Map<Long, DownloadEntry>,
+    progress: StateFlow<Map<Int, CloudProgress>>,
+    prefsStore: ArcPreferencesStore,
+    gridState: LazyGridState,
+    header: @Composable () -> Unit,
+    topPadding: Dp,
+    bottomPadding: Dp,
+    onOpenTitle: (ShelfTitle) -> Unit,
+    onCancelDownload: (CloudVideoItem) -> Unit,
+    onRemoveDownload: (CloudVideoItem) -> Unit
+) {
+    val published by progress.collectAsState()
+    val films = remember(shelf, downloads, published) { keptFilms(shelf, downloads, published) }
+    val arriving = films.filter { it.arriving }
+    val kept = films.filterNot { it.arriving }
+    val keptBytes = kept.sumOf { it.entry.sizeBytes }
+    val folder = KeptMedia.FOLDER.trimEnd('/')
+
+    LazyVerticalGrid(
+        state = gridState,
+        columns = GridCells.Fixed(1),
+        modifier = Modifier.physicsBounceOverscroll().fillMaxSize(),
+        contentPadding = PaddingValues(
+            start = 24.dp,
+            end = 24.dp,
+            top = topPadding,
+            bottom = bottomPadding
+        ),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        item(key = "downloads_heading") {
+            header()
+        }
+        item(key = "downloads_summary") {
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = when {
+                        arriving.isNotEmpty() && kept.isNotEmpty() ->
+                            "${arriving.size} ${if (arriving.size == 1) "film" else "films"} arriving · ${kept.size} kept"
+                        arriving.isNotEmpty() ->
+                            "Keeping ${arriving.size} ${if (arriving.size == 1) "film" else "films"}"
+                        kept.isNotEmpty() ->
+                            "${kept.size} ${if (kept.size == 1) "film" else "films"} kept on this device"
+                        else -> "Nothing is kept on this device"
+                    },
+                    fontSize = 15.sp,
+                    color = OneUiTextSecondary
+                )
+                Text(
+                    text = if (kept.isNotEmpty()) {
+                        "${formatFileSize(keptBytes)} in $folder, playable without a connection"
+                    } else {
+                        "Kept films land in $folder, where the Gallery can see them too"
+                    },
+                    fontSize = 13.sp,
+                    color = OneUiTextSecondary
+                )
+            }
+        }
+
+        if (arriving.isNotEmpty()) {
+            item(key = "downloads_section_arriving") { DownloadsSectionLabel("Arriving") }
+            itemsIndexed(arriving, key = { _, film -> "download_${film.entry.stableId}" }) { index, film ->
+                StaggeredListItem(index, "download:${film.entry.stableId}") {
+                    DownloadFilmRow(film, prefsStore, progress, onOpenTitle, onCancelDownload, onRemoveDownload)
+                }
+            }
+        }
+
+        if (kept.isNotEmpty()) {
+            item(key = "downloads_section_kept") { DownloadsSectionLabel("On this device") }
+            itemsIndexed(kept, key = { _, film -> "download_${film.entry.stableId}" }) { index, film ->
+                StaggeredListItem(index, "download:${film.entry.stableId}") {
+                    DownloadFilmRow(film, prefsStore, progress, onOpenTitle, onCancelDownload, onRemoveDownload)
+                }
+            }
+        }
+
+        if (films.isEmpty()) {
+            item(key = "downloads_empty") {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = OneUiCardSurface,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(24.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text(
+                            text = "No downloads yet",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = OneUiTextPrimary
+                        )
+                        Text(
+                            text = "Press the download circle on a film's page and this install keeps a " +
+                                "copy of it — the same copy the player opens when there is no signal.",
+                            fontSize = 13.sp,
+                            lineHeight = 19.sp,
+                            color = OneUiTextSecondary
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DownloadsSectionLabel(text: String) {
+    Text(
+        text = text,
+        fontSize = 12.sp,
+        fontWeight = FontWeight.SemiBold,
+        letterSpacing = 0.6.sp,
+        color = OneUiTextSecondary
+    )
+}
+
+/**
+ * The bar for one film: three dp of track with the landed part laid over it.
+ *
+ * Animated because TDLib publishes a tick per packet group, which on a good link is a step every half
+ * second rather than a slide, and a gauge that jumps reads as a broken one.
+ */
+@Composable
+private fun DownloadBar(fraction: Float) {
+    val shown by animateFloatAsState(fraction, label = "DownloadBarFraction")
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(3.dp)
+            .clip(RoundedCornerShape(2.dp))
+            .background(OneUiTextSecondary.copy(alpha = 0.22f))
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(shown.coerceIn(0f, 1f))
+                .fillMaxHeight()
+                .clip(RoundedCornerShape(2.dp))
+                .background(OneUiAccent)
+        )
+    }
+}
+
+/**
+ * One film the viewer is keeping.
+ *
+ * The row wears the same poster the shelf card wears, because a download is the same film seen from the
+ * other end. The action on the right is the info page's own disc at the row's height, so a film arriving
+ * here shows the ringed arrow with the same fraction it shows on its page, and a kept one the same tick
+ * with the same overflow behind it.
+ */
+@Composable
+private fun DownloadFilmRow(
+    film: KeptFilm,
+    prefsStore: ArcPreferencesStore,
+    progress: StateFlow<Map<Int, CloudProgress>>,
+    onOpenTitle: (ShelfTitle) -> Unit,
+    onCancelDownload: (CloudVideoItem) -> Unit,
+    onRemoveDownload: (CloudVideoItem) -> Unit
+) {
+    val title = film.title
+    val artUrl = if (title != null) rememberShelfArtUrl(title, prefsStore) else null
+    val entry = film.entry
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = OneUiCardSurface,
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (title != null) {
+                    Modifier.jellyClick(role = Role.Button, onClickLabel = "Open ${title.name}") {
+                        onOpenTitle(title)
+                    }
+                } else {
+                    Modifier
+                }
+            )
+    ) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            ArtSlot(
+                art = rememberCachedArt(artUrl, 240),
+                contentDescription = film.name,
+                modifier = Modifier
+                    .width(56.dp)
+                    .height(80.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(SlotWaitingTint)
+            )
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = film.name,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = OneUiTextPrimary,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                when {
+                    !film.arriving -> Text(
+                        text = "${formatFileSize(entry.sizeBytes)} · available offline",
+                        fontSize = 12.sp,
+                        color = OneUiTextSecondary
+                    )
+                    entry.sizeBytes > 0L -> {
+                        Text(
+                            text = "${film.percent}% · ${formatFileSize(film.landed)} of " +
+                                formatFileSize(entry.sizeBytes),
+                            fontSize = 12.sp,
+                            color = OneUiTextSecondary
+                        )
+                        DownloadBar(film.fraction)
+                    }
+                    // Said rather than drawn: TDLib answers the length of a document only once it has the
+                    // record, and a bar would be a promise about a number nobody has given.
+                    else -> Text(
+                        text = "Waiting for Telegram to say how long it is",
+                        fontSize = 12.sp,
+                        color = OneUiTextSecondary
+                    )
+                }
+            }
+            // Every row here is a promise the ledger holds, so the disc is never in its "ask me" reading:
+            // a ring being pressed means stop, and a tick being pressed means the menu that holds Remove.
+            DownloadCircleTarget(
+                size = 38.dp,
+                saved = !film.arriving,
+                arriving = film.arriving,
+                progressKey = entry.fileId,
+                progress = progress,
+                onClick = { onCancelDownload(film.target) },
+                onRemove = { onRemoveDownload(film.target) }
+            )
+        }
+    }
+}
+
 @Composable
 private fun SettingsContent(
     snapshot: MediaLibrarySnapshot,
     prefsStore: ArcPreferencesStore,
     repository: CloudRepository,
     onManageCollection: () -> Unit,
+    onAskNotifications: () -> Unit,
     gridState: LazyGridState,
+    header: @Composable () -> Unit,
     topPadding: Dp,
     bottomPadding: Dp
 ) {
     val totalBytes = remember(snapshot.videos) { snapshot.videos.sumOf { it.sizeBytes } }
     val authState by repository.authState.collectAsState()
     val connected = authState.stage == CloudAuthStage.AUTHORIZED
+    val context = LocalContext.current
+    // Both are the device's answers, not this app's, so both are re-read every time the page is looked at
+    // again — which is also the moment the viewer has most likely just come back from changing one.
+    var exemptFromSleep by remember { mutableStateOf(isExemptFromSleep(context)) }
+    var notificationsAllowed by remember { mutableStateOf(DownloadNotifier.canNotify(context)) }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        exemptFromSleep = isExemptFromSleep(context)
+        notificationsAllowed = DownloadNotifier.canNotify(context)
+    }
 
     LazyVerticalGrid(
         state = gridState,
         columns = GridCells.Fixed(1),
-        userScrollEnabled = false,
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.physicsBounceOverscroll().fillMaxSize(),
         contentPadding = PaddingValues(
             start = 24.dp,
             end = 24.dp,
-            top = topPadding + 16.dp,
+            top = topPadding,
             bottom = bottomPadding
         ),
         verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
+        item(key = "settings_heading") {
+            header()
+        }
         item(key = "settings_telegram") {
             Surface(
                 shape = RoundedCornerShape(32.dp),
@@ -6047,6 +6856,85 @@ private fun SettingsContent(
                         fontSize = 13.5.sp,
                         color = OneUiTextSecondary
                     )
+                }
+            }
+        }
+
+        item(key = "menu_downloads") {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = OneUiCardSurface,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Text(
+                        text = "Downloads",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = OneUiTextPrimary
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Download notifications", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                "How far a film has come, and a word when it is ready to watch offline",
+                                fontSize = 12.sp,
+                                color = OneUiTextSecondary
+                            )
+                        }
+                        if (notificationsAllowed) {
+                            Text("On", fontSize = 13.sp, color = OneUiTextSecondary)
+                        } else {
+                            TextButton(onClick = onAskNotifications) {
+                                Text("Allow", color = OneUiAccent)
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Battery optimization", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                "While it is on, the phone is free to freeze a download the moment the " +
+                                    "screen goes off. Off means a long film can land from a pocket.",
+                                fontSize = 12.sp,
+                                color = OneUiTextSecondary
+                            )
+                        }
+                        TextButton(onClick = { askToSkipSleep(context) }, enabled = !exemptFromSleep) {
+                            Text(if (exemptFromSleep) "Off" else "Turn off", color = OneUiAccent)
+                        }
+                    }
+
+                    // Said out loud because it is the second sleeper and the one that bites on this brand:
+                    // the exemption above is the system's, and this is the manufacturer's on top of it.
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Put never to sleep", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                "On Samsung: Battery → Background usage limits → put in Unmonitored apps. " +
+                                    "The system cannot press this one.",
+                                fontSize = 12.sp,
+                                color = OneUiTextSecondary
+                            )
+                        }
+                        TextButton(onClick = { openAppSettings(context) }) {
+                            Text("Open", color = OneUiAccent)
+                        }
+                    }
                 }
             }
         }
@@ -6236,54 +7124,114 @@ private fun SettingsContent(
     }
 }
 
+/**
+ * A browser page's heading, drawn as the grid's first row so it travels with the cards under it.
+ *
+ * This is what replaced the pinned action bar and its pull-down one-handed header: the collection home
+ * has always put its 32 sp word inside the scroll, and these pages now do the same, with the page's own
+ * controls standing beside it as circles rather than hanging in a bar that never moves.
+ */
 @Composable
-private fun OneUiCollapsibleScaffold(
-    headerState: OneUiHeaderState,
-    statusBarTopPadding: Dp,
-    actionBarHeight: Dp,
-    expandedHeader: @Composable () -> Unit,
-    actionBar: @Composable () -> Unit,
-    content: @Composable () -> Unit
+private fun BrowserHeading(
+    title: String,
+    onBack: () -> Unit,
+    search: BrowserSearch?
 ) {
-    Layout(
-        contents = listOf(content, expandedHeader, actionBar)
-    ) { (contentMeasurables, headerMeasurables, actionBarMeasurables), constraints ->
-        val maxWidth = constraints.maxWidth
-        val maxHeight = constraints.maxHeight
-        val statusBarPx = statusBarTopPadding.roundToPx()
-        val actionBarPx = actionBarHeight.roundToPx()
-        val expandedHeaderPx = headerState.maxOffsetPx.roundToInt()
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        if (search != null && search.expanded) {
+            SearchPillRow(search)
+        } else {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                HeadingCircle(Icons.AutoMirrored.Filled.ArrowBack, "Back", onBack)
+                CollectionHeading(
+                    text = title,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 14.dp)
+                )
+                if (search != null) {
+                    Spacer(Modifier.width(8.dp))
+                    HeadingCircle(Icons.Outlined.Search, "Search videos", search.onExpand)
+                    Spacer(Modifier.width(6.dp))
+                    MorphingMenu(
+                        items = search.menuItems,
+                        modifier = Modifier.clip(CircleShape).background(OneUiPillSurface),
+                        buttonSize = 44.dp
+                    )
+                }
+            }
+        }
+    }
+}
 
-        val contentPlaceable = contentMeasurables.first().measure(
-            Constraints.fixed(maxWidth, maxHeight)
-        )
-        val headerPlaceable = headerMeasurables.first().measure(
-            Constraints.fixed(maxWidth, expandedHeaderPx)
-        )
-        val actionBarPlaceable = actionBarMeasurables.first().measure(
-            Constraints.fixed(maxWidth, actionBarPx)
-        )
+/** A page's way into its own titles, kept to the page because the shelf answers from a different catalogue. */
+private class BrowserSearch(
+    val expanded: Boolean,
+    val query: String,
+    val onQueryChange: (String) -> Unit,
+    val onExpand: () -> Unit,
+    val onClose: () -> Unit,
+    val menuItems: List<MorphingMenuItem>
+)
 
-        layout(maxWidth, maxHeight) {
-            val currentOffsetPx = headerState.offsetPx.roundToInt()
-            contentPlaceable.placeRelative(
-                x = 0,
-                y = currentOffsetPx
+@Composable
+private fun SearchPillRow(search: BrowserSearch) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(TopActionPillShape)
+            .background(OneUiPillSurface)
+            .padding(start = 2.dp, end = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        HeadingCircle(Icons.AutoMirrored.Filled.ArrowBack, "Close search", search.onClose)
+        Box(modifier = Modifier.weight(1f).padding(horizontal = 10.dp)) {
+            if (search.query.isEmpty()) {
+                Text(
+                    text = "Search folders & videos...",
+                    fontSize = 15.sp,
+                    color = OneUiTextSecondary
+                )
+            }
+            BasicTextField(
+                value = search.query,
+                onValueChange = search.onQueryChange,
+                singleLine = true,
+                textStyle = TextStyle(fontSize = 15.sp, color = OneUiTextPrimary),
+                cursorBrush = SolidColor(OneUiTextPrimary),
+                modifier = Modifier.fillMaxWidth()
             )
-            headerPlaceable.placeRelative(
-                x = 0,
-                y = statusBarPx + currentOffsetPx - expandedHeaderPx
-            )
-            actionBarPlaceable.placeRelative(
-                x = 0,
-                y = statusBarPx + currentOffsetPx
-            )
+        }
+        if (search.query.isNotEmpty()) {
+            HeadingCircle(Icons.Default.Close, "Clear search") { search.onQueryChange("") }
         }
     }
 }
 
 @Composable
-private fun OneUiScrollToTopButton(
+private fun HeadingCircle(icon: ImageVector, label: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(44.dp)
+            .clip(CircleShape)
+            .background(OneUiPillSurface)
+            .jellyClick(role = Role.Button, onClickLabel = label) {
+                AppHaptics.click()
+                onClick()
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(imageVector = icon, contentDescription = label, tint = OneUiTextPrimary, modifier = Modifier.size(21.dp))
+    }
+}
+
+@Composable
+private fun ScrollToTopCircle(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -6292,7 +7240,7 @@ private fun OneUiScrollToTopButton(
         shape = CircleShape,
         color = OneUiPillSurface,
         modifier = modifier
-            .size(40.dp)
+            .size(44.dp)
             .shadow(
                 elevation = 10.dp,
                 shape = CircleShape,
@@ -6337,6 +7285,7 @@ private fun FolderGridContent(
     folders: List<VideoFolderItem>,
     columns: Int,
     gridState: LazyGridState,
+    header: @Composable () -> Unit,
     topPadding: Dp,
     bottomPadding: Dp,
     morphingFolderBucketId: String?,
@@ -6347,8 +7296,7 @@ private fun FolderGridContent(
     LazyVerticalGrid(
         state = gridState,
         columns = GridCells.Fixed(columns),
-        userScrollEnabled = false,
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.physicsBounceOverscroll().fillMaxSize(),
         contentPadding = PaddingValues(
             start = 14.dp,
             end = 14.dp,
@@ -6358,6 +7306,9 @@ private fun FolderGridContent(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        item(key = "folder_heading", span = { GridItemSpan(maxLineSpan) }) {
+            header()
+        }
         if (folders.isEmpty()) {
             item(span = { GridItemSpan(maxLineSpan) }) {
                 Box(
@@ -6397,6 +7348,7 @@ private fun VideoGridContent(
     videos: List<VideoItem>,
     columns: Int,
     gridState: LazyGridState,
+    header: @Composable () -> Unit,
     topPadding: Dp,
     bottomPadding: Dp,
     sharedKeyPrefix: String,
@@ -6411,8 +7363,7 @@ private fun VideoGridContent(
     LazyVerticalGrid(
         state = gridState,
         columns = GridCells.Fixed(columns),
-        userScrollEnabled = false,
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.physicsBounceOverscroll().fillMaxSize(),
         contentPadding = PaddingValues(
             start = 14.dp,
             end = 14.dp,
@@ -6422,6 +7373,9 @@ private fun VideoGridContent(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        item(key = "video_heading", span = { GridItemSpan(maxLineSpan) }) {
+            header()
+        }
         if (videos.isEmpty()) {
             item(span = { GridItemSpan(maxLineSpan) }) {
                 Box(
@@ -6524,7 +7478,7 @@ private fun VideoFolderCard(
                 clip = true
                 shape = CardCornerShape
             }
-            .background(OneUiPlaceholderGray)
+            .background(SlotWaitingTint)
             .border(
                 width = 0.5.dp,
                 color = Color.White.copy(alpha = 0.08f),
@@ -6665,7 +7619,7 @@ private fun VideoFileCard(
                 clip = true
                 shape = CardCornerShape
             }
-            .background(OneUiPlaceholderGray)
+            .background(SlotWaitingTint)
             .border(
                 width = 0.5.dp,
                 color = Color.White.copy(alpha = 0.08f),
@@ -6784,9 +7738,9 @@ private fun VideoFileCard(
 
 @Immutable
 private enum class VideoScaleMode(val label: String) {
-    FIT("Fit"),
-    CROP("Crop"),
-    STRETCH("16:9")
+    FIT("Fit to screen"),
+    STRETCH("Stretch"),
+    CROP("Crop to fit")
 }
 
 private enum class ActiveGestureMode {
@@ -6795,10 +7749,11 @@ private enum class ActiveGestureMode {
     VOLUME,
     HORIZONTAL_SEEK,
     VERTICAL_DISMISS,
-    PINCH_ZOOM
-}
+    PINCH_ZOOM,
 
-private val SpeedPresets = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+    /** A vertical drag that began on the chrome: deliberately answers to nothing. */
+    CHROME
+}
 
 /**
  * The film's own lettering, held over the picture while the stream catches up.
@@ -6845,6 +7800,7 @@ private fun HeroVlcVideoPlayerScreen(
     animatedVisibilityScope: AnimatedVisibilityScope,
     cloudRepository: CloudRepository?,
     onSelectAdjacentVideo: (VideoItem) -> Unit,
+    onFallToAnotherCopy: (VideoItem, String) -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -6852,6 +7808,17 @@ private fun HeroVlcVideoPlayerScreen(
     val mainActivity = activity as? MainActivity
     val lifecycleOwner = LocalLifecycleOwner.current
     val hostView = LocalView.current
+
+    // A playing film owns the whole glass. While this screen is up the status and navigation bars
+    // are gone, and an edge swipe only borrows them back for a moment — so the first swipe can
+    // neither drop the notification shade on the picture nor throw the viewer home mid-scene.
+    DisposableEffect(activity, hostView) {
+        val controller = activity?.window?.let { WindowInsetsControllerCompat(it, hostView) }
+        controller?.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller?.hide(WindowInsetsCompat.Type.systemBars())
+        onDispose { controller?.show(WindowInsetsCompat.Type.systemBars()) }
+    }
     val configuration = LocalConfiguration.current
     val coroutineScope = rememberCoroutineScope()
     val video = playback.video
@@ -6874,14 +7841,46 @@ private fun HeroVlcVideoPlayerScreen(
     }
 
     val vlcEngine = remember {
-        ArcVlcPlayerEngine(context, initialRate = prefsStore.defaultPlaybackSpeed)
+        ArcVlcPlayerEngine(
+            context,
+            initialSubtitleLiftPercent = prefsStore.subtitleLiftPercent,
+            initialSubtitleSizePercent = prefsStore.subtitleSizePercent
+        )
+    }
+
+    // The two subtitle numbers belong to the viewer, not to this engine, which is built again the next
+    // time a film opens.
+    DisposableEffect(vlcEngine, prefsStore) {
+        vlcEngine.onSubtitleStyleChange = { liftPercent, sizePercent ->
+            prefsStore.updateSubtitleStyle(liftPercent, sizePercent)
+        }
+        onDispose { vlcEngine.onSubtitleStyleChange = null }
     }
 
     var showControls by remember { mutableStateOf(true) }
     var isControlsLocked by remember { mutableStateOf(false) }
-    var showTracksSheet by remember { mutableStateOf(false) }
+    var trackSheet by remember { mutableStateOf(TrackSheet.NONE) }
     var expandedPlayerTools by remember { mutableStateOf(false) }
+
+    /** Bumped by every touch inside the control layer, which restarts the hide countdown. */
+    var controlsTouchStamp by remember { mutableIntStateOf(0) }
+
+    /** True while a finger is held down in the control layer, so the countdown waits for the lift. */
+    var isTouchingControls by remember { mutableStateOf(false) }
+
+    // The chrome borrows the screen rather than owning it: three seconds after it comes up, or after
+    // the last touch inside it, the frame goes back to the film. A finger resting on the scrubber is
+    // still using it, so the countdown waits for the lift rather than pulling the bar out from under
+    // the drag, and an open tracks sheet is an answer the viewer is still reading.
+    LaunchedEffect(showControls, isControlsLocked, trackSheet, controlsTouchStamp, isTouchingControls) {
+        if (!showControls || isControlsLocked || trackSheet != TrackSheet.NONE || isTouchingControls) return@LaunchedEffect
+        delay(3_000L)
+        showControls = false
+    }
     var scaleMode by remember { mutableStateOf(VideoScaleMode.FIT) }
+    var sizeToastLabel by remember { mutableStateOf("") }
+    var sizeToastVisible by remember { mutableStateOf(false) }
+    var sizeToastStamp by remember { mutableIntStateOf(0) }
     var gestureHudText by remember { mutableStateOf<String?>(null) }
     var gestureHudSticky by remember { mutableStateOf(false) }
     var gestureGaugeFraction by remember { mutableStateOf<Float?>(null) }
@@ -6892,7 +7891,7 @@ private fun HeroVlcVideoPlayerScreen(
     var lastScrubTick by remember { mutableFloatStateOf(0f) }
 
     /** Seconds left on the next-up card. Zero means nothing is being offered. */
-    var nextUpSeconds by remember { mutableStateOf(0) }
+    var nextUpSeconds by remember { mutableIntStateOf(0) }
 
     /** The next-up card up before the end, with no countdown: offered, not imminent. */
     var nextUpEarly by remember { mutableStateOf(false) }
@@ -6946,9 +7945,42 @@ private fun HeroVlcVideoPlayerScreen(
      */
     var isAskingTelegram by remember(video.id) { mutableStateOf(false) }
 
+    /** The open gave up — no path, no file. Its explanation is a pill, not a spinner that never stops. */
+    var openGaveUp by remember(video.id) { mutableStateOf(false) }
+
+    /**
+     * Which copies of this part the player has already been refused by, and why the file now opening
+     * was asked for — both carried on the playback, because this composable is rebuilt by the switch.
+     */
+    var reasonAlreadySaid by remember(video.id) { mutableStateOf<String?>(null) }
+
+    /**
+     * Put down the copy that would not open and hand the player another one of the same part.
+     *
+     * Two ways a file fails here, and neither is the viewer's doing: Telegram will not deliver the bytes,
+     * and libVLC reads the container and refuses it. A shelf that holds the film twice has a second try
+     * to offer, and the one it offers is the best of what is left — which after a refusal of the picked
+     * copy is usually the file already on this phone.
+     */
+    fun tryAnotherCopy(reason: String): Boolean {
+        val next = PlayOrder.otherCopyOfPart(
+            slots = playback.copySlots,
+            presentIds = playback.playlist.map { it.id },
+            failedId = video.id,
+            alreadyTried = playback.refusedCopies
+        )?.let { id -> playback.playlist.firstOrNull { it.id == id } } ?: return false
+        onFallToAnotherCopy(next, reason)
+        return true
+    }
+
     // Tap to first picture: fetching the range, then letting the player open what landed.
-    val isWaitingForFirstFrame = isAskingTelegram ||
-        (cloudSource != null && openedMedia != null && !vlcEngine.isFirstFrameRendered)
+    //
+    // A cloud film is waiting from the moment the player mounts, not from the moment it has something
+    // loaded: resolving the path is a Telegram round trip of its own (measured at 2.6 s on a warm file),
+    // and gating on `openedMedia` left that stretch with no overlay at all — the transport row up over an
+    // empty band, which is what the first seconds of a film looked like.
+    val isWaitingForFirstFrame = !openGaveUp && (isAskingTelegram ||
+        ((cloudSource != null || openedMedia != null) && !vlcEngine.isFirstFrameRendered))
 
     // Every state in which the picture is held and nothing is being played. The transport row stands
     // down for all of them: there is no position to move while the player has no media, and the row
@@ -6985,6 +8017,18 @@ private fun HeroVlcVideoPlayerScreen(
         }
     }
 
+    /**
+     * The film's own wide shot — the same picture the info page wears — asked for at the hero's width
+     * so it is the bitmap already in the cache rather than a second decode of the same file.
+     *
+     * Null for anything the shelf never resolved: a local import, or a title whose catalogue row has no
+     * backdrop. Those keep the file's own extracted frame.
+     */
+    val loadingArtUrl = prefsStore
+        .titleDetail(titleCard?.providerId, titleCard?.isSeries == true)?.backdropUrl
+        ?: titleCard?.posterUrl
+    val loadingArt = rememberCachedArt(loadingArtUrl, PosterCache.HERO_WIDTH_PX)
+
     LaunchedEffect(video.uri) {
         zoomScale = 1f
         panOffset = Offset.Zero
@@ -6994,24 +8038,67 @@ private fun HeroVlcVideoPlayerScreen(
         val sharedPosition =
             PlayOrder.positionByCopy(playback.copySlots, prefsStore.resumePositions)[video.id]
         val savedResumePos = sharedPosition ?: prefsStore.resumePositions[video.id] ?: 0L
+        // A film the viewer kept is read off the disk it was saved on, before a single question is asked
+        // of Telegram: the point of keeping it is that it opens on a plane, and the resolve below spends a
+        // round trip to name a file this phone already has the address of. The ledger is awaited first
+        // because it is read at launch and this open can beat it — and on a plane, the fall-through has no
+        // answer at all. A copy still arriving is deliberately not taken through here: half a file read
+        // straight off the disk has no way to ask for the rest, which is the whole job of the window.
+        val keptHandle = cloudSource?.let { source ->
+            cloudRepository?.let { repository ->
+                repository.restoreLedger()
+                repository.downloadedHandleFor(source)
+            }
+        }
+        if (keptHandle != null) {
+            // Letting go of the source is how the window's three customers stand down at once: the tick
+            // that drags the fetch behind the play head, the loop that keeps it moving through a stall,
+            // and the seek that waits on bytes. With the film already here there is nothing to aim, and
+            // aiming would spend the link re-streaming what the viewer already paid for.
+            cloudSource = null
+        }
         val streamUri = when {
             video.uri != Uri.EMPTY -> video.uri
-            cloudRepository == null || cloudSource == null -> Uri.EMPTY
+            keptHandle != null -> Uri.parse(keptHandle)
+            cloudRepository == null || cloudSource == null -> {
+                // Three ways out of here land on a black player with no log line at all, and a phone
+                // that says "it opened and played nothing" cannot be argued with. Which of them fired
+                // is the whole diagnosis, so it gets written down — with the launch route, because
+                // `cloudSources` is carried by the screen that opened the film, and an empty list says
+                // a grid handed over a cloud row as though it were one of its own local videos.
+                android.util.Log.i(
+                    "ArcPlayer",
+                    "resolve refused: repo=${cloudRepository != null} source=${cloudSource?.fileId} " +
+                        "parts=${playback.cloudSources.size} from=${playback.sharedKeyPrefix} video=${video.id}"
+                )
+                Uri.EMPTY
+            }
             else -> {
                 isAskingTelegram = true
                 val asked = cloudSource
                 val live = asked?.let {
-                    runCatching { cloudRepository.resolveLive(it) }.getOrNull() ?: it
+                    runCatching { cloudRepository.resolveLive(it) }
+                        .onFailure { android.util.Log.w("ArcPlayer", "resolveLive threw", it) }
+                        .getOrNull() ?: it
                 }
                 isAskingTelegram = false
                 if (live != null && live != asked) cloudSource = live
-                val path = live?.let { runCatching { cloudRepository.localPathFor(it) }.getOrNull() }
+                val path = live?.let {
+                    runCatching { cloudRepository.localPathFor(it) }
+                        .onFailure { android.util.Log.w("ArcPlayer", "localPathFor threw", it) }
+                        .getOrNull()
+                }
+                android.util.Log.i("ArcPlayer", "resolve file=${asked?.fileId} path=${path ?: "none"}")
                 path?.let { Uri.fromFile(File(it)) } ?: Uri.EMPTY
             }
         }
         if (streamUri == Uri.EMPTY) {
+            // The shelf holds this part twice more often than it used to, so a copy Telegram will not
+            // hand back is asked of the other files before it is said out loud.
+            if (tryAnotherCopy("That copy could not be fetched. Playing another.")) return@LaunchedEffect
             // The player opened on this film's promise and has nothing to show, so the reason stays on
             // screen rather than flicking for 800 ms over a black frame.
+            openGaveUp = true
             gestureHudSticky = true
             gestureHudText = "Telegram did not deliver this file."
             return@LaunchedEffect
@@ -7021,6 +8108,26 @@ private fun HeroVlcVideoPlayerScreen(
         vlcEngine.loadAndPlay(media, startPositionMs = savedResumePos)
         if (savedResumePos > ResumeRules.MIN_RESUME_POSITION_MS) {
             gestureHudText = "Resumed from ${formatDuration(savedResumePos)}"
+        }
+        // Said once per file: a re-open of the same copy — a stall that aims the window again — must
+        // not repeat a sentence the viewer has already read.
+        playback.switchReason?.let { reason ->
+            if (reason != reasonAlreadySaid) {
+                reasonAlreadySaid = reason
+                gestureHudText = reason
+            }
+        }
+    }
+
+    // libVLC took this file in hand and refused it, which is a different thing from going quiet: a
+    // truncated upload and a codec this build cannot open both land here, and both are answered by the
+    // other copy of the part rather than by a re-open of bytes that will never play.
+    LaunchedEffect(vlcEngine.openRefused, video.id) {
+        if (!vlcEngine.openRefused) return@LaunchedEffect
+        if (!tryAnotherCopy("That file would not open here. Playing another copy.")) {
+            openGaveUp = true
+            gestureHudSticky = true
+            gestureHudText = "This file would not open on this phone."
         }
     }
 
@@ -7112,10 +8219,15 @@ private fun HeroVlcVideoPlayerScreen(
     LaunchedEffect(cloudSource, cloudRepository, vlcEngine) {
         val source = cloudSource ?: return@LaunchedEffect
         val repository = cloudRepository ?: return@LaunchedEffect
+        // [BufferGuard.NEVER] is Long.MIN_VALUE, so subtracting it wraps past zero and prints an age
+        // that reads as "it just happened" — which is how a black player's own stall line argued that
+        // the player had reported a position a moment ago.
+        fun ago(nowMs: Long, stamp: Long): String =
+            if (stamp == BufferGuard.NEVER) "never" else (nowMs - stamp).toString()
         var stalledSinceMs = BufferGuard.NEVER
         var restarts = 0
         var lastRestartMs = BufferGuard.NEVER
-        var restartAimedAtMs = -1L
+        var lastAimMs = -1L
         var admittedSlowly = false
         var lastHeadMs = -1L
         var headMovedAtMs = BufferGuard.NEVER
@@ -7131,10 +8243,12 @@ private fun HeroVlcVideoPlayerScreen(
                 lastHeadMs = headMs
                 headMovedAtMs = now
             }
-            // A re-open that then gets somewhere is the only thing that forgives the attempt count.
-            // Ticking for a moment after a restart proves nothing on its own.
-            if (restartAimedAtMs >= 0L && headMs >= restartAimedAtMs + BufferGuard.PROGRESS_AFTER_RESTART_MS) {
-                restartAimedAtMs = -1L
+            // The only thing that forgives the attempt count is the film getting clear of the spot it
+            // keeps dying in. Two seconds used to do it, and that is what made a stall loop: re-opening at
+            // the failing byte plays a few seconds before the same byte fails again, so every restart
+            // earned its reset and the three attempts never ran out.
+            if (lastAimMs >= 0L && headMs > lastAimMs + BufferGuard.FAULT_CLEARED_MS) {
+                lastAimMs = -1L
                 restarts = 0
             }
             val guard = BufferGuard.Snapshot(
@@ -7147,7 +8261,8 @@ private fun HeroVlcVideoPlayerScreen(
                 watchedMs = headMs,
                 durationMs = durationMs,
                 fileComplete = repository.progress.value[source.fileId]?.isComplete == true,
-                playOwedSinceMs = vlcEngine.playOwedSinceMs
+                playOwedSinceMs = vlcEngine.playOwedSinceMs,
+                firstFrameRendered = vlcEngine.isFirstFrameRendered
             )
             val stalled = durationMs > 1L && BufferGuard.isStalled(guard)
             if (!stalled) {
@@ -7162,7 +8277,6 @@ private fun HeroVlcVideoPlayerScreen(
                     gestureHudText = null
                 }
             } else {
-                if (stalledSinceMs == BufferGuard.NEVER) stalledSinceMs = now
                 vlcEngine.isBuffering = true
                 // Only the fake end is ours to undo. A scrubber the viewer moved during the wait is a
                 // position they chose, and dragging it back every second would be the app arguing.
@@ -7170,11 +8284,27 @@ private fun HeroVlcVideoPlayerScreen(
                 val headBytes = repository.cachedByteOffset(source, headMs, durationMs)
                 runCatching { repository.advanceWindow(source, headBytes) }
                     .onFailure { android.util.Log.w("ArcCloud", "stall pump failed", it) }
-                val ahead = runCatching { repository.readableAhead(source, headBytes) }.getOrNull() ?: 0L
+                val settled = runCatching { repository.settledAhead(source, headBytes) }.getOrNull() ?: 0L
+                if (stalledSinceMs == BufferGuard.NEVER) {
+                    stalledSinceMs = now
+                    // Thrown once, at the moment the picture goes quiet, because the restart that may
+                    // follow is a guess and this is the evidence for it. Every one of these numbers is
+                    // the app's own belief about the film or the player, so a frozen picture that never
+                    // gets its restart can be read apart from here: a stall with `settled=0` is a link
+                    // question, one with megabytes settled and `playing=false` is a player question.
+                    android.util.Log.i(
+                        "ArcCloud",
+                        "stall seen at ${headMs}ms headBytes=$headBytes settled=$settled " +
+                            "playing=${vlcEngine.isPlaying} firstFrame=${vlcEngine.isFirstFrameRendered} " +
+                            "seekWaiting=${vlcEngine.isSeekWaiting} duration=${durationMs} " +
+                            "headMovedAgo=${ago(now, headMovedAtMs)} tickedAgo=${ago(now, vlcEngine.lastTickAtMs)} " +
+                            "owedSince=${vlcEngine.playOwedSinceMs} aim=$lastAimMs"
+                    )
+                }
                 if (BufferGuard.shouldRestart(
                         nowMs = now,
                         stalledSinceMs = stalledSinceMs,
-                        bytesAhead = ahead,
+                        bytesAhead = settled,
                         restarts = restarts,
                         lastRestartMs = lastRestartMs,
                         graceMs = BufferGuard.graceMs(guard),
@@ -7183,17 +8313,21 @@ private fun HeroVlcVideoPlayerScreen(
                 ) {
                     val media = openedMedia
                     if (media != null) {
+                        val targetMs = BufferGuard.restartTargetMs(headMs, lastAimMs, durationMs)
                         restarts++
                         lastRestartMs = now
-                        restartAimedAtMs = headMs
+                        lastAimMs = targetMs
                         android.util.Log.i(
                             "ArcCloud",
-                            "stall restart #$restarts at ${headMs}ms with $ahead bytes ahead"
+                            "stall restart #$restarts at ${targetMs}ms (head was ${headMs}ms) " +
+                                "with $settled settled bytes ahead"
                         )
-                        vlcEngine.loadAndPlay(media, startPositionMs = headMs)
+                        vlcEngine.loadAndPlay(media, startPositionMs = targetMs)
                     }
                 }
-                if (restarts >= BufferGuard.MAX_RESTARTS && !admittedSlowly) {
+                if ((restarts >= BufferGuard.MAX_RESTARTS ||
+                        BufferGuard.isWaitingOnTheLink(now, stalledSinceMs, settled)) && !admittedSlowly
+                ) {
                     admittedSlowly = true
                     gestureHudSticky = true
                     gestureHudText = "Telegram is slow to deliver that part."
@@ -7232,7 +8366,10 @@ private fun HeroVlcVideoPlayerScreen(
             // seek is waiting on and starts the file arriving from the beginning all over again.
             // Measured on a cold resume: three re-opens, each one following its own `seek served from
             // disk` with `advance read=0 … -> Fetch(offset=0)`, and the picture never came up.
-            if (vlcEngine.durationMs <= 1L && !vlcEngine.isCatchingUpToItsPosition) {
+            // Standing down before the player has media is not a gap: until then the resolve path owns
+            // the window and is aiming at the file's tail for its cue table. A byte-0 aim from here in
+            // that stretch is a second hand on one window, which is how the tail fetch gets starved.
+            if (openedMedia != null && vlcEngine.durationMs <= 1L && !vlcEngine.isCatchingUpToItsPosition) {
                 runCatching { repository.advanceWindow(source, 0L) }
                     .onFailure { android.util.Log.w("ArcCloud", "opening pump failed", it) }
             }
@@ -7261,6 +8398,36 @@ private fun HeroVlcVideoPlayerScreen(
                 durationMs = vlcEngine.durationMs
             )
             delay(1500L)
+        }
+    }
+
+    /**
+     * Turn the screen to the shape the film was shot in.
+     *
+     * Opening a player used to leave the requested orientation at `UNSPECIFIED`, which hands the
+     * decision to the system — and a phone with auto-rotate switched off answers "portrait". A 16:9
+     * film then played as a letterbox strip down the middle of the screen while the same file in
+     * another app turned itself. Those apps win because they ask for a sensor mode instead:
+     * [ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE] and its portrait twin follow how the device
+     * is actually held and ignore the user's rotation setting, so the film turns without switching
+     * auto-rotate back on for the rest of the phone.
+     *
+     * The film's own aspect ratio is the only honest signal of which way it wants to go, and 1 is the
+     * divide: at a square the two orientations give the same picture, so it leans toward the one that
+     * also fits the transport controls. [ArcVlcPlayerEngine.videoLayoutKnown] holds the decision back
+     * until libVLC has reported a track, because the placeholder ratio is 16:9 and a vertical clip
+     * would otherwise swing to landscape and straight back a few hundred milliseconds later.
+     *
+     * Keyed on the ratio rather than run once per open so that switching to a copy of a different
+     * shape is followed. The Rotate tool stays the manual override: a tap moves none of these three
+     * keys, so nothing here re-runs to argue with it, and the choice stands until the next film.
+     */
+    LaunchedEffect(video.id, vlcEngine.videoLayoutKnown, vlcEngine.videoAspectRatio) {
+        if (!vlcEngine.videoLayoutKnown) return@LaunchedEffect
+        activity?.requestedOrientation = if (vlcEngine.videoAspectRatio >= 1f) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
         }
     }
 
@@ -7294,16 +8461,36 @@ private fun HeroVlcVideoPlayerScreen(
                 lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
                 win.attributes = lp
             }
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            // Handed back to the viewer's own setting rather than to no opinion. UNSPECIFIED reads as
+            // "leave the screen where it is", so after a film that turned itself sideways the home was
+            // measured still lying landscape on a phone whose auto-rotate is off, with nothing left to
+            // stand it up. FULL_USER is the one request that answers to that switch: it follows the
+            // sensor when auto-rotate is on, and returns to the rotation the viewer locked when it is
+            // off — which is the portrait this app's home is drawn for.
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_USER
             vlcEngine.release()
         }
     }
 
     LaunchedEffect(gestureHudText) {
-        if (gestureHudText != null && gestureGaugeFraction == null && !gestureHudSticky) {
-            delay(800L)
+        val line = gestureHudText
+        if (line != null && gestureGaugeFraction == null && !gestureHudSticky) {
+            // A gauge reading is a glance; a sentence explaining a copy switch nobody asked for has to
+            // be readable while the eye is still looking for the picture. Held by the line rather than
+            // by a flag the caller sets, because this effect is re-entered on a switch and a second
+            // writer of the same sentence would reset the timer.
+            delay(if (line.length > 24) 2_600L else 800L)
             gestureHudText = null
         }
+    }
+
+    // Measured off the reference clip: the size pill fades in over 0.45 s and out over 0.37 s,
+    // with roughly 0.6 s of full alpha between. The clear fires at the end of that hold; the two
+    // fades belong to the AnimatedVisibility below.
+    LaunchedEffect(sizeToastStamp) {
+        if (sizeToastStamp == 0) return@LaunchedEffect
+        delay(1050L)
+        sizeToastVisible = false
     }
 
     val cornerRadius by animatedVisibilityScope.transition.animateDp(
@@ -7325,6 +8512,7 @@ private fun HeroVlcVideoPlayerScreen(
     val controlsRight = maxOf(controlsMargin, with(density) { WindowInsets.safeDrawing.getRight(this, layoutDirection).toDp() })
     val compactToolbar = configuration.screenWidthDp.dp - controlsLeft - controlsRight < 440.dp
     var bottomControlsHeight by remember { mutableIntStateOf(0) }
+    var topControlsHeight by remember { mutableIntStateOf(0) }
     var nextUpCardHeight by remember { mutableIntStateOf(0) }
     val nextUpBottom = if (isLandscape) navBarBottom + (if (compactToolbar) 112.dp else 92.dp)
         else with(density) { bottomControlsHeight.toDp() } + 12.dp
@@ -7420,6 +8608,21 @@ private fun HeroVlcVideoPlayerScreen(
         }
     }
 
+    val videoRatio = vlcEngine.videoAspectRatio
+    var containerPx by remember { mutableStateOf(IntSize.Zero) }
+    // The rect libVLC is told to draw: the largest box of the film's own shape that fits
+    // the container. The modes never renegotiate that with the decoder — they only
+    // transform the layer showing it, which is what lets a mode change land as a single
+    // frame cut the way the reference does, instead of a resize the eye can follow.
+    val containerW = containerPx.width
+    val containerH = containerPx.height
+    val fitW = if (containerW > 0 && containerH > 0) {
+        min(containerW, (containerH * videoRatio).toInt()).coerceAtLeast(1)
+    } else {
+        0
+    }
+    val fitH = if (fitW > 0) (fitW / videoRatio).toInt().coerceAtLeast(1) else 0
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -7427,8 +8630,8 @@ private fun HeroVlcVideoPlayerScreen(
             .pointerInput(isControlsLocked, zoomScale) {
                 detectTapGestures(
                     onTap = {
-                        if (showTracksSheet) {
-                            showTracksSheet = false
+                        if (trackSheet != TrackSheet.NONE) {
+                            trackSheet = TrackSheet.NONE
                         } else {
                             showControls = !showControls
                         }
@@ -7460,13 +8663,14 @@ private fun HeroVlcVideoPlayerScreen(
                     }
                 )
             }
-            .pointerInput(isControlsLocked, showTracksSheet) {
-                if (isControlsLocked || showTracksSheet) return@pointerInput
+            .pointerInput(isControlsLocked, trackSheet) {
+                if (isControlsLocked || trackSheet != TrackSheet.NONE) return@pointerInput
                 val touchSlop = viewConfiguration.touchSlop
 
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     val startX = down.position.x
+                    val startY = down.position.y
                     val screenW = size.width.toFloat().coerceAtLeast(1f)
                     val screenH = size.height.toFloat().coerceAtLeast(1f)
 
@@ -7506,6 +8710,14 @@ private fun HeroVlcVideoPlayerScreen(
                                     mode = if (abs(totalDx) > abs(totalDy) * 1.25f) {
                                         seekStartMs = vlcEngine.currentPositionMs
                                         ActiveGestureMode.HORIZONTAL_SEEK
+                                    } else if (showControls &&
+                                        (startY < topControlsHeight || startY > screenH - bottomControlsHeight)
+                                    ) {
+                                        // The two scrim bands. The top one is where the status bar is pulled
+                                        // down from, and answering it with brightness — or with a dismissal
+                                        // from the middle — stole that gesture every time the chrome happened
+                                        // to be up. The bottom band is the scrubber's neighbourhood.
+                                        ActiveGestureMode.CHROME
                                     } else {
                                         when {
                                             startX < screenW * 0.34f -> ActiveGestureMode.BRIGHTNESS
@@ -7609,22 +8821,24 @@ private fun HeroVlcVideoPlayerScreen(
     ) {
         with(sharedTransitionScope) {
             val isTransitionRunning = animatedVisibilityScope.transition.isRunning
-            val effectiveAspectRatio = when (scaleMode) {
-                VideoScaleMode.FIT -> vlcEngine.videoAspectRatio
-                VideoScaleMode.CROP -> vlcEngine.videoAspectRatio
-                VideoScaleMode.STRETCH -> 16f / 9f
-            }
 
             Box(
                 modifier = Modifier
                     .align(Alignment.Center)
                     .then(
-                        if (scaleMode == VideoScaleMode.CROP) {
-                            Modifier.fillMaxSize()
+                        if (scaleMode == VideoScaleMode.FIT) {
+                            // Contain, not width-first. Pinning the width and deriving the height
+                            // (`fillMaxWidth().aspectRatio`) is what the box used to do, and for any
+                            // film squarer than the screen the derived height is taller than the
+                            // screen — measured on a Note10+ with a 1.85 film: a 3040x1647 box on a
+                            // 3040x1440 display. Nothing clamps it, so the picture overflows by 103px
+                            // top and bottom, and the band it loses at the bottom is exactly where the
+                            // film's subtitles live. Bare `aspectRatio` takes the largest box of the
+                            // film's shape that fits *both* ways, which is the letterbox the mode's
+                            // name already promises.
+                            Modifier.aspectRatio(videoRatio)
                         } else {
-                            Modifier
-                                .fillMaxWidth()
-                                .aspectRatio(effectiveAspectRatio)
+                            Modifier.fillMaxSize()
                         }
                     )
                     .graphicsLayer {
@@ -7651,32 +8865,74 @@ private fun HeroVlcVideoPlayerScreen(
                     )
                     .clip(RoundedCornerShape(cornerRadius))
                     .background(Color.Black)
-                    .onSizeChanged { intSize ->
-                        vlcEngine.updateSurfaceSize(intSize.width, intSize.height)
-                    }
+                    .onSizeChanged { containerPx = it }
             ) {
-                AndroidView(
-                    factory = { ctx ->
-                        TextureView(ctx).apply {
-                            layoutParams = ViewGroup.LayoutParams(
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                                ViewGroup.LayoutParams.MATCH_PARENT
-                            )
-                            vlcEngine.attachTextureView(this)
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .aspectRatio(videoRatio)
+                        .graphicsLayer {
+                            if (fitW > 0 && fitH > 0) {
+                                when (scaleMode) {
+                                    VideoScaleMode.FIT -> {
+                                        scaleX = 1f
+                                        scaleY = 1f
+                                    }
+                                    VideoScaleMode.STRETCH -> {
+                                        scaleX = containerW / fitW.toFloat()
+                                        scaleY = containerH / fitH.toFloat()
+                                    }
+                                    VideoScaleMode.CROP -> {
+                                        val cover = max(
+                                            containerW / fitW.toFloat(),
+                                            containerH / fitH.toFloat()
+                                        )
+                                        scaleX = cover
+                                        scaleY = cover
+                                    }
+                                }
+                            }
                         }
-                    },
-                    update = { textureView ->
-                        vlcEngine.attachTextureView(textureView)
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
-
-                if (!vlcEngine.isFirstFrameRendered || isTransitionRunning) {
-                    MediaThumbnailImage(
-                        uri = video.uri,
-                        contentDescription = video.title,
+                        .onSizeChanged { intSize ->
+                            vlcEngine.updateSurfaceSize(intSize.width, intSize.height)
+                        }
+                ) {
+                    AndroidView(
+                        factory = { ctx ->
+                            TextureView(ctx).apply {
+                                layoutParams = ViewGroup.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT
+                                )
+                                vlcEngine.attachTextureView(this)
+                            }
+                        },
+                        update = { textureView ->
+                            vlcEngine.attachTextureView(textureView)
+                        },
                         modifier = Modifier.fillMaxSize()
                     )
+                }
+
+                if (!vlcEngine.isFirstFrameRendered || isTransitionRunning) {
+                    // What the film wears until its first frame exists. This used to be a flat grey
+                    // panel with a drawn film strip on it, which reads as a broken player rather than a
+                    // waiting one — and the wide shot that says what the film is has been on the device
+                    // since the shelf first resolved it.
+                    if (loadingArt != null) {
+                        Image(
+                            bitmap = loadingArt.asImageBitmap(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        MediaThumbnailImage(
+                            uri = video.uri,
+                            contentDescription = video.title,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
                 }
 
                 AnimatedVisibility(
@@ -7709,16 +8965,41 @@ private fun HeroVlcVideoPlayerScreen(
                                 )
                             }
                             if (seekStageText.isNotEmpty()) {
-                                Spacer(modifier = Modifier.height(18.dp))
+                                Spacer(modifier = Modifier.height(16.dp))
                                 Text(
                                     text = seekStageText,
-                                    fontSize = 12.5.sp,
-                                    color = Color.White.copy(alpha = 0.86f)
+                                    fontSize = 11.5.sp,
+                                    color = Color.White.copy(alpha = 0.6f)
                                 )
                             }
                         }
                     }
                 }
+            }
+        }
+
+        AnimatedVisibility(
+            visible = sizeToastVisible && !isInPipMode,
+            enter = fadeIn(tween(450)),
+            exit = fadeOut(tween(370)),
+            modifier = Modifier.align(BiasAlignment(0f, -0.48f))
+        ) {
+            // The reference's stadium announcement, in the same solid scrim the seek and gesture
+            // HUDs wear — a blur over the letterbox band would only ever render black, since there
+            // is no picture behind the pill to frost. Opacity only: it neither slides nor scales.
+            // The label outlives `visible`, or the exit fade would shrink to an empty circle while
+            // the text disappears first.
+            Surface(
+                shape = RoundedCornerShape(50),
+                color = Color.Black.copy(alpha = 0.76f)
+            ) {
+                Text(
+                    text = sizeToastLabel,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
+                )
             }
         }
 
@@ -7805,13 +9086,32 @@ private fun HeroVlcVideoPlayerScreen(
             exit = fadeOut(tween(180)),
             modifier = Modifier.fillMaxSize()
         ) {
-            Box(modifier = Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    // Every touch inside the chrome restarts the hide countdown, which is why the
+                    // scrubber, the buttons and the tools row never needed to report it themselves.
+                    // Nothing is consumed: the film's own tap and swipe handlers sit under this box.
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            controlsTouchStamp++
+                            isTouchingControls = true
+                            var stillHeld = true
+                            while (stillHeld) {
+                                stillHeld = awaitPointerEvent().changes.any { it.pressed }
+                            }
+                            isTouchingControls = false
+                        }
+                    }
+            ) {
                 Row(
                     horizontalArrangement = Arrangement.End,
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
                         .align(Alignment.TopCenter)
+                        .onSizeChanged { topControlsHeight = it.height }
                         .background(
                             Brush.verticalGradient(
                                 listOf(Color.Black.copy(alpha = 0.5f), Color.Transparent)
@@ -7877,72 +9177,50 @@ private fun HeroVlcVideoPlayerScreen(
                     ) {
                         PlayerControlButton(
                             contentDescription = "Previous episode or video",
+                            size = 52.dp,
                             enabled = hasPrevious,
-                            onClick = { previousVideo?.let(onSelectAdjacentVideo) }
-                        ) {
-                            SkipIconCanvas(isNext = false, enabled = hasPrevious)
-                        }
-                        PlayerControlButton(
-                            contentDescription = "Rewind 10 seconds",
-                            size = 56.dp,
                             onClick = {
-                                vlcEngine.seekByDelta(-10_000L)
-                                gestureHudText = "-10s"
+                                AppHaptics.click()
+                                previousVideo?.let(onSelectAdjacentVideo)
                             }
                         ) {
-                            PlayerSeekIcon(forward = false)
+                            Icon(
+                                imageVector = HugeIcons.Previous,
+                                contentDescription = null,
+                                tint = if (hasPrevious) Color.White else Color.White.copy(alpha = 0.35f),
+                                modifier = Modifier.size(28.dp)
+                            )
                         }
                         PlayerControlButton(
                             contentDescription = if (vlcEngine.isPlaying) "Pause" else "Play",
-                            size = 72.dp,
+                            size = 64.dp,
                             onClick = {
                                 AppHaptics.click()
                                 vlcEngine.togglePlayPause()
                             }
                         ) {
-                            if (vlcEngine.isPlaying) {
-                                Canvas(modifier = Modifier.size(42.dp)) {
-                                    val barW = size.width * 0.25f
-                                    val barH = size.height * 0.8f
-                                    val top = (size.height - barH) / 2f
-                                    drawRoundRect(
-                                        color = Color.White,
-                                        topLeft = Offset(size.width * 0.13f, top),
-                                        size = ComposeSize(barW, barH),
-                                        cornerRadius = CornerRadius(3.dp.toPx())
-                                    )
-                                    drawRoundRect(
-                                        color = Color.White,
-                                        topLeft = Offset(size.width * 0.62f, top),
-                                        size = ComposeSize(barW, barH),
-                                        cornerRadius = CornerRadius(3.dp.toPx())
-                                    )
-                                }
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Default.PlayArrow,
-                                    contentDescription = null,
-                                    tint = Color.White,
-                                    modifier = Modifier.size(52.dp)
-                                )
-                            }
-                        }
-                        PlayerControlButton(
-                            contentDescription = "Forward 10 seconds",
-                            size = 56.dp,
-                            onClick = {
-                                vlcEngine.seekByDelta(10_000L)
-                                gestureHudText = "+10s"
-                            }
-                        ) {
-                            PlayerSeekIcon(forward = true)
+                            Icon(
+                                imageVector = if (vlcEngine.isPlaying) HugeIcons.Pause else HugeIcons.Play,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(32.dp)
+                            )
                         }
                         PlayerControlButton(
                             contentDescription = "Next episode or video",
+                            size = 52.dp,
                             enabled = hasNext,
-                            onClick = { nextVideo?.let(onSelectAdjacentVideo) }
+                            onClick = {
+                                AppHaptics.click()
+                                nextVideo?.let(onSelectAdjacentVideo)
+                            }
                         ) {
-                            SkipIconCanvas(isNext = true, enabled = hasNext)
+                            Icon(
+                                imageVector = HugeIcons.Next,
+                                contentDescription = null,
+                                tint = if (hasNext) Color.White else Color.White.copy(alpha = 0.35f),
+                                modifier = Modifier.size(28.dp)
+                            )
                         }
                     }
                 }
@@ -8049,35 +9327,33 @@ private fun HeroVlcVideoPlayerScreen(
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
                             PlayerControlButton(
-                                contentDescription = "Tracks & Subs",
-                                onClick = { showTracksSheet = !showTracksSheet }
+                                contentDescription = "Audio tracks",
+                                onClick = {
+                                    trackSheet =
+                                        if (trackSheet == TrackSheet.AUDIO) TrackSheet.NONE else TrackSheet.AUDIO
+                                }
                             ) {
                                 PlayerToolIcon(PlayerTool.TRACKS)
                             }
                             PlayerControlButton(
-                                contentDescription = "Playback speed: ${String.format(Locale.US, "%.2gx", vlcEngine.playbackRate)}",
+                                contentDescription = "Subtitles",
                                 onClick = {
-                                    val nextIdx = (SpeedPresets.indexOf(vlcEngine.playbackRate) + 1) % SpeedPresets.size
-                                    val nextRate = SpeedPresets[nextIdx]
-                                    vlcEngine.setSpeed(nextRate)
-                                    prefsStore.updateDefaultSpeed(nextRate)
+                                    trackSheet =
+                                        if (trackSheet == TrackSheet.SUBTITLES) TrackSheet.NONE else TrackSheet.SUBTITLES
                                 }
                             ) {
-                                Text(
-                                    text = String.format(Locale.US, "%.2gx", vlcEngine.playbackRate),
-                                    color = Color.White,
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
+                                PlayerToolIcon(PlayerTool.SUBTITLES)
                             }
                             PlayerControlButton(
                                 contentDescription = "Video size: ${scaleMode.label}",
                                 onClick = {
                                     scaleMode = VideoScaleMode.entries[(scaleMode.ordinal + 1) % VideoScaleMode.entries.size]
-                                    gestureHudText = scaleMode.label
+                                    sizeToastLabel = scaleMode.label
+                                    sizeToastVisible = true
+                                    sizeToastStamp++
                                 }
                             ) {
-                                PlayerToolIcon(PlayerTool.FIT)
+                                VideoSizeModeIcon(scaleMode)
                             }
                             AnimatedVisibility(
                                 visible = expandedPlayerTools,
@@ -8116,15 +9392,16 @@ private fun HeroVlcVideoPlayerScreen(
                                 contentDescription = if (expandedPlayerTools) "Collapse controls" else "Expand controls",
                                 onClick = { expandedPlayerTools = !expandedPlayerTools }
                             ) {
-                                Canvas(modifier = Modifier.size(22.dp)) {
-                                    val direction = if (expandedPlayerTools) -1f else 1f
-                                    val path = androidx.compose.ui.graphics.Path().apply {
-                                        moveTo(center.x - direction * size.width * 0.15f, size.height * 0.25f)
-                                        lineTo(center.x + direction * size.width * 0.15f, center.y)
-                                        lineTo(center.x - direction * size.width * 0.15f, size.height * 0.75f)
-                                    }
-                                    drawPath(path, Color.White, style = Stroke(2.dp.toPx(), cap = StrokeCap.Round))
-                                }
+                                Icon(
+                                    imageVector = HugeIcons.ChevronRight,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .graphicsLayer {
+                                            rotationZ = if (expandedPlayerTools) 190f else 0f
+                                        }
+                                )
                             }
                         }
                         if (!compactToolbar) {
@@ -8216,7 +9493,7 @@ private fun HeroVlcVideoPlayerScreen(
         }
 
         AnimatedVisibility(
-            visible = showTracksSheet && !isInPipMode,
+            visible = trackSheet == TrackSheet.AUDIO && !isInPipMode,
             enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.94f, animationSpec = tween(180)),
             exit = fadeOut(tween(150)) + scaleOut(targetScale = 0.94f, animationSpec = tween(150)),
             modifier = Modifier
@@ -8227,145 +9504,212 @@ private fun HeroVlcVideoPlayerScreen(
                     bottom = navBarBottom + 96.dp
                 )
         ) {
-            Surface(
-                shape = RoundedCornerShape(24.dp),
-                color = Color(0xF21C1C20),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier
-                        .padding(18.dp)
-                        .verticalScroll(rememberScrollState())
-                ) {
+            TrackSheetCard {
+                Text(
+                    text = "Audio Tracks",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                if (vlcEngine.audioTracks.isEmpty()) {
                     Text(
-                        text = "Audio Tracks",
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color.White
+                        text = "Default Audio",
+                        fontSize = 12.5.sp,
+                        color = Color.White.copy(alpha = 0.65f)
                     )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    if (vlcEngine.audioTracks.isEmpty()) {
-                        Text(
-                            text = "Default Audio",
-                            fontSize = 12.5.sp,
-                            color = Color.White.copy(alpha = 0.65f)
-                        )
-                    } else {
-                        vlcEngine.audioTracks.forEach { track ->
-                            val isSelected = track.id == vlcEngine.selectedAudioTrackId
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(if (isSelected) Color.White.copy(alpha = 0.14f) else Color.Transparent)
-                                    .clickable { vlcEngine.selectAudioTrack(track.id) }
-                                    .padding(horizontal = 10.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = track.name,
-                                    fontSize = 13.sp,
-                                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                                    color = if (isSelected) Color.White else Color.White.copy(alpha = 0.78f)
-                                )
-                            }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "Subtitles",
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.White
-                        )
-                        PlayerChipButton(
-                            text = "+ Load .SRT / .ASS",
-                            onClick = {
-                                subtitlePickerLauncher.launch(arrayOf("*/*"))
-                            }
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(6.dp))
-                    if (vlcEngine.subtitleTracks.isEmpty()) {
-                        Text(
-                            text = "No embedded subtitles",
-                            fontSize = 12.5.sp,
-                            color = Color.White.copy(alpha = 0.65f)
-                        )
-                    } else {
-                        val isDisabledSelected = vlcEngine.selectedSubtitleTrackId == -1
+                } else {
+                    vlcEngine.audioTracks.forEach { track ->
+                        val isSelected = track.id == vlcEngine.selectedAudioTrackId
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
-                                .background(if (isDisabledSelected) Color.White.copy(alpha = 0.14f) else Color.Transparent)
-                                .clickable { vlcEngine.selectSubtitleTrack(-1) }
+                                .background(if (isSelected) Color.White.copy(alpha = 0.14f) else Color.Transparent)
+                                .clickable { vlcEngine.selectAudioTrack(track.id) }
                                 .padding(horizontal = 10.dp, vertical = 7.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "Disable Subtitles",
+                                text = track.name,
                                 fontSize = 13.sp,
-                                fontWeight = if (isDisabledSelected) FontWeight.SemiBold else FontWeight.Normal,
-                                color = if (isDisabledSelected) Color.White else Color.White.copy(alpha = 0.78f)
+                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                color = if (isSelected) Color.White else Color.White.copy(alpha = 0.78f)
                             )
                         }
-
-                        vlcEngine.subtitleTracks.filter { it.id != -1 }.forEach { sub ->
-                            val isSelected = sub.id == vlcEngine.selectedSubtitleTrackId
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(if (isSelected) Color.White.copy(alpha = 0.14f) else Color.Transparent)
-                                    .clickable { vlcEngine.selectSubtitleTrack(sub.id) }
-                                    .padding(horizontal = 10.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = sub.name,
-                                    fontSize = 13.sp,
-                                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                                    color = if (isSelected) Color.White else Color.White.copy(alpha = 0.78f)
-                                )
-                            }
-                        }
                     }
+                }
+            }
+        }
 
-                    Spacer(modifier = Modifier.height(12.dp))
+        AnimatedVisibility(
+            visible = trackSheet == TrackSheet.SUBTITLES && !isInPipMode,
+            enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.94f, animationSpec = tween(180)),
+            exit = fadeOut(tween(150)) + scaleOut(targetScale = 0.94f, animationSpec = tween(150)),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(
+                    start = 20.dp,
+                    end = 20.dp,
+                    bottom = navBarBottom + 96.dp
+                )
+        ) {
+            TrackSheetCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Subtitles",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White
+                    )
+                    PlayerChipButton(
+                        text = "+ Load .SRT / .ASS",
+                        onClick = {
+                            subtitlePickerLauncher.launch(arrayOf("*/*"))
+                        }
+                    )
+                }
 
+                Spacer(modifier = Modifier.height(6.dp))
+                if (vlcEngine.subtitleTracks.isEmpty()) {
+                    Text(
+                        text = "No embedded subtitles",
+                        fontSize = 12.5.sp,
+                        color = Color.White.copy(alpha = 0.65f)
+                    )
+                } else {
+                    val isDisabledSelected = vlcEngine.selectedSubtitleTrackId == -1
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(if (isDisabledSelected) Color.White.copy(alpha = 0.14f) else Color.Transparent)
+                            .clickable { vlcEngine.selectSubtitleTrack(-1) }
+                            .padding(horizontal = 10.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Subtitle Sync: ${vlcEngine.subtitleDelayMs} ms",
-                            fontSize = 12.5.sp,
-                            color = Color.White.copy(alpha = 0.85f)
+                            text = "Disable Subtitles",
+                            fontSize = 13.sp,
+                            fontWeight = if (isDisabledSelected) FontWeight.SemiBold else FontWeight.Normal,
+                            color = if (isDisabledSelected) Color.White else Color.White.copy(alpha = 0.78f)
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            PlayerChipButton(
-                                text = "-100ms",
-                                onClick = { vlcEngine.adjustSubtitleDelay(-100L) }
-                            )
-                            PlayerChipButton(
-                                text = "Reset",
-                                onClick = { vlcEngine.adjustSubtitleDelay(0L) }
-                            )
-                            PlayerChipButton(
-                                text = "+100ms",
-                                onClick = { vlcEngine.adjustSubtitleDelay(100L) }
+                    }
+
+                    vlcEngine.subtitleTracks.filter { it.id != -1 }.forEach { sub ->
+                        val isSelected = sub.id == vlcEngine.selectedSubtitleTrackId
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (isSelected) Color.White.copy(alpha = 0.14f) else Color.Transparent)
+                                .clickable { vlcEngine.selectSubtitleTrack(sub.id) }
+                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = sub.name,
+                                fontSize = 13.sp,
+                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                color = if (isSelected) Color.White else Color.White.copy(alpha = 0.78f)
                             )
                         }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Subtitle Sync: ${vlcEngine.subtitleDelayMs} ms",
+                        fontSize = 12.5.sp,
+                        color = Color.White.copy(alpha = 0.85f)
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        PlayerChipButton(
+                            text = "-100ms",
+                            onClick = { vlcEngine.adjustSubtitleDelay(-100L) }
+                        )
+                        PlayerChipButton(
+                            text = "Reset",
+                            onClick = { vlcEngine.adjustSubtitleDelay(0L) }
+                        )
+                        PlayerChipButton(
+                            text = "+100ms",
+                            onClick = { vlcEngine.adjustSubtitleDelay(100L) }
+                        )
+                    }
+                }
+
+                // Unlike sync, these two cannot be answered by a running player at all: libVLC speaks
+                // them when it builds an instance, so each tap builds a new one around the same second of
+                // the same film. The brief reload is the cost of the change, and the reason the steps are
+                // small.
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (vlcEngine.subtitleLiftPercent == 0) {
+                            "Subtitle Position: Default"
+                        } else {
+                            "Subtitle Position: +${vlcEngine.subtitleLiftPercent}%"
+                        },
+                        fontSize = 12.5.sp,
+                        color = Color.White.copy(alpha = 0.85f)
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        PlayerChipButton(
+                            text = "-4%",
+                            onClick = { vlcEngine.adjustSubtitleLift(-SUBTITLE_LIFT_STEP_PERCENT) }
+                        )
+                        PlayerChipButton(
+                            text = "Reset",
+                            onClick = { vlcEngine.resetSubtitleLift() }
+                        )
+                        PlayerChipButton(
+                            text = "+4%",
+                            onClick = { vlcEngine.adjustSubtitleLift(SUBTITLE_LIFT_STEP_PERCENT) }
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Subtitle Size: ${vlcEngine.subtitleSizePercent}%",
+                        fontSize = 12.5.sp,
+                        color = Color.White.copy(alpha = 0.85f)
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        PlayerChipButton(
+                            text = "-20%",
+                            onClick = { vlcEngine.adjustSubtitleSize(-SUBTITLE_SIZE_STEP_PERCENT) }
+                        )
+                        PlayerChipButton(
+                            text = "Reset",
+                            onClick = { vlcEngine.resetSubtitleSize() }
+                        )
+                        PlayerChipButton(
+                            text = "+20%",
+                            onClick = { vlcEngine.adjustSubtitleSize(SUBTITLE_SIZE_STEP_PERCENT) }
+                        )
                     }
                 }
             }
@@ -8416,148 +9760,69 @@ private fun PlayerControlButton(
     }
 }
 
+/**
+ * The size button draws the mode it is in, not a generic resize glyph: a pair of arrows driving
+ * inward along the diagonal for fit, the frame pulled open along that diagonal for stretch, a
+ * frame gapped at the corner the arrow escapes through for crop. It swaps on the same frame as
+ * the picture cut, so the button and the picture always agree about what the viewer is looking at.
+ */
 @Composable
-private fun PlayerSeekIcon(forward: Boolean) {
-    Box(modifier = Modifier.size(34.dp), contentAlignment = Alignment.Center) {
-        Canvas(modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = if (forward) -1f else 1f }) {
-            drawArc(
-                color = Color.White,
-                startAngle = -90f,
-                sweepAngle = 290f,
-                useCenter = false,
-                topLeft = Offset(size.width * 0.12f, size.height * 0.22f),
-                size = ComposeSize(size.width * 0.76f, size.height * 0.72f),
-                style = Stroke(2.3.dp.toPx(), cap = StrokeCap.Round)
-            )
-            val arrow = androidx.compose.ui.graphics.Path().apply {
-                moveTo(size.width * 0.27f, size.height * 0.22f)
-                lineTo(size.width * 0.53f, size.height * 0.02f)
-                lineTo(size.width * 0.53f, size.height * 0.42f)
-                close()
-            }
-            drawPath(arrow, Color.White)
-        }
-        Text(
-            text = "10",
-            color = Color.White,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.offset(y = 4.dp)
-        )
+private fun VideoSizeModeIcon(mode: VideoScaleMode) {
+    val glyph = when (mode) {
+        VideoScaleMode.FIT -> HugeIcons.Fit
+        VideoScaleMode.STRETCH -> HugeIcons.Stretch
+        VideoScaleMode.CROP -> HugeIcons.Crop
     }
+    Icon(
+        imageVector = glyph,
+        contentDescription = null,
+        tint = Color.White,
+        modifier = Modifier.size(24.dp)
+    )
 }
 
-private enum class PlayerTool { TRACKS, FIT, ROTATE, PIP }
+/** Which track sheet is standing, if any: the two buttons can never both be open. */
+private enum class TrackSheet { NONE, AUDIO, SUBTITLES }
+
+private enum class PlayerTool { TRACKS, SUBTITLES, ROTATE, PIP }
 
 @Composable
 private fun PlayerToolIcon(tool: PlayerTool) {
-    Box(modifier = Modifier.size(24.dp), contentAlignment = Alignment.Center) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val w = size.width
-            val h = size.height
-            val stroke = Stroke(1.8.dp.toPx(), cap = StrokeCap.Round)
-            when (tool) {
-                PlayerTool.TRACKS -> drawRoundRect(
-                    color = Color.White,
-                    topLeft = Offset(w * 0.04f, h * 0.12f),
-                    size = ComposeSize(w * 0.92f, h * 0.76f),
-                    cornerRadius = CornerRadius(4.dp.toPx()),
-                    style = stroke
-                )
-                PlayerTool.FIT -> {
-                    val path = androidx.compose.ui.graphics.Path().apply {
-                        moveTo(w * 0.34f, h * 0.14f)
-                        lineTo(w * 0.08f, h * 0.14f)
-                        lineTo(w * 0.08f, h * 0.4f)
-                        moveTo(w * 0.66f, h * 0.14f)
-                        lineTo(w * 0.92f, h * 0.14f)
-                        lineTo(w * 0.92f, h * 0.4f)
-                        moveTo(w * 0.08f, h * 0.6f)
-                        lineTo(w * 0.08f, h * 0.86f)
-                        lineTo(w * 0.34f, h * 0.86f)
-                        moveTo(w * 0.66f, h * 0.86f)
-                        lineTo(w * 0.92f, h * 0.86f)
-                        lineTo(w * 0.92f, h * 0.6f)
-                    }
-                    drawPath(path, Color.White, style = stroke)
-                }
-                PlayerTool.ROTATE -> {
-                    drawRoundRect(
-                        color = Color.White,
-                        topLeft = Offset(w * 0.32f, h * 0.21f),
-                        size = ComposeSize(w * 0.36f, h * 0.58f),
-                        cornerRadius = CornerRadius(2.dp.toPx()),
-                        style = stroke
-                    )
-                    val path = androidx.compose.ui.graphics.Path().apply {
-                        moveTo(w * 0.1f, h * 0.57f)
-                        lineTo(w * 0.1f, h * 0.1f)
-                        lineTo(w * 0.59f, h * 0.1f)
-                        moveTo(w * 0.47f, 0f)
-                        lineTo(w * 0.59f, h * 0.1f)
-                        lineTo(w * 0.47f, h * 0.22f)
-                        moveTo(w * 0.9f, h * 0.43f)
-                        lineTo(w * 0.9f, h * 0.9f)
-                        lineTo(w * 0.41f, h * 0.9f)
-                        moveTo(w * 0.53f, h * 0.78f)
-                        lineTo(w * 0.41f, h * 0.9f)
-                        lineTo(w * 0.53f, h)
-                    }
-                    drawPath(path, Color.White, style = stroke)
-                }
-                PlayerTool.PIP -> {
-                    drawRoundRect(
-                        color = Color.White,
-                        topLeft = Offset(w * 0.04f, h * 0.12f),
-                        size = ComposeSize(w * 0.92f, h * 0.76f),
-                        cornerRadius = CornerRadius(2.dp.toPx()),
-                        style = stroke
-                    )
-                    drawRoundRect(
-                        color = Color.White,
-                        topLeft = Offset(w * 0.5f, h * 0.48f),
-                        size = ComposeSize(w * 0.32f, h * 0.26f),
-                        cornerRadius = CornerRadius(1.dp.toPx())
-                    )
-                }
-            }
-        }
-        if (tool == PlayerTool.TRACKS) {
-            Text("CC", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-        }
+    when (tool) {
+        PlayerTool.TRACKS -> ToolGlyph(HugeIcons.AudioTracks)
+        PlayerTool.SUBTITLES -> ToolGlyph(HugeIcons.Subtitles)
+        PlayerTool.ROTATE -> ToolGlyph(HugeIcons.Rotate)
+        PlayerTool.PIP -> ToolGlyph(HugeIcons.PictureInPicture)
     }
 }
 
 @Composable
-private fun SkipIconCanvas(
-    isNext: Boolean,
-    enabled: Boolean
-) {
-    val tint = if (enabled) Color.White else Color.White.copy(alpha = 0.35f)
-    Canvas(modifier = Modifier.size(18.dp)) {
-        val w = size.width
-        val h = size.height
-        val path = androidx.compose.ui.graphics.Path().apply {
-            if (isNext) {
-                moveTo(w * 0.18f, h * 0.18f)
-                lineTo(w * 0.68f, h * 0.50f)
-                lineTo(w * 0.18f, h * 0.82f)
-                close()
-            } else {
-                moveTo(w * 0.82f, h * 0.18f)
-                lineTo(w * 0.32f, h * 0.50f)
-                lineTo(w * 0.82f, h * 0.82f)
-                close()
-            }
-        }
-        drawPath(path = path, color = tint)
-        val barX = if (isNext) w * 0.78f else w * 0.22f
-        drawLine(
-            color = tint,
-            start = Offset(barX, h * 0.20f),
-            end = Offset(barX, h * 0.80f),
-            strokeWidth = w * 0.12f,
-            cap = StrokeCap.Round
+private fun ToolGlyph(glyph: ImageVector) {
+    Icon(
+        imageVector = glyph,
+        contentDescription = null,
+        tint = Color.White,
+        modifier = Modifier.size(24.dp)
+    )
+}
+
+/**
+ * The one card shape both track sheets wear. Splitting audio from captions means two overlays that
+ * have to stay pixel-identical apart from what is inside them, including while one fades out and the
+ * other fades in over the same spot.
+ */
+@Composable
+private fun TrackSheetCard(content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = Color(0xF21C1C20),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier
+                .padding(18.dp)
+                .verticalScroll(rememberScrollState()),
+            content = content
         )
     }
 }
@@ -8628,29 +9893,31 @@ private fun MediaThumbnailImage(
 @Composable
 private fun PlaceholderThumbnailBox(modifier: Modifier = Modifier) {
     Spacer(
-        modifier = modifier.drawWithCache {
-            val w = size.width
-            val h = size.height
-            val bottomGradient = Brush.verticalGradient(
-                colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.42f)),
-                startY = h * 0.55f,
-                endY = h
-            )
-            onDrawBehind {
-                drawRect(color = OneUiPlaceholderGray)
-                val boxSize = w * 0.22f
-                val left = (w - boxSize) / 2f
-                val top = (h - boxSize) * 0.40f
-                drawRoundRect(
-                    color = Color(0xFF9E9EA3),
-                    topLeft = Offset(left, top),
-                    size = ComposeSize(boxSize, boxSize),
-                    cornerRadius = CornerRadius(w * 0.03f, w * 0.03f),
-                    style = Stroke(width = w * 0.022f)
+        modifier = modifier
+            .background(SlotWaitingTint)
+            .jellySkeletonSweep()
+            .drawWithCache {
+                val w = size.width
+                val h = size.height
+                val bottomGradient = Brush.verticalGradient(
+                    colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.42f)),
+                    startY = h * 0.55f,
+                    endY = h
                 )
-                drawRect(brush = bottomGradient)
+                onDrawBehind {
+                    val boxSize = w * 0.22f
+                    val left = (w - boxSize) / 2f
+                    val top = (h - boxSize) * 0.40f
+                    drawRoundRect(
+                        color = Color(0xFF9E9EA3),
+                        topLeft = Offset(left, top),
+                        size = ComposeSize(boxSize, boxSize),
+                        cornerRadius = CornerRadius(w * 0.03f, w * 0.03f),
+                        style = Stroke(width = w * 0.022f)
+                    )
+                    drawRect(brush = bottomGradient)
+                }
             }
-        }
     )
 }
 
@@ -8735,14 +10002,14 @@ private fun EmptyMediaStateView(onRescanClick: () -> Unit) {
         verticalArrangement = Arrangement.Center
     ) {
         Text(
-            text = "No videos found",
+            text = "No films on this phone",
             fontSize = 18.sp,
             fontWeight = FontWeight.SemiBold,
             color = OneUiTextPrimary
         )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
-            text = "Videos recorded with your camera or downloaded to your device will appear here automatically.",
+            text = "Movies and series kept in your own folders appear here once the collection recognises them.",
             fontSize = 13.5.sp,
             color = OneUiTextSecondary,
             textAlign = TextAlign.Center
@@ -8781,25 +10048,58 @@ private fun OneUiFloatingBottomBar(
     // Mirrors Arc Music's BottomNavigation structure exactly: clip -> glass -> padding.
     // A trailing Modifier.shadow() or an inner Surface on the glass node makes Haze
     // blur the bar's own icons instead of just the backdrop.
+    // Fixed width, not fillMaxWidth: with the labels gone a full-width bar reads as a
+    // long thin stadium. 63.dp cells around 24.dp icons is what the capsule wants.
+    val rowInteractionSource = remember { MutableInteractionSource() }
+    val tabSources = remember(BottomNavTab.entries) {
+        BottomNavTab.entries.associateWith { MutableInteractionSource() }
+    }
+    val rowPressed by rowInteractionSource.collectIsPressedAsState()
+    val tabsPressed = BottomNavTab.entries.map { tabSources.getValue(it).collectIsPressedAsState() }
+
+    // Arc Music squashes the whole capsule under the finger, not only the cell that was touched, so
+    // every cell's pressed state is read up here. The empty click behind it is what makes a press on
+    // the glass between two icons count as a press on the bar.
+    val barScale by animateFloatAsState(
+        targetValue = if (rowPressed || tabsPressed.any { it.value }) 0.96f else 1f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessLow
+        ),
+        label = "navbar_jelly_scale"
+    )
+
     BoxWithConstraints(
         modifier = modifier
-            .fillMaxWidth()
-            .height(70.dp)
-            .clip(RoundedCornerShape(35.dp))
+            .width(264.dp)
+            .height(56.dp)
+            .clip(RoundedCornerShape(28.dp))
             .jellyGlass(
                 hazeState = hazeState,
                 backdrop = backdrop,
                 tintTransparency = 0.4f,
                 noiseFactor = 0.06f,
-                shape = RoundedCornerShape(35.dp)
+                shape = RoundedCornerShape(28.dp)
             )
-            .border(1.dp, Color.White.copy(alpha = 0.5f), RoundedCornerShape(35.dp))
-            .padding(horizontal = 6.dp, vertical = 5.dp)
+            // The bar needs an edge or it disappears into the black page under it, but it needs the
+            // outline role, not white: a 50% white ring over black reads as #808080 and looks like a
+            // sticker outline rather than glass.
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(28.dp))
+            .graphicsLayer {
+                scaleX = barScale
+                scaleY = barScale
+            }
+            .clickable(
+                interactionSource = rowInteractionSource,
+                indication = null,
+                onClick = {}
+            )
+            .padding(horizontal = 6.dp, vertical = 4.dp)
     ) {
             val tabCount = BottomNavTab.entries.size
             val selectedIndex = BottomNavTab.entries.indexOf(selectedTab).coerceIn(0, tabCount - 1)
             val cellWidth = maxWidth / tabCount
-            val pillWidth = 64.dp
+            val pillWidth = 44.dp
             val targetOffset = cellWidth * (selectedIndex + 0.5f) - pillWidth / 2
             val animatedOffset by animateDpAsState(
                 targetValue = targetOffset,
@@ -8814,8 +10114,8 @@ private fun OneUiFloatingBottomBar(
             Box(
                 modifier = Modifier
                     .align(Alignment.CenterStart)
-                    .offset(x = animatedOffset)
-                    .size(width = pillWidth, height = 44.dp)
+                    .offset { IntOffset(x = animatedOffset.roundToPx(), y = 0) }
+                    .size(pillWidth)
                     .background(OneUiTextPrimary.copy(alpha = 0.09f), CircleShape)
             )
 
@@ -8824,73 +10124,116 @@ private fun OneUiFloatingBottomBar(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 BottomNavTab.entries.forEach { tab ->
-                    val isSelected = tab == selectedTab
-
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(60.dp)
-                            .semantics(mergeDescendants = true) { selected = isSelected }
-                            .jellyClick(
-                                interactionSource = remember { MutableInteractionSource() },
-                                indication = null,
-                                role = Role.Tab,
-                                scaleDownTo = 0.96f,
-                                onClick = {
-                                    AppHaptics.click()
-                                    onTabSelected(tab)
-                                }
-                            ),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
-                        ) {
-                            BottomBarTabIcon(
-                                tab = tab,
-                                selected = isSelected,
-                                modifier = Modifier.size(22.dp)
-                            )
-                            Spacer(modifier = Modifier.height(3.dp))
-                            Text(
-                                text = tab.label,
-                                fontSize = 11.sp,
-                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                                color = OneUiTextPrimary,
-                                maxLines = 1
-                            )
-                        }
+                    val select = {
+                        AppHaptics.click()
+                        onTabSelected(tab)
                     }
+                    BottomBarTabCell(
+                        tab = tab,
+                        isSelected = tab == selectedTab,
+                        interactionSource = tabSources.getValue(tab),
+                        modifier = Modifier.weight(1f),
+                        onPressed = select,
+                        onClick = select
+                    )
                 }
             }
         }
 }
 
+/**
+ * One tab: the pill sliding underneath it is drawn by the bar, so this owns only the glyph.
+ *
+ * Arc Music's three-part highlight — outlined and filled cuts crossed over each other, the tint
+ * easing to full strength, the icon standing up by five percent — is what makes the selection read as
+ * the tab filling in rather than a disc arriving next to it.
+ *
+ * [onPressed] runs at touch-down and [onClick] is the fallback for callers that never emit a press,
+ * which matters because a page cannot begin moving until the frame after the state write. A finger
+ * rests on glass for a tenth of a second before lifting, and a transition that waits for the release
+ * spends that time doing nothing.
+ */
 @Composable
-private fun BottomBarTabIcon(
+private fun BottomBarTabCell(
     tab: BottomNavTab,
-    selected: Boolean,
-    modifier: Modifier = Modifier
+    isSelected: Boolean,
+    interactionSource: MutableInteractionSource,
+    modifier: Modifier = Modifier,
+    onPressed: () -> Unit,
+    onClick: () -> Unit
 ) {
-    val color = if (selected) OneUiTextPrimary else OneUiTextSecondary
-    if (tab == BottomNavTab.LIBRARY) {
-        Canvas(modifier) {
-            val stroke = Stroke(1.8.dp.toPx(), cap = StrokeCap.Round)
-            drawLine(color, Offset(size.width * 0.25f, size.height * 0.12f),
-                Offset(size.width * 0.75f, size.height * 0.12f), stroke.width, StrokeCap.Round)
-            drawLine(color, Offset(size.width * 0.17f, size.height * 0.25f),
-                Offset(size.width * 0.83f, size.height * 0.25f), stroke.width, StrokeCap.Round)
-            drawRoundRect(color, Offset(size.width * 0.1f, size.height * 0.38f),
-                ComposeSize(size.width * 0.8f, size.height * 0.5f), CornerRadius(4.dp.toPx()),
-                style = if (selected) androidx.compose.ui.graphics.drawscope.Fill else stroke)
+    // A plain field, not state: nothing renders from it, it only stops the release that follows a
+    // press from selecting the tab a second time.
+    val firedOnPress = remember { booleanArrayOf(false) }
+    val currentOnPressed by rememberUpdatedState(onPressed)
+    LaunchedEffect(interactionSource) {
+        interactionSource.interactions.collect { interaction ->
+            when (interaction) {
+                is PressInteraction.Press -> { firedOnPress[0] = true; currentOnPressed() }
+                is PressInteraction.Cancel -> firedOnPress[0] = false
+                else -> Unit
+            }
         }
-    } else {
-        val image = when (tab) {
-            BottomNavTab.HOME -> if (selected) Icons.Filled.Home else Icons.Outlined.Home
-            BottomNavTab.SEARCH -> Icons.Outlined.Search
-            else -> if (selected) Icons.Filled.Settings else Icons.Outlined.Settings
+    }
+
+    val iconTint by animateColorAsState(
+        targetValue = if (isSelected) OneUiTextPrimary else OneUiTextSecondary,
+        animationSpec = spring(stiffness = Spring.StiffnessLow),
+        label = "nav_icon_tint_${tab.label}"
+    )
+    val iconScale by animateFloatAsState(
+        targetValue = if (isSelected) 1.05f else 1f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMedium
+        ),
+        label = "nav_icon_scale_${tab.label}"
+    )
+    val (outline, fill) = when (tab) {
+        BottomNavTab.HOME -> HugeIcons.Home to HugeIcons.HomeFilled
+        BottomNavTab.SEARCH -> HugeIcons.Search to HugeIcons.SearchFilled
+        BottomNavTab.LIBRARY -> HugeIcons.Library to HugeIcons.LibraryFilled
+        BottomNavTab.SETTINGS -> HugeIcons.Settings to HugeIcons.SettingsFilled
+    }
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .fillMaxHeight()
+            .semantics(mergeDescendants = true) {
+                selected = isSelected
+                // The visible label is gone, so the name lives in accessibility instead. It stays out
+                // of the two Icon calls below, which are composed together through most of the
+                // crossfade and would otherwise announce the tab twice.
+                contentDescription = tab.label
+            }
+            .jellyClick(
+                interactionSource = interactionSource,
+                indication = null,
+                role = Role.Tab,
+                scaleDownTo = 0.88f,
+                onClick = {
+                    if (!firedOnPress[0]) onClick()
+                    firedOnPress[0] = false
+                }
+            )
+    ) {
+        Crossfade(
+            targetState = isSelected,
+            animationSpec = tween(durationMillis = 200),
+            label = "nav_icon_crossfade_${tab.label}"
+        ) { showFill ->
+            Icon(
+                imageVector = if (showFill) fill else outline,
+                contentDescription = null,
+                tint = iconTint,
+                modifier = Modifier
+                    .size(24.dp)
+                    .graphicsLayer {
+                        scaleX = iconScale
+                        scaleY = iconScale
+                    }
+            )
         }
-        Icon(image, contentDescription = null, tint = color, modifier = modifier)
     }
 }

@@ -17,11 +17,20 @@ object ShelfManifest {
     private const val VERSION = "1"
     private const val SEPARATOR = "\t"
 
-    /** One item per line, in the order [FIELDS] names; the free text sits at the end. */
+    /**
+     * One item per line, in the order [FIELDS] names; the free text sits at the end.
+     *
+     * `dateSec` is the last column and may be absent, which is what keeps a manifest written before the
+     * shelf started caring when a file arrived readable. A cache that has to be thrown away to grow
+     * costs the one thing it exists to prevent: the blank moment before Telegram answers.
+     */
     private val FIELDS = listOf(
         "stableId", "chatId", "messageId", "fileId", "sizeBytes", "durationMs",
-        "width", "height", "supportsStreaming", "mimeType", "chatTitle", "title"
+        "width", "height", "supportsStreaming", "mimeType", "chatTitle", "title", "dateSec"
     )
+
+    /** The columns a line has to carry to be a file at all: everything but the optional date. */
+    private val REQUIRED = FIELDS.size - 1
 
     fun encode(chatId: Long, items: List<CloudVideoItem>): String = buildString {
         append(MAGIC).append(SEPARATOR).append(VERSION).append(SEPARATOR).append(chatId).append('\n')
@@ -39,6 +48,7 @@ object ShelfManifest {
                 item.mimeType.clean(),
                 item.chatTitle.clean(),
                 item.title.clean(),
+                item.dateSec.toString(),
             )
             append(columns.joinToString(SEPARATOR)).append('\n')
         }
@@ -57,7 +67,7 @@ object ShelfManifest {
 
         return lines.drop(1).mapNotNull { line ->
             val parts = line.split(SEPARATOR)
-            if (parts.size != FIELDS.size || parts[1].toLongOrNull() != chatId) return@mapNotNull null
+            if (parts.size < REQUIRED || parts[1].toLongOrNull() != chatId) return@mapNotNull null
             runCatching {
                 CloudVideoItem(
                     stableId = parts[0].toLong(),
@@ -72,6 +82,7 @@ object ShelfManifest {
                     height = parts[7].toInt(),
                     mimeType = parts[9],
                     supportsStreaming = parts[8].toBoolean(),
+                    dateSec = parts.getOrNull(12)?.toLongOrNull() ?: 0L,
                     isFromManifest = true,
                 )
             }.getOrNull()

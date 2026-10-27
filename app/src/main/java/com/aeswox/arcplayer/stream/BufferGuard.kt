@@ -45,14 +45,37 @@ object BufferGuard {
     const val FINISHED_TOLERANCE_MS = 2_000L
 
     /**
-     * How far the play head has to get past the point a restart was aimed at before the attempt
-     * count is forgiven. Re-opening makes the player tick for a moment even when it then stalls
-     * again, and counting that as recovery would let the cap be reset forever.
+     * How far past the position a restart was aimed at the play head has to get before that aim counts
+     * as recovered, and how close a new stall has to land to be the same fault rather than a fresh one.
+     *
+     * One number does both jobs because they are the same question: did the film get clear of the spot
+     * it died in? Two seconds was the old answer, and it is what made a stall loop — re-opening at the
+     * failing byte plays a few seconds before the same byte fails again, which forgave the attempt count
+     * every time and let three restarts become thirty. Measured on the phone as three rounds of "stops,
+     * buffers, resumes a few seconds behind, stops where it did before" on one film in one sitting.
      */
-    const val PROGRESS_AFTER_RESTART_MS = 2_000L
+    const val FAULT_CLEARED_MS = 30_000L
+
+    /**
+     * How far past a fault the media is aimed once it has already killed the player there.
+     *
+     * A stall with film on disk in front of it is not the link, and a re-open that hands the same byte
+     * back asks the same question of the same player. Thirty seconds is roughly one skipped scene:
+     * enough to leave a region the decoder cannot read behind, short enough that a viewer who comes
+     * back to it later has not lost the plot.
+     */
+    const val STEP_PAST_FAULT_MS = 30_000L
+
+    /**
+     * How long a stall can sit with nothing settling onto disk before the link is admitted rather than
+     * waited on. Restarts are gated on bytes that have actually landed, so a dead link never reaches
+     * the attempt cap and the wait would otherwise be silent forever.
+     */
+    const val LINK_GIVE_UP_MS = 90_000L
 
     data class Snapshot(
         val nowMs: Long,
+        /** When the player last reported a position, or [BufferGuard.NEVER] before it ever said one. */
         val lastTickMs: Long,
         /**
          * When the play head was last seen at a different moment in the film than it had been.
@@ -73,7 +96,22 @@ object BufferGuard {
          * [BufferGuard.NEVER]. A seek the viewer made while stopped owes nothing and is not timed.
          */
         val playOwedSinceMs: Long = NEVER,
+        /** Whether the player has ever put a frame on screen. A black player is not a quiet one. */
+        val firstFrameRendered: Boolean = true,
     )
+
+    /**
+     * How long ago a stamp was stamped, with [NEVER] answered as the oldest possible age rather than as
+     * a subtraction.
+     *
+     * The sentinel is [Long.MIN_VALUE] so that `now - stamp` wraps past zero and comes back a large
+     * negative number, which every "is this gap long enough" comparison reads as "it just happened". A
+     * player that has never said where it is then looks freshly alive forever — and a film that never
+     * got its first frame is exactly the case where nothing has ever been reported. Measured on device
+     * as a `tickedAgo=-9223372036851414642` in the stall line of a black player.
+     */
+    private fun ageMs(nowMs: Long, stamp: Long): Long =
+        if (stamp == NEVER) Long.MAX_VALUE else nowMs - stamp
 
     /**
      * Whether the picture is quiet because the bytes are.
@@ -85,12 +123,21 @@ object BufferGuard {
      * a hole, believes the film is over, and reports an end. Only the last frame it genuinely showed
      * tells that lie from a real ending, because the end report moves the position to the full
      * length.
+     *
+     * A player that has never reported a position at all used to be excused here outright, on the
+     * reasoning that no play head means nothing to measure. That is the one case the whole rule exists
+     * for: the container opened, no frame ever appeared, and nothing was left asking Telegram for the
+     * bytes that would have produced one. It is timed as a silence now, but only from a black screen —
+     * a first frame with no ticks is a film the viewer stopped on deliberately — and only after an open
+     * is overdue, because a container that takes ten seconds to parse has always looked like this.
      */
     fun isStalled(fact: Snapshot): Boolean {
         if (fact.stoppedOnPurpose || fact.seeking || fact.fileComplete) return false
         if (owesAPlayHead(fact)) return true
-        if (fact.lastTickMs == NEVER) return false
-        if (fact.nowMs - fact.headMovedAtMs < STALL_CONFIRM_MS) return false
+        if (fact.lastTickMs == NEVER) {
+            return !fact.firstFrameRendered && ageMs(fact.nowMs, fact.headMovedAtMs) >= SILENT_SEEK_MS
+        }
+        if (ageMs(fact.nowMs, fact.headMovedAtMs) < STALL_CONFIRM_MS) return false
         if (fact.playing) return true
         return fact.durationMs > 0L && fact.watchedMs < fact.durationMs - FINISHED_TOLERANCE_MS
     }
@@ -120,9 +167,10 @@ object BufferGuard {
     /**
      * Whether to hand the play head back to the player.
      *
-     * A restart costs a cold open of the container, so the pump gets its grace first and the bytes
-     * have to actually have arrived before either attempt. Once the attempts are spent the wait is
-     * real rather than slow, and saying so beats quietly retrying forever.
+     * A restart costs a cold open of the container, so the pump gets its grace first and [bytesAhead] has
+     * to be film that has actually landed — a re-open pointed at bytes that are still in flight reads the
+     * hole they leave behind and reports it as the end of the movie. Once the attempts are spent the wait
+     * is real rather than slow, and saying so beats quietly retrying forever.
      *
      * [bytesToEof] keeps the last seconds of a file recoverable. The ahead rule asks for a full
      * [RECOVER_AHEAD_BYTES] of film to restart into, and a head parked ten seconds from the end can
@@ -146,4 +194,31 @@ object BufferGuard {
         if (nowMs - stalledSinceMs < graceMs) return false
         return restarts == 0 || nowMs - lastRestartMs >= RESTART_SPACING_MS
     }
+
+    /**
+     * Where to hand the play head back to the player.
+     *
+     * [lastAimMs] is where the previous restart was aimed, or -1 when nothing has been restarted. A stall
+     * that lands on the same spot the last re-open was aimed at says the re-open asked the same question
+     * and got the same answer, so this aims past it instead of back into it — otherwise the recovery is
+     * one repeat of the failure with a spinner in between.
+     *
+     * The step is refused near the end of the film: there is nothing to skip into, and the tail is already
+     * recoverable on the bytes it has.
+     */
+    fun restartTargetMs(stalledAtMs: Long, lastAimMs: Long, durationMs: Long): Long {
+        if (lastAimMs < 0L || kotlin.math.abs(stalledAtMs - lastAimMs) > FAULT_CLEARED_MS) return stalledAtMs
+        val pastTheFault = lastAimMs + STEP_PAST_FAULT_MS
+        if (durationMs > 1L && pastTheFault > durationMs - FINISHED_TOLERANCE_MS) return stalledAtMs
+        return maxOf(pastTheFault, stalledAtMs)
+    }
+
+    /**
+     * Whether the wait is on bytes that are not coming rather than on a player that needs a push.
+     *
+     * [settledAhead] counts film that has actually landed. A link delivering nothing never trips the
+     * restart cap, because a restart is not what it needs, so this is the other way the silence ends.
+     */
+    fun isWaitingOnTheLink(nowMs: Long, stalledSinceMs: Long, settledAhead: Long): Boolean =
+        settledAhead < RECOVER_AHEAD_BYTES && ageMs(nowMs, stalledSinceMs) >= LINK_GIVE_UP_MS
 }

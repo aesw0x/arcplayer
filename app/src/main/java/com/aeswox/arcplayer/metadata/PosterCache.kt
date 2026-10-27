@@ -26,6 +26,12 @@ object PosterCache {
     /** Wide enough for the largest card the grid can ask for. */
     const val TARGET_WIDTH_PX = 560
 
+    /**
+     * Wide enough to fill a phone edge to edge. A catalogue wide shot is served 1280 px across, so
+     * asking just under that keeps the decoder at full size rather than halving it.
+     */
+    const val HERO_WIDTH_PX = 1_100
+
     /** Wide enough for a wordmark drawn across a landscape phone, which is the widest thing here. */
     const val WORDMARK_WIDTH_PX = 1_100
 
@@ -38,6 +44,21 @@ object PosterCache {
     }
 
     /**
+     * The in-memory copy of an image at one size, or null if it has not been decoded yet.
+     *
+     * The only way to put artwork on screen in the same frame it is asked for, which a second card
+     * showing a picture the first already decoded needs: loading takes a frame to report back.
+     *
+     * Size is part of the key because the same artwork is drawn at two very different sizes — a grid
+     * card and the full-width hero band — and one shared entry would let whichever asked first decide
+     * the quality of both, leaving the hero a small card's bitmap stretched across the screen.
+     */
+    fun cached(url: String?, targetWidthPx: Int = TARGET_WIDTH_PX): Bitmap? =
+        url?.let { memory.get(memoryKey(it, targetWidthPx)) }
+
+    private fun memoryKey(url: String, targetWidthPx: Int): String = "$url@$targetWidthPx"
+
+    /**
      * The poster for one url, or null when it is not available yet.
      *
      * Null rather than a failed load: the card keeps the small inline frame Telegram already sent and
@@ -45,10 +66,11 @@ object PosterCache {
      */
     suspend fun bitmap(context: Context, url: String?, targetWidthPx: Int = TARGET_WIDTH_PX): Bitmap? {
         if (url.isNullOrBlank()) return null
-        memory.get(url)?.let { return it }
+        val key = memoryKey(url, targetWidthPx)
+        memory.get(key)?.let { return it }
 
         return withContext(Dispatchers.IO) {
-            memory.get(url)?.let { return@withContext it }
+            memory.get(key)?.let { return@withContext it }
             decodeSemaphore.withPermit {
                 coroutineContext.ensureActive()
                 val file = diskFile(context, url)
@@ -57,7 +79,7 @@ object PosterCache {
                 val poster = runCatching { decode(file, targetWidthPx) }.getOrNull() ?: return@withPermit null
                 coroutineContext.ensureActive()
                 poster.prepareToDraw()
-                memory.put(url, poster)
+                memory.put(key, poster)
                 poster
             }
         }

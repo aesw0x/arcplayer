@@ -73,6 +73,7 @@ fun MorphingMenu(
     buttonSize: Dp = 38.dp,
     menuWidth: Dp = 230.dp,
     contentDescription: String? = "More options",
+    icon: ImageVector = Icons.Default.MoreVert,
     tint: Color = MaterialTheme.colorScheme.onSurface
 ) {
     var isOpen by remember { mutableStateOf(false) }
@@ -121,7 +122,7 @@ fun MorphingMenu(
                 .jelly(overflowSource, scaleDownTo = 0.88f)
         ) {
             Icon(
-                imageVector = Icons.Default.MoreVert,
+                imageVector = icon,
                 contentDescription = contentDescription,
                 tint = tint,
                 modifier = Modifier.size(22.dp)

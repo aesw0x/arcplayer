@@ -45,10 +45,28 @@ data class MediaCard(
     val logoKnown: Boolean = false,
     /** Carried from [MediaMatch] so the info page can ask for one title's details directly. */
     val providerId: Int? = null,
-    val isSeries: Boolean = false
+    val isSeries: Boolean = false,
+    /**
+     * Which version of the matching rules wrote this answer.
+     *
+     * A refusal is an answer, and a real one — but it is an answer given by the rules that existed
+     * when it was written, and those rules have since been wrong about films sitting in this very
+     * library. Without this stamp a card refused once can never be corrected, because the pass that
+     * asks the catalogues skips every file the store already has an opinion about.
+     */
+    val rules: Int = RULES
 ) {
     companion object {
         const val NONE = "none"
+
+        /**
+         * Bump this when [TitleScore] or the parser changes, to reopen the refusals they got wrong.
+         *
+         * Also the lever for a card that ended up with a name and nothing to look at: the pass only
+         * re-asks those once the rules move, which is how "The Balkan Line" and "Colony" sat as grey
+         * boxes on a shelf whose catalogues both hold posters.
+         */
+        const val RULES = 5
 
         /** The parsed name on its own, for a file whose lookup has not landed or never will. */
         fun unresolved(guess: MediaGuess): MediaCard =
@@ -106,19 +124,31 @@ object MediaSources {
      * Every source is consulted before giving up, because the one that knows an uploaded film is not
      * the one that answers fastest. A single unreachable source is enough to make the whole answer
      * [MediaOutcome.Unreachable]: refusing on partial evidence is how a bad minute becomes permanent.
+     *
+     * An answer that arrives with no artwork is held to the same standard, because it is the one case
+     * where a partial answer looks like a complete one. Wikipedia names films it cannot show — a
+     * poster is fair-use and its API leaves those out — so a chain whose first three sources never
+     * replied can still come back with a name, a grey box, and nothing left to try.
      */
     fun lookup(guess: MediaGuess, apiKey: String): MediaOutcome {
         if (guess is MediaGuess.Unnamed) return MediaOutcome.NoMatch
         var unreachable = false
+        var nameOnly: MediaMatch? = null
         for (source in chain(apiKey)) {
             val outcome = runCatching { source.lookup(guess) }.getOrDefault(MediaOutcome.Unreachable)
-            when (outcome) {
-                is MediaOutcome.Found -> return outcome
-                MediaOutcome.NoMatch -> Unit
-                MediaOutcome.Unreachable -> unreachable = true
+            when {
+                outcome is MediaOutcome.Found && !outcome.match.posterUrl.isNullOrBlank() -> return outcome
+                outcome is MediaOutcome.Found -> nameOnly = nameOnly ?: outcome.match
+                outcome is MediaOutcome.NoMatch -> Unit
+                else -> unreachable = true
             }
         }
-        return if (unreachable) MediaOutcome.Unreachable else MediaOutcome.NoMatch
+        // The name is kept only when every source that could have supplied a picture was asked and
+        // declined, which is a fact about the film. If one of them never replied at all, the whole
+        // answer is a fact about the network, and storing it would freeze the grey box.
+        return if (nameOnly != null && !unreachable) MediaOutcome.Found(nameOnly)
+        else if (unreachable) MediaOutcome.Unreachable
+        else MediaOutcome.NoMatch
     }
 }
 

@@ -19,10 +19,28 @@
     <!-- Frosted Jelly haptics: the knock a pressed control answers with -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Keeping a film: the row that says how far it has come, and the ask for it on Android 13+ -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+        A download is kept alive by a foreground service, because nothing else on Android guarantees that
+        a process with no visible screen survives long enough to finish a four gigabyte file. The type is
+        dataSync — it is moving bytes and playing nothing — and on Android 14+ naming it is not optional.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Keeps the link alive when the screen goes off mid-download, until the last film lands -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- The settings row that asks the system to stop putting this app to sleep -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
         android:name=".ArcPlayerApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.ArcPlayer">
@@ -39,6 +57,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Not exported: it exists only while this app is fetching a film, and nothing outside the
+             process has any business starting it. -->
+        <service
+            android:name=".cloud.DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>

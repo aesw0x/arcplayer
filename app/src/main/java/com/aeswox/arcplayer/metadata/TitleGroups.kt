@@ -8,11 +8,18 @@ import java.util.Calendar
  * [id] is only carried through into [TitlePart] and never read here, so the caller decides what a
  * file is called by. [sizeBytes] is the only quality signal a file name cannot lie about: two copies
  * of the same film with no resolution in either name still have different sizes.
+ *
+ * [frameHeight] and [onPhone] are the two claims a name cannot make for itself. The first is there
+ * for files whose name says nothing — a video Telegram saved from a chat is called `VID_20240101…`
+ * and the only thing known about its picture is how tall it is. The second is what puts the copy
+ * already on the phone ahead of an equal one that still has to be fetched.
  */
 data class TitleCandidate(
     val id: Long,
     val fileName: String,
     val sizeBytes: Long,
+    val frameHeight: Int = 0,
+    val onPhone: Boolean = false,
 )
 
 /** Whether a group is one work, or a numbered part of a longer one. */
@@ -235,7 +242,7 @@ object TitleGroups {
         // the heavier file goes first; equal claims and equal sizes are the same upload twice, and the
         // copy that arrived first keeps its place.
         val sorted = entries
-            .map { it to CopyRank.of(it.candidate.fileName, it.candidate.sizeBytes) }
+            .map { it to rank(it.candidate) }
             .sortedWith(
                 compareByDescending<Pair<MovieEntry, CopyRank>> { it.second }.thenBy { it.first.at }
             )
@@ -255,7 +262,7 @@ object TitleGroups {
         val key = "s:" + TitleScore.key(entries.first().series)
         // Watch order first, then within one episode the copy whose name claims the better picture.
         val sorted = entries
-            .map { it to CopyRank.of(it.candidate.fileName, it.candidate.sizeBytes) }
+            .map { it to rank(it.candidate) }
             .sortedWith(
                 compareBy<Pair<EpisodeEntry, CopyRank>>({ it.first.season ?: 1 }, { it.first.episode })
                     .thenByDescending { it.second }
@@ -277,6 +284,22 @@ object TitleGroups {
             }
         ) to entries.minOf { it.at }
     }
+
+    /**
+     * What one file says about its own quality: the claims in its name, plus the two it cannot make.
+     *
+     * [TitleCandidate.frameHeight] reaches [CopyRank] whichever way the name reads, because
+     * [ReleaseInfo] already takes it only where the name states no resolution — a Telegram download
+     * called `VID_20240101…` has nothing else to go on, and beside a name that says "720p" the height
+     * of the file that happens to be here is not evidence about the film.
+     */
+    private fun rank(candidate: TitleCandidate): CopyRank =
+        CopyRank.of(
+            fileName = candidate.fileName,
+            sizeBytes = candidate.sizeBytes,
+            frameHeight = candidate.frameHeight,
+            onPhone = candidate.onPhone
+        )
 
     /** The year with the most copies, and the newest of them when two are tied. */
     private fun mostCommonYear(years: List<Int>): Int {

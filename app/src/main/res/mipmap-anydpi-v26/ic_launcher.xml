@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Pure black behind, the white board in front, and the same board again as the themed layer so an
+    Android 13+ "themed icons" wallpaper picks up the mark instead of showing a grey placeholder.
+
+    No density PNGs: the app starts at API 31, so every device that can install it reads this file and
+    masks it itself. minSdk 31 also means no roundIcon — on API 26+ the launcher shapes the one adaptive
+    layer it is given, and the pre-26 round variant only ever mattered for old phones.
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@android:color/black" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

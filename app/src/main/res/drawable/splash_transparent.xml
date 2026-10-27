@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Nothing at all, one pixel of it. The system splash shows the launcher icon on its own panel by
+    default, which would put a second, frozen clapperboard on screen for a beat before the intro draws
+    the real one. Pointing windowSplashScreenAnimatedIcon at this leaves the panel as plain black — the
+    same black the intro opens on — so the two are one continuous screen rather than a handover.
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <size android:width="1dp" android:height="1dp" />
+    <solid android:color="@android:color/transparent" />
+</shape>

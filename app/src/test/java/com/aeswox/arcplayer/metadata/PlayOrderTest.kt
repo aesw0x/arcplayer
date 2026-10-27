@@ -18,8 +18,9 @@ class PlayOrderTest {
         slots: List<List<Long>>,
         resume: Map<Long, Long>,
         lengths: Map<Long, Long> = emptyMap(),
-        lastPlayed: Map<Long, Long> = emptyMap()
-    ) = PlayOrder.nextCopy(slots, resume, lengths, lastPlayed)
+        lastPlayed: Map<Long, Long> = emptyMap(),
+        saved: Set<Long> = emptySet()
+    ) = PlayOrder.nextCopy(slots, resume, lengths, lastPlayed, saved)
 
     @Test
     fun anUnwatchedShowOpensTheBestCopyOfItsFirstPart() {
@@ -311,6 +312,170 @@ class PlayOrderTest {
             lengthsMs = mapOf(11L to ONE_HOUR)
         )
         assertEquals(PlayOrder.Progress(12L, TEN_MINUTES, ONE_HOUR, 50 * MINUTE), gone)
+    }
+
+    @Test
+    fun aRefusedCopyFallsToTheOtherFileOfItsOwnPart() {
+        assertEquals(
+            11L,
+            PlayOrder.otherCopyOfPart(
+                slots = listOf(listOf(12L, 11L), listOf(22L, 21L)),
+                presentIds = listOf(12L, 11L, 22L, 21L),
+                failedId = 12L
+            )
+        )
+    }
+
+    @Test
+    fun aRefusedPartNeverLandsOnTheNextEpisode() {
+        // Moving sideways into the following part would play a different film than the one asked for,
+        // which is a choice the viewer never made.
+        assertNull(
+            PlayOrder.otherCopyOfPart(
+                slots = listOf(listOf(12L), listOf(22L, 21L)),
+                presentIds = listOf(12L, 22L, 21L),
+                failedId = 12L
+            )
+        )
+    }
+
+    @Test
+    fun aThirdCopyIsOfferedWhenTheFirstTwoHaveAlreadyBeenRefused() {
+        assertEquals(
+            13L,
+            PlayOrder.otherCopyOfPart(
+                slots = listOf(listOf(12L, 11L, 13L)),
+                presentIds = listOf(12L, 11L, 13L),
+                failedId = 12L,
+                alreadyTried = setOf(11L, 12L)
+            )
+        )
+    }
+
+    @Test
+    fun aPartThatHasTriedEveryCopyItHoldsIsOutOfTries() {
+        assertNull(
+            PlayOrder.otherCopyOfPart(
+                slots = listOf(listOf(12L, 11L, 13L)),
+                presentIds = listOf(12L, 11L, 13L),
+                failedId = 12L,
+                alreadyTried = setOf(11L, 12L, 13L)
+            )
+        )
+    }
+
+    @Test
+    fun aFileThePlayerWasNeverHandedIsNotOfferedBack() {
+        // The grouping knows three uploads; the launch only carried two into the playlist, and the
+        // third has no address in the player's hand.
+        assertNull(
+            PlayOrder.otherCopyOfPart(
+                slots = listOf(listOf(12L, 11L, 13L)),
+                presentIds = listOf(12L, 11L),
+                failedId = 12L,
+                alreadyTried = setOf(11L)
+            )
+        )
+    }
+
+    @Test
+    fun theBestCopyLeftIsTheOneOfferedAfterARefusal() {
+        assertEquals(
+            21L,
+            PlayOrder.otherCopyOfPart(
+                slots = listOf(listOf(22L, 21L, 23L)),
+                presentIds = listOf(23L, 21L, 22L),
+                failedId = 22L
+            )
+        )
+    }
+
+    @Test
+    fun aCopyTheDeviceIsHoldingOpensBeforeTheOneTheShelfRanksHighest() {
+        val picked = play(
+            slots = listOf(listOf(12L, 11L)),
+            resume = emptyMap(),
+            saved = setOf(11L)
+        )
+
+        // The point of pressing Download is that the film is now on the phone, and a Play that opened
+        // the better upload over the link instead is a Play that ignores an instruction the viewer gave
+        // in the same screen seconds earlier.
+        assertEquals(PlayOrder.Play(11L, 0L), picked)
+    }
+
+    @Test
+    fun aKeptCopyOutranksTheCopyTheViewerLastWatched() {
+        val picked = play(
+            slots = listOf(listOf(12L, 11L, 10L)),
+            resume = mapOf(10L to TEN_MINUTES),
+            lengths = mapOf(10L to ONE_HOUR, 11L to ONE_HOUR),
+            lastPlayed = mapOf(10L to LAST_NIGHT),
+            saved = setOf(11L)
+        )
+
+        // The two rules disagree here on purpose, and the download wins: the reason Resume honors a
+        // lesser copy is that the bigger one would not carry over the link, and a copy already on this
+        // device carries itself. The ten minutes are not lost either — a watched minute belongs to the
+        // part, and every copy of it is opened at the deepest place any of them reached.
+        assertEquals(PlayOrder.Play(11L, TEN_MINUTES), picked)
+    }
+
+    @Test
+    fun theBestOfTwoKeptCopiesOfOnePartIsTheOneOpened() {
+        val picked = play(
+            slots = listOf(listOf(13L, 12L, 11L)),
+            resume = emptyMap(),
+            saved = setOf(11L, 12L)
+        )
+
+        assertEquals(PlayOrder.Play(12L, 0L), picked)
+    }
+
+    @Test
+    fun aKeptCopyCarriesOnlyItsOwnPart() {
+        val picked = play(
+            slots = listOf(listOf(12L, 11L), listOf(22L, 21L)),
+            resume = emptyMap(),
+            saved = setOf(11L)
+        )
+
+        // Episode 1 was saved and episode 2 was not. Stepping to 22L is the best copy of a part nobody
+        // has opened, and the promise covered exactly one file.
+        assertEquals(PlayOrder.Play(11L, 0L), picked)
+        val next = PlayOrder.progress(
+            slots = listOf(listOf(11L), listOf(22L, 21L)),
+            resumeMs = mapOf(11L to TEN_MINUTES),
+            lengthsMs = mapOf(11L to ONE_HOUR, 21L to ONE_HOUR, 22L to ONE_HOUR)
+        )
+        assertEquals(PlayOrder.Progress(11L, TEN_MINUTES, ONE_HOUR, 50 * MINUTE), next)
+    }
+
+    @Test
+    fun aCopySavedForAnotherTitleIsNotAPromiseAboutThisOne() {
+        val picked = play(
+            slots = listOf(listOf(12L, 11L)),
+            resume = emptyMap(),
+            saved = setOf(99L)
+        )
+
+        assertEquals(PlayOrder.Play(12L, 0L), picked)
+    }
+
+    @Test
+    fun aSavedCopyIsTheOneTheContinueRowResumesOn() {
+        val gone = PlayOrder.progress(
+            slots = listOf(listOf(12L, 11L)),
+            resumeMs = mapOf(11L to TEN_MINUTES),
+            lengthsMs = mapOf(12L to ONE_HOUR, 11L to ONE_HOUR),
+            lastPlayedMs = mapOf(11L to LAST_NIGHT),
+            savedIds = setOf(11L)
+        )
+
+        // The row promises a place in the film and the Play button has to put the viewer there. A row
+        // that named the 720p because it was last watched there, beside a Play that opens the saved
+        // 1080p, is two answers to one question.
+        assertEquals(PlayOrder.Progress(11L, TEN_MINUTES, ONE_HOUR, 50 * MINUTE), gone)
     }
 
     private companion object {

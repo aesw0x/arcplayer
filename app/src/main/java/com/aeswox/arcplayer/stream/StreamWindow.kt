@@ -60,6 +60,11 @@ object StreamWindow {
      * has been pushed forward to extend the file leaves the play head reading behind its start, and
      * judged on the window alone that position has nothing ahead of it — so a watchdog waiting for
      * bytes to resume on never sees any, on a file whose bytes are sitting on disk.
+     *
+     * [includeInFlight] turned off answers the harder question instead: how much can be read *now*,
+     * with nothing arriving. A span Telegram is still carrying is a promise, and a player re-opened
+     * into the part of it that has not landed reads the zeroes behind the last real byte, which it
+     * reports as the end of the movie.
      */
     fun readableBytes(
         position: Long,
@@ -67,14 +72,15 @@ object StreamWindow {
         windowStart: Long,
         windowLength: Long,
         completed: Boolean,
-        alreadyDelivered: DeliveredRun = DeliveredRun.NONE
+        alreadyDelivered: DeliveredRun = DeliveredRun.NONE,
+        includeInFlight: Boolean = true
     ): Long {
         if (position < 0L) return 0L
         if (completed) return size - position.coerceAtMost(size)
         val spanEnd = windowStart + windowLength
         val arriving = if (position in windowStart until spanEnd) spanEnd - position else 0L
         val onDisk = if (alreadyDelivered.covers(position)) alreadyDelivered.to - position else 0L
-        return maxOf(arriving, onDisk)
+        return if (includeInFlight) maxOf(arriving, onDisk) else onDisk
     }
 
     /**

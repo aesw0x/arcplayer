@@ -72,6 +72,7 @@ class TdBridge(
     @Synchronized
     fun start() {
         if (client != null) return
+        quietLogger()
         client = Client.create(
             /* clientHandler = */ { result -> onTdObject(result) },
             /* extraHandler = */ null,
@@ -80,6 +81,22 @@ class TdBridge(
                 submit(CloudAuthInput.Rejected(error.message ?: "TDLib crashed"))
             }
         )
+    }
+
+    /**
+     * Cut TDLib's chatter down.
+     *
+     * TDLib's internal logger writes straight to logcat under the tag `DLTD`, and a cold start that
+     * opens the shelf printed 100,501 of those lines inside the ~1.6 s the app is coming up. They are
+     * routine traffic at verbosity 3 and 4 — every request sent, every update received, every byte
+     * position — while the same capture held 2 lines at 2 and none below. Going through
+     * [Client.execute] rather than a client request is what TDLib asks for here: the log functions are
+     * synchronous, global to the process, and this has to take effect before the client has finished
+     * starting. A failure only costs us quiet, so it must not cost the start.
+     */
+    private fun quietLogger() {
+        runCatching { Client.execute(TdApi.SetLogVerbosityLevel(MAX_LOG_VERBOSITY)) }
+            .onFailure { Log.w(TAG, "TDLib logger is still verbose", it) }
     }
 
     private fun onTdObject(obj: TdApi.Object) {
@@ -173,5 +190,6 @@ class TdBridge(
     private companion object {
         const val TAG = "ArcTdBridge"
         const val APP_VERSION = "1.0.0"
+        const val MAX_LOG_VERBOSITY = 2
     }
 }

@@ -24,13 +24,16 @@ into one Android source set, and a backdrop resolution scale added for cheaper e
 Apache-2.0 requires the license text to travel with those files, which is why `LICENSE` is committed
 at the repository root.
 
-## The libVLC caveat
+## libVLC distribution considerations
 
-`libvlc-all`'s own POM declares LGPL-2.1, and this repository's Apache-2.0 grant is compatible with
-that. But VLC's upstream sources are GPL-family and the bundle ships third-party codecs, and the AAR
-contains no license file of its own (checked by unpacking it). Building and using this app on your
-own device is unremarkable; **redistributing an APK needs the question settled against VideoLAN's
-own terms first**, which is also why libVLC players historically cannot be listed on Google Play.
+The `libvlc-all` 3.6.0 POM declares LGPL-2.1. This repository's Apache-2.0 license covers Arc Player's
+own source; it does not replace the licenses of libVLC, native codecs, or other bundled components.
+
+Distributors must review the exact bundled libraries and comply with their applicable terms,
+including license notices, corresponding source availability, and LGPL modification/relinking
+requirements where applicable. Producing a signed APK is not, by itself, a license-compliance audit.
+Whether an app can be distributed through a particular store is a separate question; using libVLC
+does not establish a blanket Google Play prohibition.
 
 ## TDLib and Telegram
 
@@ -43,18 +46,19 @@ TDLib is Apache-2.0. Two obligations that are not about code:
 
 ## Catalogue data, not code
 
-`metadata/` asks three services what a file actually is. None of them contribute code, but each has
-terms that are not about licensing:
+`metadata/` queries catalogue services to identify media. They do not contribute application code,
+but their data, artwork, and service access remain subject to their own terms:
 
-- **TMDB** supplies film and series titles and all live-action artwork, under a v3 API key registered
+- **TMDB** supplies film and series titles and artwork, under a v3 API key registered
   to this app. Their terms require attribution, which is on the Menu tab under "Data Sources", and
   cover non-commercial use only. The key is read from git-ignored `local.properties` at build time
   and compiled into `BuildConfig`, so it **is visible to anyone who unpacks the APK** — accepted here
   because the key grants read-only access to public catalogue data and carries no billing.
 - **AniList** supplies series titles and anime artwork over a keyless GraphQL endpoint.
-- **Wikipedia** fills in titles the other two miss, via the MediaWiki search API. It withholds
-  fair-use film posters from its thumbnail endpoint, so a Wikipedia-sourced card has a correct name
-  and no artwork by design.
+- **IMDb** provides an additional title and artwork lookup path. Its content and access are subject
+  to IMDb's terms; the application does not own or relicense that catalogue.
+- **Wikipedia** provides another title lookup path through the MediaWiki search API. Thumbnail
+  availability varies; individual images retain their own licenses and usage restrictions.
 
 ## Provenance of the streaming design
 

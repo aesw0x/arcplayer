@@ -1,5 +1,7 @@
 package com.aeswox.arcplayer.cloud
 
+import com.aeswox.arcplayer.Playable
+
 /** A chat the signed-in account can browse videos in. */
 data class CloudChat(
     val chatId: Long,
@@ -14,18 +16,26 @@ data class CloudChat(
  * resume / favorites / history maps the local library uses.
  */
 data class CloudVideoItem(
-    val stableId: Long,
+    override val stableId: Long,
     val chatId: Long,
     val chatTitle: String,
     val messageId: Long,
     val fileId: Int,
-    val title: String,
-    val sizeBytes: Long,
-    val durationMs: Long,
+    override val title: String,
+    override val sizeBytes: Long,
+    override val durationMs: Long,
     val width: Int,
     val height: Int,
     val mimeType: String,
     val supportsStreaming: Boolean,
+    /**
+     * When the message carrying this file was sent, in epoch seconds.
+     *
+     * The shelf needs a date a device file's can be compared against: a message id says only that one
+     * post came after another in the same chat, which is worth nothing beside a MediaStore row from
+     * yesterday.
+     */
+    val dateSec: Long = 0L,
     /**
      * Whether this came off disk rather than out of Telegram's answer to the current session.
      *
@@ -35,14 +45,21 @@ data class CloudVideoItem(
      * into the message itself and does not hand out again.
      */
     val isFromManifest: Boolean = false,
-) {
+) : Playable {
+    override val arrivedAtSec: Long get() = dateSec
+    override val frameHeight: Int get() = height
+    override val isOnPhone: Boolean get() = false
+
+    override fun withLength(learnedMs: Long): CloudVideoItem =
+        copy(durationMs = maxOf(durationMs, learnedMs))
+
     val durationFormatted: String
         get() {
             val totalSeconds = durationMs / 1000L
             return "%02d:%02d".format(totalSeconds / 60L, totalSeconds % 60L)
         }
 
-    val sizeFormatted: String
+    override val sizeFormatted: String
         get() = formatCloudBytes(sizeBytes)
 }
 

@@ -10,14 +10,24 @@ import org.junit.Test
  * The names are the shapes real archives carry: a careful uploader's brackets and release tail, a
  * careless one's dots, and a channel that renamed nothing at all. The year is pinned so a test cannot
  * start failing in January.
+ *
+ * Several of the tests below put a phone copy beside a channel copy of the same work, which is what the
+ * merged library hands this object: one list, files from two places, and no id in common. Grouping has
+ * to ignore where a file came from and still find the copies of one film — then let the shelf put the
+ * one already downloaded first.
  */
 class TitleGroupsTest {
 
     private val interstellar = "Interstellar (2014) 1080p BluRay x264.mkv"
     private val interstellarSmall = "Interstellar.2014.720p.WEB-DL.mkv"
 
-    private fun file(id: Long, name: String, sizeBytes: Long = ONE_GB) =
-        TitleCandidate(id, name, sizeBytes)
+    private fun file(
+        id: Long,
+        name: String,
+        sizeBytes: Long = ONE_GB,
+        onPhone: Boolean = false,
+        frameHeight: Int = 0
+    ) = TitleCandidate(id, name, sizeBytes, frameHeight, onPhone)
 
     @Test
     fun twoCopiesOfOneFilmBecomeOneCard() {
@@ -286,6 +296,54 @@ class TitleGroupsTest {
 
         assertEquals(2, group.parts.size)
         assertEquals(listOf(2L, 1L), group.parts.map { it.id })
+    }
+
+    @Test
+    fun aCopyOnThePhoneAndACopyOnTheChannelBecomeOneCard() {
+        val group = TitleGroups.group(
+            listOf(
+                file(1L, interstellar, 8L * ONE_GB),
+                file(2L, interstellar, 2L * ONE_GB, onPhone = true)
+            ),
+            thisYear = THIS_YEAR
+        ).single()
+
+        // One card, and the file already sitting on the phone is the one it plays: two names that claim
+        // the same picture claim the same picture, whatever either was downloaded for.
+        assertEquals(2, group.parts.size)
+        assertEquals(listOf(2L, 1L), group.parts.map { it.id })
+        assertEquals(2L, group.representative.id)
+    }
+
+    @Test
+    fun oneEpisodesTwoCopiesSortWithThePhonesFirst() {
+        val group = TitleGroups.group(
+            listOf(
+                file(1L, "Lain S01E01 1080p.mkv", 6L * ONE_GB),
+                file(2L, "Lain S01E01 1080p.mkv", ONE_GB, onPhone = true),
+                file(3L, "Lain S01E02 1080p.mkv")
+            ),
+            thisYear = THIS_YEAR
+        ).single()
+
+        // Watch order still governs the list; the phone only decides between two copies of one episode.
+        assertEquals(listOf(2L, 1L, 3L), group.parts.map { it.id })
+        assertEquals(listOf(1, 1, 2), group.parts.map { it.episode })
+    }
+
+    @Test
+    fun theHeightOfACopyIsOnlyUsedWhenNeitherNameStatesAResolution() {
+        val group = TitleGroups.group(
+            listOf(
+                file(1L, "Arrival (2016).mkv", 6L * ONE_GB),
+                file(2L, "Arrival (2016).mkv", ONE_GB, frameHeight = 2160)
+            ),
+            thisYear = THIS_YEAR
+        ).single()
+
+        // A file whose name says nothing is still measured by what its pixels are, which is how a
+        // download from a chat gets ranked at all.
+        assertEquals(2L, group.representative.id)
     }
 
     @Test

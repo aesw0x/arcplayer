@@ -26,6 +26,13 @@ object TitleScore {
     const val NEAR_YEAR = 1
     const val WRONG_YEAR = -2
 
+    /**
+     * Words that only ever count off the parts of a franchise, so a digit immediately after one is
+     * doing the naming and the word is not. Deliberately short: "Season" and "Episode" are left out
+     * because a file carrying those has already been read as one part of a show, not as a film.
+     */
+    private val partWords = setOf("chapter", "part", "vol", "volume")
+
     /** One row of a search response, reduced to what can be compared. */
     data class Candidate(val title: String, val year: Int?)
 
@@ -37,14 +44,40 @@ object TitleScore {
      * the exception because catalogues and uploaders disagree about it for the same film: IMDb calls
      * the 2026 biopic "Virginia Woolf's Night & Day" while the file says "Night and Day", and dropping
      * the symbol instead of reading it leaves those two names unrelated.
+     *
+     * A word that only numbers the part — "Chapter", "Part" — disappears when a digit follows it, for
+     * the same reason of disagreement. TMDB names the 2023 film "John Wick: Chapter 4" and the scene
+     * names the file "John.Wick.4", and measured against the live catalogue that gap alone is what
+     * refused the film: the correct row was the first one back from all three of TMDB, IMDb and
+     * Wikipedia, and every one of them scored 2 against a floor of 4. Names that really do differ,
+     * like "John Wick" against "John Wick 2", still differ, because only the numbering word is spent
+     * and the digit stays.
      */
     fun key(value: String): String {
-        val builder = StringBuilder(value.length)
+        val words = ArrayList<String>(4)
+        val word = StringBuilder()
+        fun flush() {
+            if (word.isNotEmpty()) {
+                words += word.toString()
+                word.setLength(0)
+            }
+        }
         for (character in value.lowercase()) {
             when {
-                character.isLetterOrDigit() -> builder.append(character)
-                character == '&' -> builder.append("and")
+                character.isLetterOrDigit() -> word.append(character)
+                character == '&' -> {
+                    flush()
+                    word.append("and")
+                    flush()
+                }
+                else -> flush()
             }
+        }
+        flush()
+        val builder = StringBuilder(value.length)
+        words.forEachIndexed { index, word ->
+            val numbersAPart = word in partWords && words.getOrNull(index + 1)?.all { it.isDigit() } == true
+            if (!numbersAPart) builder.append(word)
         }
         return builder.toString()
     }

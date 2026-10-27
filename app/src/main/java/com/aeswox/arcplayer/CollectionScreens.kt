@@ -3,6 +3,7 @@ package com.aeswox.arcplayer
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -39,12 +40,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.BlurEffect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.RenderEffect
+import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
@@ -64,7 +70,11 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.aeswox.arcplayer.cloud.CloudAuthStage
 import com.aeswox.arcplayer.cloud.CloudRepository
 import com.aeswox.arcplayer.cloud.CloudVideoItem
+import com.aeswox.arcplayer.cloud.DownloadEntry
+import com.aeswox.arcplayer.cloud.DownloadLedger
 import com.aeswox.arcplayer.metadata.MediaCard
+import com.aeswox.arcplayer.metadata.PhoneVideoVerdict
+import com.aeswox.arcplayer.metadata.PhoneVideos
 import com.aeswox.arcplayer.metadata.PlayOrder
 import com.aeswox.arcplayer.metadata.TitleCandidate
 import com.aeswox.arcplayer.metadata.TitleGroups
@@ -73,7 +83,9 @@ import com.aeswox.arcplayer.ui.animations.JellySkeleton
 import com.aeswox.arcplayer.ui.animations.StaggeredListItem
 import com.aeswox.arcplayer.ui.animations.jellyClick
 import com.aeswox.arcplayer.ui.animations.physicsBounceOverscroll
+import com.aeswox.arcplayer.ui.components.HugeIcons
 import com.aeswox.arcplayer.ui.haptics.AppHaptics
+import com.aeswox.arcplayer.ui.theme.Accent as JellyAccent
 import com.aeswox.arcplayer.ui.theme.Background as JellyBackground
 import com.aeswox.arcplayer.ui.theme.OnPrimary as JellyOnPrimary
 import com.aeswox.arcplayer.ui.theme.OnSurface as JellyOnSurface
@@ -85,41 +97,199 @@ import com.aeswox.arcplayer.ui.theme.SurfaceContainer as JellySurfaceContainer
 import com.aeswox.arcplayer.ui.theme.SurfaceContainerHigh as JellySurfaceHigh
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitCancellation
-import kotlinx.coroutines.launch
 import kotlin.math.abs
 
 private enum class CollectionFilter(val label: String) {
     ALL("All"), MOVIES("Movies"), SERIES("Series"), FAVOURITES("Favourites")
 }
 
-private data class CollectionResume(
+internal data class CollectionResume(
     val title: ShelfTitle?,
     val local: VideoItem?,
-    val progress: PlayOrder.Progress
+    val progress: PlayOrder.Progress,
+    /**
+     * The shelf work this device file is a kept copy of, for a file the grid itself never shows.
+     *
+     * A keep is filed in this app's own corner of `Movies`, which the shelf skips on purpose so a download
+     * never starts a second poster beside the film it copied. The skip is right for the grid and wrong for
+     * a card that has to say what film is worth resuming: the ledger knows both ids of the same bytes, and
+     * this is the work those ids name.
+     */
+    val keptOf: ShelfTitle? = null
 ) {
     val key: String get() = title?.let { "cloud:${it.group.key}" } ?: "local:${local!!.id}"
-    val name: String get() = title?.name ?: local!!.title
+    val name: String get() = title?.name ?: keptOf?.name ?: local!!.title
 }
 
-@Composable
-internal fun CollectionScreens(
-    tab: BottomNavTab,
-    repository: CloudRepository,
+/**
+ * Everything the collection tabs draw, worked out once per library change instead of once per composition.
+ *
+ * A tab switch throws the leaving page away and builds the entering one from nothing, so anything a page
+ * derives inside itself is derived again in the very frame the transition is supposed to start in — and
+ * this derives every file name the library holds through the catalogue parser, which is where the
+ * viewer's half second goes. Built above the transition it is already there when the finger lifts.
+ */
+internal class CollectionShelf(
+    val authorized: Boolean,
+    val loading: Boolean,
+    val gone: Boolean,
+    val readFailed: Boolean,
+    val resolved: List<ShelfTitle>,
+    val titles: List<ShelfTitle>,
+    val hiddenTitles: Int,
+    val movies: List<ShelfTitle>,
+    val series: List<ShelfTitle>,
+    val featured: List<ShelfTitle>,
+    val onShelf: Set<Long>,
+    /**
+     * The phone's own files that belong to a film or an episode, and nothing else it holds.
+     *
+     * Not a second guess about what counts as a movie. The shelf is the one pass that reads a device
+     * file's name against a catalogue, so its answer is reused here: the positive ids among the parts of
+     * a card, plus the catalog row of every keep made from one of those parts — a keep is the same film
+     * as the copy it was made from, filed under a row the grid never sees. Everything else in MediaStore
+     * is a camera roll, a screen recording or a clip, and the viewer has asked not to be shown those
+     * anywhere, including on the device screens.
+     */
+    val deviceIds: Set<Long>,
+    val savedIds: Set<Long>,
+    val continuing: List<CollectionResume>
+)
+
+/**
+ * The whole shelf from one pass over what the library holds right now.
+ *
+ * The preference maps are read here, not passed in, because a card landing late has to rebuild this
+ * rather than be quietly ignored by a caller that already looked. The Telegram list and the two read
+ * flags arrive as values the caller read through a state delegate, so the derivation observes them at
+ * the moment it runs.
+ */
+private fun buildCollectionShelf(
+    authorized: Boolean,
+    shelfId: Long,
+    videosByChat: Map<Long, List<CloudVideoItem>>,
+    loading: Boolean,
+    gone: Boolean,
+    readFailed: Boolean,
     prefsStore: ArcPreferencesStore,
     snapshot: MediaLibrarySnapshot,
-    topInset: Dp,
-    bottomInset: Dp,
-    onOpenTitle: (ShelfTitle) -> Unit,
-    onCloudPlay: (CloudVideoItem, List<CloudVideoItem>, List<List<Long>>, MediaCard?) -> Unit,
-    onLocalPlay: (VideoItem, List<VideoItem>) -> Unit,
-    onOpenDevice: () -> Unit,
-    onOpenAllVideos: () -> Unit,
-    onOpenPlaylists: () -> Unit,
-    onManageCollection: () -> Unit
-) {
-    if (tab == BottomNavTab.SETTINGS) return
+    downloads: Map<Long, DownloadEntry>
+): CollectionShelf {
+    val files = if (authorized && !gone && shelfId != 0L) videosByChat[shelfId].orEmpty()
+        .filter { it.chatId == shelfId } else emptyList()
+    val lengths = prefsStore.knownLengths.toMap()
+    val cards = prefsStore.mediaCards.toMap()
+    val positions = prefsStore.resumePositions.toMap()
+    val watched = prefsStore.watchedAt.toMap()
+    val history = prefsStore.watchHistoryIds
+    val savedIds = DownloadLedger.completeIds(downloads)
+    // The two piles as one, newest file first, because a card's place in the grid is the place of the
+    // newest copy it holds. A Telegram file arrives with the date of the message that carries it and a
+    // device file with the moment MediaStore took it in, which are the only two figures either has.
+    //
+    // Only what the phone's own folders say is a *kept* video reaches the shelf. A camera roll runs
+    // through this list otherwise, and every holiday clip in it would cost a catalogue request to be told
+    // it is not a film — and one that parses by accident would sit on a poster card beside the collection.
+    val onChannel: List<Playable> = files.map { it.withLength(lengths[it.stableId] ?: 0L) }
+    val onPhone: List<Playable> = snapshot.videos
+        .map { it.withLength(lengths[it.stableId] ?: 0L) }
+        .filter { PhoneVideos.verdictOf(it.relativePath, it.durationMs) == PhoneVideoVerdict.COLLECTION }
+    val shelfFiles = (onChannel + onPhone).sortedByDescending { it.arrivedAtSec }
+    val groups = TitleGroups.group(
+        shelfFiles.map { TitleCandidate(it.stableId, it.title, it.sizeBytes, it.frameHeight, it.isOnPhone) }
+    )
+    val resolved = shelfCards(shelfFiles, groups, cards)
+    // A work with nothing but its own file name to show is a grey box on a poster wall, so a card only
+    // earns its place once the catalogue has said what it is. That test is asked of a shelf the phone
+    // alone fills, and never of one holding a channel copy: those files really are on the shelf, and an
+    // airplane would otherwise empty the whole collection.
+    val titles = resolved.filter { it.heldOnChannel || !it.posterUrl.isNullOrBlank() || it.providerId != null }
+    // The device files that earned a card, in the phone's own numbers, plus the rows holding a keep of
+    // one. A card the grid hides — no name, no picture — hides its files here too, or the two screens
+    // would disagree about what this app contains.
+    val cardParts = titles.flatMap { it.partIds }.toSet()
+    val deviceIds = cardParts.filter { it > 0L }.toSet() +
+        DownloadLedger.keptRows(downloads).filter { (_, part) -> part in cardParts }.keys
+    val shelfResume = resolved.mapNotNull { title ->
+        PlayOrder.progress(
+            title.copySlots, PlayOrder.positionByCopy(title.copySlots, positions), title.lengths, watched, savedIds
+        )?.let { CollectionResume(title, null, it) }
+    }.sortedByDescending { watched[it.progress.partId] ?: 0L }
+    val namedFromShelf = shelfResume.mapNotNull { it.title?.group?.key }.toSet()
+    // A watched file the shelf already carries is in the rail above, under its own title — which is the
+    // whole point of merging the two piles, so a film played from `Movies/` moves the poster rather than
+    // starting a second row beside it. What is left here is a keep of a film whose card has nothing left
+    // to resume, and nothing else: the phone's clips and camera roll are not a film's worth of progress.
+    val onShelf = resolved.flatMap { it.partIds }.toSet()
+    val workOfRow = DownloadLedger.keptRows(downloads).mapNotNull { (row, part) ->
+        resolved.firstOrNull { title -> part in title.partIds }?.let { row to it }
+    }.toMap()
+    val localResume = snapshot.videos.mapNotNull { video ->
+        // A clip, a screen recording or a camera roll file has no business in a rail about films, and
+        // this is the one place the phone's whole video table was still being read straight.
+        if (video.id !in deviceIds) return@mapNotNull null
+        if (video.id in onShelf) return@mapNotNull null
+        // A keep is the same bytes as the channel copy the shelf already carries, filed under the row its
+        // bytes landed in. So the shelf's card is the one this rail wants, and it wins for the same reason
+        // a film played from `Movies/` wins there: one work, one card. Only a work that earned no card —
+        // watched through, so nothing is left to resume — lets the keep speak for it, and then it is named
+        // by the work rather than by the name a channel typed onto a file.
+        val keptOf = workOfRow[video.id]
+        if (keptOf != null && keptOf.group.key in namedFromShelf) return@mapNotNull null
+        val position = positions[video.id] ?: 0L
+        val length = maxOf(video.durationMs, lengths[video.id] ?: 0L)
+        val finished = com.aeswox.arcplayer.playback.ResumeRules.decide(position, length) ==
+            com.aeswox.arcplayer.playback.ResumeOutcome.DROP
+        if (position < com.aeswox.arcplayer.playback.ResumeRules.MIN_RESUME_POSITION_MS || finished) null
+        else CollectionResume(
+            null, video,
+            PlayOrder.Progress(video.id, position, length, (length - position).coerceAtLeast(0L)),
+            keptOf
+        )
+    }
+    val continuing = (shelfResume + localResume).sortedBy { entry ->
+        history.indexOf(entry.progress.partId).takeIf { it >= 0 } ?: Int.MAX_VALUE
+    }.take(12)
+    return CollectionShelf(
+        authorized = authorized,
+        loading = loading,
+        gone = gone,
+        readFailed = readFailed,
+        resolved = resolved,
+        titles = titles,
+        hiddenTitles = resolved.size - titles.size,
+        movies = titles.filterNot { it.isSeries },
+        series = titles.filter { it.isSeries },
+        featured = titles.filter {
+            it.name.isNotBlank() && !it.group.key.startsWith("u:") && !it.posterUrl.isNullOrBlank()
+        }.take(5),
+        onShelf = onShelf,
+        deviceIds = deviceIds,
+        savedIds = savedIds,
+        continuing = continuing
+    )
+}
+
+/**
+ * The shelf, kept alive across a tab switch and rebuilt only when the library actually moved.
+ *
+ * [snapshot], [authorized] and the collection's chat id are plain values by the time they get here, so
+ * they are keys of the block holding the derived value; everything the shelf reads through
+ * [prefsStore] or the two Telegram flows is observed inside the derivation instead. Both catalogue
+ * passes run here too, which is the other half of the fix: they key their effects on the list they are
+ * given, and a list rebuilt by every composition restarted every catalogue ask in the middle of the
+ * transition. What comes back is the state, not its contents, so each tab reads the shelf in its own
+ * scope and a late catalogue answer redraws the page showing it rather than only the page that asked.
+ */
+@Composable
+internal fun rememberCollectionShelf(
+    repository: CloudRepository,
+    prefsStore: ArcPreferencesStore,
+    snapshot: MediaLibrarySnapshot
+): State<CollectionShelf> {
     val videosByChat by repository.videos.collectAsState()
     val auth by repository.authState.collectAsState()
+    val downloads by repository.downloads.collectAsState()
     val authorized = auth.stage == CloudAuthStage.AUTHORIZED
     val shelfId = prefsStore.movieFolderChatId
     val owner = LocalLifecycleOwner.current
@@ -150,61 +320,73 @@ internal fun CollectionScreens(
         }
     }
 
-    val files = if (authorized && !gone && shelfId != 0L) videosByChat[shelfId].orEmpty()
-        .filter { it.chatId == shelfId } else emptyList()
-    val lengths = prefsStore.knownLengths.toMap()
-    val cards = prefsStore.mediaCards.toMap()
-    val positions = prefsStore.resumePositions.toMap()
-    val watched = prefsStore.cloudWatchedAt.toMap()
+    // Handed back as the state rather than its contents: the tabs read it in their own scope, so a late
+    // catalogue answer redraws the page that shows it instead of only the page that asked.
+    val shelf = remember(repository, prefsStore, snapshot, authorized, shelfId) {
+        derivedStateOf {
+            buildCollectionShelf(
+                authorized, shelfId, videosByChat, loading, gone, readFailed, prefsStore, snapshot,
+                downloads
+            )
+        }
+    }
+    TitleSearchPass(shelf.value.resolved, prefsStore)
+    // Every card on this shelf is about to wear the same picture its page will, and the wide shot only
+    // comes with the title's detail. Asked here rather than when a page opens, because a card that
+    // swaps its own artwork at the moment of the tap is a visible flicker behind the incoming page.
+    ShelfArtworkWarmPass(shelf.value.titles, prefsStore)
+    return shelf
+}
+
+@Composable
+internal fun CollectionScreens(
+    tab: BottomNavTab,
+    shelfState: State<CollectionShelf>,
+    prefsStore: ArcPreferencesStore,
+    snapshot: MediaLibrarySnapshot,
+    topInset: Dp,
+    bottomInset: Dp,
+    onOpenTitle: (ShelfTitle) -> Unit,
+    onShelfPlay: (Playable, List<Playable>, List<List<Long>>, MediaCard?) -> Unit,
+    onLocalPlay: (VideoItem, List<VideoItem>) -> Unit,
+    onOpenDevice: () -> Unit,
+    onOpenAllVideos: () -> Unit,
+    onOpenPlaylists: () -> Unit,
+    onManageCollection: () -> Unit,
+    activeDownloads: Int,
+    onOpenDownloads: () -> Unit
+) {
+    if (tab == BottomNavTab.SETTINGS) return
+    val shelf = shelfState.value
+    val authorized = shelf.authorized
+    val loading = shelf.loading
+    val gone = shelf.gone
+    val readFailed = shelf.readFailed
+    val titles = shelf.titles
+    val hiddenTitles = shelf.hiddenTitles
+    val movies = shelf.movies
+    val series = shelf.series
+    val featured = shelf.featured
+    val onShelf = shelf.onShelf
+    val continuing = shelf.continuing
+    val savedIds = shelf.savedIds
     val favourites = prefsStore.favoriteIds
-    val history = prefsStore.watchHistoryIds
-    val groups = remember(files) {
-        TitleGroups.group(files.map { TitleCandidate(it.stableId, it.title, it.sizeBytes) })
-    }
-    val byId = remember(files, lengths) {
-        files.associate { it.stableId to it.copy(durationMs = maxOf(it.durationMs, lengths[it.stableId] ?: 0L)) }
-    }
-    val representatives = remember(groups, byId) { groups.mapNotNull { byId[it.representative.id] } }
-    TitleSearchPass(representatives, prefsStore)
-    val titles = remember(groups, byId, cards) {
-        groups.mapNotNull { group ->
-            val representative = byId[group.representative.id] ?: return@mapNotNull null
-            ShelfTitle(group, group.parts.mapNotNull { byId[it.id] }, representative, cards[representative.stableId])
-        }.sortedByDescending { title -> title.parts.maxOfOrNull { it.messageId } ?: 0L }
-    }
-    val movies = titles.filterNot { it.isSeries }
-    val series = titles.filter { it.isSeries }
-    val featured = titles.filter {
-        it.name.isNotBlank() && !it.group.key.startsWith("u:") && !it.posterUrl.isNullOrBlank()
-    }.take(5)
-    val cloudResume = titles.mapNotNull { title ->
-        PlayOrder.progress(title.copySlots, PlayOrder.positionByCopy(title.copySlots, positions), title.lengths, watched)
-            ?.let { CollectionResume(title, null, it) }
-    }.sortedByDescending { watched[it.progress.partId] ?: 0L }
-    val localResume = snapshot.videos.mapNotNull { video ->
-        val position = positions[video.id] ?: 0L
-        val length = maxOf(video.durationMs, lengths[video.id] ?: 0L)
-        val finished = com.aeswox.arcplayer.playback.ResumeRules.decide(position, length) ==
-            com.aeswox.arcplayer.playback.ResumeOutcome.DROP
-        if (position < com.aeswox.arcplayer.playback.ResumeRules.MIN_RESUME_POSITION_MS || finished) null else CollectionResume(
-            null, video, PlayOrder.Progress(video.id, position, length, (length - position).coerceAtLeast(0L))
-        )
-    }
-    val continuing = (cloudResume + localResume).sortedBy { entry ->
-        history.indexOf(entry.progress.partId).takeIf { it >= 0 } ?: Int.MAX_VALUE
-    }.take(12)
     val playResume: (CollectionResume) -> Unit = { entry ->
         val title = entry.title
         if (title != null) {
             val byCopy = PlayOrder.positionByCopy(title.copySlots, prefsStore.resumePositions.toMap())
             val currentLengths = title.partIds.associateWith { maxOf(title.lengths[it] ?: 0L, prefsStore.knownLengths[it] ?: 0L) }
             // Continue must not jump to an earlier, unstarted episode selected by nextCopy.
-            val progress = PlayOrder.progress(title.copySlots, byCopy, currentLengths, prefsStore.cloudWatchedAt)
+            val progress = PlayOrder.progress(
+                title.copySlots, byCopy, currentLengths, prefsStore.watchedAt, shelf.savedIds
+            )
             val choice = progress?.let { PlayOrder.Play(it.partId, it.resumeMs) }
-                ?: PlayOrder.nextCopy(title.copySlots, byCopy, currentLengths, prefsStore.cloudWatchedAt)
+                ?: PlayOrder.nextCopy(
+                    title.copySlots, byCopy, currentLengths, prefsStore.watchedAt, shelf.savedIds
+                )
             title.parts.firstOrNull { it.stableId == choice?.partId }?.let { file ->
                 prefsStore.rememberResumePosition(file.stableId, choice!!.resumeMs)
-                onCloudPlay(file, title.parts, title.copySlots, title.card)
+                onShelfPlay(file, title.parts, title.copySlots, title.card)
             }
         } else entry.local?.let { onLocalPlay(it, snapshot.videos) }
     }
@@ -230,7 +412,11 @@ internal fun CollectionScreens(
             title.group.parts.forEach { append(it.episodeTitle.orEmpty()).append(' ') }
         })
     }
-    val localMatches = snapshot.videos.filter { collectionMatches(terms, "${it.title} ${it.folderName}") }
+    // A device file the shelf already carries is searched as a title, not twice, so it drops out of the
+    // pile below — which is left holding exactly what the collection has no card for.
+    val localMatches = snapshot.videos.filter {
+        it.id !in onShelf && collectionMatches(terms, "${it.title} ${it.folderName}")
+    }
     val emptyMessage = when {
         !authorized -> "Connect Telegram to see your own movies and series. Your on-device videos are still available."
         loading -> "Reading your Telegram collection…"
@@ -252,13 +438,34 @@ internal fun CollectionScreens(
                     item(span = { GridItemSpan(maxLineSpan) }) {
                         Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                             if (browse != null) CollectionBack { browse = null }
-                            CollectionHeading(if (browse != null) when (browse) {
-                                CollectionFilter.MOVIES -> "Your Movies"
-                                CollectionFilter.SERIES -> "Your Series"
-                                CollectionFilter.FAVOURITES -> "Favourites"
-                                else -> "Your collection"
-                            } else "Library")
-                            Text("${titles.size} ${if (titles.size == 1) "title" else "titles"} · Your Telegram collection", color = JellyOnSurfaceVariant)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                CollectionHeading(
+                                    if (browse != null) when (browse) {
+                                        CollectionFilter.MOVIES -> "Your Movies"
+                                        CollectionFilter.SERIES -> "Your Series"
+                                        CollectionFilter.FAVOURITES -> "Favourites"
+                                        else -> "Your collection"
+                                    } else "Library",
+                                    modifier = Modifier.weight(1f)
+                                )
+                                // The Library screen's own way into the Downloads page. It is a circle
+                                // rather than a pill because it stands beside a 32 sp word, and any
+                                // taller control would push the heading off the top of the grid.
+                                if (browse == null && tab == BottomNavTab.LIBRARY) {
+                                    CollectionDownloadsBadge(activeDownloads, onOpenDownloads)
+                                }
+                            }
+                            Text(
+                                buildString {
+                                    append("${titles.size} ${if (titles.size == 1) "title" else "titles"} · Telegram and this phone")
+                                    // Said out loud because a device file the catalogue would not name is filed here
+                                    // and then not drawn, and a grid that quietly shrinks looks like a bug.
+                                    if (hiddenTitles > 0) {
+                                        append(" · $hiddenTitles ${if (hiddenTitles == 1) "has" else "have"} no artwork yet")
+                                    }
+                                },
+                                color = JellyOnSurfaceVariant
+                            )
                         }
                     }
                     if (browse == null) item(span = { GridItemSpan(maxLineSpan) }) {
@@ -287,7 +494,9 @@ internal fun CollectionScreens(
                         CollectionEmpty(if (titles.isEmpty()) emptyMessage else "No ${selectedFilter.label.lowercase()} yet.", onManageCollection, onOpenDevice)
                     }
                     itemsIndexed(filtered, key = { _, title -> title.group.key }) { index, title ->
-                        StaggeredListItem(index) { CollectionPoster(title, Modifier.fillMaxWidth(), onOpenTitle) }
+                        StaggeredListItem(index, "shelf:${title.group.key}") {
+                            CollectionPoster(title, Modifier.fillMaxWidth(), prefsStore, savedIds, onOpenTitle)
+                        }
                     }
                 }
             }
@@ -314,18 +523,19 @@ internal fun CollectionScreens(
                     if (terms.isEmpty()) item {
                         Text("Find your titles, episode files and on-device folders. Only your own videos — no catalogue search.", color = JellyOnSurfaceVariant)
                     } else {
-                        item { CollectionHeading("Telegram collection · ${cloudMatches.size}", small = true) }
+                        item { CollectionHeading("Your collection · ${cloudMatches.size}", small = true) }
                         if (cloudMatches.isEmpty()) item { Text("No matching collection titles.", color = JellyOnSurfaceVariant) }
                         itemsIndexed(cloudMatches, key = { _, title -> "cloud:${title.group.key}" }) { index, title ->
-                            StaggeredListItem(index) {
-                                CollectionSearchRow(title.name, if (title.isSeries) "Series · Telegram" else "Movie · Telegram",
-                                    onClick = { onOpenTitle(title) }, art = { CollectionArtwork(title.posterUrl) })
+                            StaggeredListItem(index, "cloud:${title.group.key}") {
+                                CollectionSearchRow(title.name,
+                                    "${if (title.isSeries) "Series" else "Movie"} · ${title.whereItLives()}",
+                                    onClick = { onOpenTitle(title) }, art = { CollectionShelfArt(title, prefsStore) })
                             }
                         }
-                        item { Spacer(Modifier.height(16.dp)); CollectionHeading("On Device · ${localMatches.size}", small = true) }
+                        item { Spacer(Modifier.height(16.dp)); CollectionHeading("On this phone · ${localMatches.size}", small = true) }
                         if (localMatches.isEmpty()) item { Text("No matching device videos or folders.", color = JellyOnSurfaceVariant) }
                         itemsIndexed(localMatches, key = { _, video -> "local:${video.id}" }) { index, video ->
-                            StaggeredListItem(index) {
+                            StaggeredListItem(index, "local:${video.id}") {
                                 CollectionSearchRow(video.title, video.folderName,
                                     onClick = { onLocalPlay(video, localMatches) }, art = { CollectionLocalArtwork(video) })
                             }
@@ -334,8 +544,8 @@ internal fun CollectionScreens(
                 }
             }
             else -> {
-                BoxWithConstraints(Modifier.fillMaxSize()) {
-                    val heroHeight = (maxWidth * 1.25f).coerceIn(440.dp, 500.dp)
+                Box(Modifier.fillMaxSize()) {
+                    val heroHeight = rememberCollectionHeroHeight()
                     val heroPager = rememberPagerState(pageCount = { featured.size })
                     val heroPull = remember { Animatable(0f) }
                     // The backdrop lives outside the scrolling column on purpose. The bounce
@@ -363,7 +573,7 @@ internal fun CollectionScreens(
                                     modifier = Modifier.physicsBounceOverscroll(isHorizontal = true)
                                 ) {
                                     itemsIndexed(continuing, key = { _, entry -> entry.key }) { index, entry ->
-                                        StaggeredListItem(index) { CollectionContinueCard(entry) { playResume(entry) } }
+                                        StaggeredListItem(index, "continue:${entry.key}") { CollectionContinueCard(entry, prefsStore, savedIds) { playResume(entry) } }
                                     }
                                 }
                             }
@@ -372,13 +582,13 @@ internal fun CollectionScreens(
                             Box(Modifier.padding(horizontal = 24.dp)) { CollectionEmpty(emptyMessage, onManageCollection, onOpenDevice) }
                         }
                         if (titles.isNotEmpty()) item(key = "recent") {
-                            CollectionRail("Recently Added", titles.take(16), { browse = CollectionFilter.ALL }, onOpenTitle)
+                            CollectionRail("Recently Added", titles.take(16), prefsStore, savedIds, { browse = CollectionFilter.ALL }, onOpenTitle)
                         }
                         if (movies.isNotEmpty()) item(key = "movies") {
-                            CollectionRail("Your Movies", movies.take(16), { browse = CollectionFilter.MOVIES }, onOpenTitle)
+                            CollectionRail("Your Movies", movies.take(16), prefsStore, savedIds, { browse = CollectionFilter.MOVIES }, onOpenTitle)
                         }
                         if (series.isNotEmpty()) item(key = "series") {
-                            CollectionRail("Your Series", series.take(16), { browse = CollectionFilter.SERIES }, onOpenTitle)
+                            CollectionRail("Your Series", series.take(16), prefsStore, savedIds, { browse = CollectionFilter.SERIES }, onOpenTitle)
                         }
                     }
                 }
@@ -388,6 +598,50 @@ internal fun CollectionScreens(
 }
 
 private fun collectionMatches(terms: List<String>, text: String): Boolean = terms.all { text.contains(it, ignoreCase = true) }
+
+/**
+ * Which piles a card's copies came out of, in the words a viewer would use for them.
+ *
+ * A merged film has to say both: the channel copy is what put it on the shelf and the phone copy is
+ * what Play will open, so a label that picked one of the two would be a lie either way.
+ */
+private fun ShelfTitle.whereItLives(): String {
+    val onChannel = heldOnChannel
+    val onPhone = parts.any { it.isOnPhone }
+    return if (onChannel && onPhone) "Telegram and this phone"
+    else if (onChannel) "Telegram" else "On this phone"
+}
+
+/**
+ * The height both heroes wear — the collection home's carousel and a title page's opening picture.
+ *
+ * 1.25 viewports tall puts the picture's bottom just past the middle of the screen on the phones this
+ * app is shaped for, and the clamp keeps a tablet from getting a wall of artwork. Both screens ask the
+ * same question, so both ask it here: a hero that changes size between the card and the page it opens
+ * is the flicker the push was built to avoid.
+ */
+@Composable
+internal fun rememberCollectionHeroHeight(): Dp {
+    val width = LocalConfiguration.current.screenWidthDp.dp
+    return remember(width) { (width * 1.25f).coerceIn(440.dp, 500.dp) }
+}
+
+/**
+ * The one hero scrim: shade for the status bar, clear across the picture, then the page closing over
+ * its own bottom edge. Shared because the two heroes should hand over to the page the same way.
+ */
+internal val HeroScrim = Brush.verticalGradient(
+    0f to Color.Black.copy(alpha = 0.32f), 0.35f to Color.Transparent,
+    0.67f to Color.Black.copy(alpha = 0.68f), 0.84f to Color.Black.copy(alpha = 0.75f),
+    1f to JellyBackground
+)
+
+/**
+ * The hero's last 64 dp: page colour closing over the picture, so its bottom edge dissolves instead
+ * of being cut. The scrim's own tail is only 75% black where the picture is brightest, and a bright
+ * poster bottom prints straight through it.
+ */
+internal val HeroFeather = Brush.verticalGradient(listOf(JellyBackground.copy(alpha = 0f), JellyBackground))
 
 @Composable
 private fun CollectionHero(titles: List<ShelfTitle>, prefs: ArcPreferencesStore, topInset: Dp,
@@ -400,7 +654,6 @@ private fun CollectionHero(titles: List<ShelfTitle>, prefs: ArcPreferencesStore,
         }
         return
     }
-    val scope = rememberCoroutineScope()
     Box(Modifier.fillMaxWidth().height(heroHeight)) {
         HorizontalPager(
             state = pager,
@@ -426,10 +679,10 @@ private fun CollectionHero(titles: List<ShelfTitle>, prefs: ArcPreferencesStore,
             // what the stretch is meant to move: the wordmark, the metadata and the pill.
             val recede = abs(pager.currentPage - page + pager.currentPageOffsetFraction).coerceIn(0f, 1f)
             Box(Modifier.fillMaxSize()) {
-                Text("IN YOUR COLLECTION", color = Color.White, fontSize = 11.sp, letterSpacing = 2.sp,
-                    modifier = Modifier.padding(start = 24.dp, top = topInset + 20.dp))
-                Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(start = 24.dp, end = 24.dp, bottom = 72.dp)
-                    .graphicsLayer { alpha = 1f - recede },
+                // The group wants to sit lower than the hero box allows, so the last 3 dp hang past
+                // its bottom edge into the gap above the next section.
+                Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(start = 24.dp, end = 24.dp)
+                    .graphicsLayer { alpha = 1f - recede; translationY = 3.dp.toPx() },
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     if (logo != null) Image(logo.asImageBitmap(), title.name, contentScale = ContentScale.Fit,
@@ -442,18 +695,6 @@ private fun CollectionHero(titles: List<ShelfTitle>, prefs: ArcPreferencesStore,
                 }
             }
         }
-        Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            titles.forEachIndexed { index, _ ->
-                Box(Modifier.size(48.dp).jellyClick(role = Role.Button, onClickLabel = "Show featured title ${index + 1}") {
-                    AppHaptics.tick()
-                    scope.launch { pager.animateScrollToPage(index) }
-                }.semantics { contentDescription = "Featured title ${index + 1} of ${titles.size}${if (index == pager.currentPage) ", selected" else ""}" },
-                    contentAlignment = Alignment.Center) {
-                    Box(Modifier.size(width = if (index == pager.currentPage) 24.dp else 6.dp, height = 6.dp).background(
-                        if (index == pager.currentPage) JellyOnSurface else JellyOutlineVariant, CircleShape))
-                }
-            }
-        }
     }
 }
 
@@ -463,20 +704,26 @@ private fun CollectionHero(titles: List<ShelfTitle>, prefs: ArcPreferencesStore,
  * The bounce overscroll translates the column as a whole, and everything inside the column shares
  * that moved clip, so an artwork inside the list can never hold the top edge mid-stretch — pulling
  * down drags the picture down and opens the page background above it. This layer follows only the
- * real scroll offset, which leaves the picture pinned while the title, pills and dots riding the
- * column give way, exactly as the stretch intends.
+ * real scroll offset, which leaves the picture pinned while the title, metadata and pill riding
+ * the column give way, exactly as the stretch intends.
  */
 @Composable
 private fun PinnedHeroArtwork(titles: List<ShelfTitle>, prefs: ArcPreferencesStore, pager: PagerState,
                               scroll: LazyListState, heroHeight: Dp, pull: Animatable<Float, *>) {
     val layerHeightPx = with(LocalDensity.current) { heroHeight.toPx() }
-    // The layer comes first because a modifier draws in its own node: with `background` ahead of
-    // `graphicsLayer` the rectangle is painted before the transform exists, so the sheet never moves
-    // and blankets the screen in page colour instead of sliding off the picture.
+    val maxBlurPx = with(LocalDensity.current) { 28.dp.toPx() }
     Box(Modifier.graphicsLayer {
         val offset = if (scroll.firstVisibleItemIndex == 0) scroll.firstVisibleItemScrollOffset else 0
         // 0.6 rather than 1: the picture already recedes at 40% of the scroll, as before.
         translationY = if (scroll.firstVisibleItemIndex == 0) -offset * 0.6f else -layerHeightPx * 2f
+        // A pinned picture that only gets covered reads as dead weight. Defocusing and dimming it as
+        // the list comes up makes it recede instead, and the soft edge is what carries the eye across
+        // the line the page-colour sheet finally closes over.
+        val retreat = heroRetreat(scroll, layerHeightPx)
+        // The radius guard is not tidiness: `BlurEffect(0f, 0f, ..)` returns a null native pointer on
+        // API 31 and takes the process down, so the effect has to stay absent until there is blur to do.
+        renderEffect = if (retreat <= 0.001f) null
+            else defocusAndDim(maxBlurPx * retreat, 1f - 0.65f * retreat)
     }.fillMaxWidth().height(heroHeight).clipToBounds()) {
         val offsetFraction = pager.currentPageOffsetFraction
         for (index in (pager.currentPage - 1)..(pager.currentPage + 1)) {
@@ -484,13 +731,57 @@ private fun PinnedHeroArtwork(titles: List<ShelfTitle>, prefs: ArcPreferencesSto
             HeroArtPage(titles[index], prefs, index - pager.currentPage - offsetFraction)
         }
     }
-    // The layer's clip is static while the list's hero edge scrolls and stretches away, so the
-    // picture's slower parallax would overdraw the rails below; this cover rides that edge —
-    // real scroll plus the overscroll stretch — and hides the overdraw behind the page colour.
-    Box(Modifier.graphicsLayer {
+    // The cover rides that edge — real scroll plus the overscroll stretch — and hides the overdraw
+    // behind the page colour. Its top edge is feathered rather than square: the cover travels at
+    // 1:1 while the picture recedes at 0.6:1, so after a few hundred dp of scroll the edge is no
+    // longer sitting on the scrim's opaque tail but across mid-tone artwork, and a square edge
+    // slices it (measured: luma 33.8 on one row, 0.0 on the next). The feather dissolves the
+    // picture under the sheet instead, and also swallows the artwork's own clip edge, which
+    // surfaces for the same reason. The solid part still overlaps the picture's bottom by a few
+    // pixels rather than meeting it edge to edge — both edges land on fractional pixels, and the
+    // row between them is painted by neither at full strength, which prints one bright line of raw
+    // artwork across the seam.
+    //
+    // The stretch only ever rides the cover upward. Riding it down would slide that overlap off the
+    // picture's clip edge — the pinned layer holds still while the cover follows the finger — and the
+    // same raw-artwork row reappears for as long as the finger is down (measured on a held pull:
+    // luma 22.2 on the seam row, 0.0 on every row either side of it).
+    val seamOverlapPx = with(LocalDensity.current) { 3.dp.toPx() }
+    val featherPx = with(LocalDensity.current) { 64.dp.toPx() }
+    Column(Modifier.graphicsLayer {
         val offset = if (scroll.firstVisibleItemIndex == 0) scroll.firstVisibleItemScrollOffset else layerHeightPx.toInt()
-        translationY = layerHeightPx - offset + pull.value
-    }.fillMaxSize().background(JellyBackground))
+        translationY = layerHeightPx - offset + pull.value.coerceAtMost(0f) - seamOverlapPx - featherPx
+    }.fillMaxSize()) {
+        Box(Modifier.fillMaxWidth().height(64.dp).background(HeroFeather))
+        Box(Modifier.fillMaxWidth().weight(1f).background(JellyBackground))
+    }
+}
+
+/**
+ * How far the list has travelled across the pinned picture, 0..1.
+ *
+ * Only ever read from inside a `graphicsLayer` lambda: reading it in the composition body would
+ * recompose this layer, and the three artwork pages it holds, on every scroll frame.
+ */
+private fun heroRetreat(scroll: LazyListState, layerHeightPx: Float): Float {
+    val travelled = if (scroll.firstVisibleItemIndex == 0) scroll.firstVisibleItemScrollOffset.toFloat() else layerHeightPx
+    return (travelled / layerHeightPx).coerceIn(0f, 1f)
+}
+
+/**
+ * Defocus the picture and scale its colours toward black, in one effect chain on one layer.
+ *
+ * The darkening has to ride the blur's own layer. Painted as a sibling over the artwork through a
+ * nested `graphicsLayer { alpha = .. }` it never showed at all, while this layer tracked the scroll
+ * frame for frame — measured: a constant `keep` of 0.35 landed as 0.350 on the pixel bands.
+ * Compose 1.7.4 ships no `ColorMatrixEffect`, so the chain is assembled through the platform API.
+ */
+private fun defocusAndDim(radiusPx: Float, keep: Float): RenderEffect {
+    val blur = BlurEffect(radiusPx, radiusPx, TileMode.Clamp).asAndroidRenderEffect()
+    val dim = android.graphics.ColorMatrixColorFilter(
+        floatArrayOf(keep, 0f, 0f, 0f, 0f, 0f, keep, 0f, 0f, 0f, 0f, 0f, keep, 0f, 0f, 0f, 0f, 0f, 1f, 0f)
+    )
+    return android.graphics.RenderEffect.createColorFilterEffect(dim, blur).asComposeRenderEffect()
 }
 
 /** One backdrop page of the pinned layer, sliding with the same offset the pager gives its page. */
@@ -507,10 +798,7 @@ private fun HeroArtPage(title: ShelfTitle, prefs: ArcPreferencesStore, slide: Fl
                 scaleX = 1.18f; scaleY = 1.18f
                 translationX = -slide * size.width * 0.1f
             })
-        Box(Modifier.fillMaxSize().background(Brush.verticalGradient(
-            0f to Color.Black.copy(alpha = 0.32f), 0.35f to Color.Transparent,
-            0.67f to Color.Black.copy(alpha = 0.68f), 0.84f to Color.Black.copy(alpha = 0.75f),
-            1f to JellyBackground)))
+        Box(Modifier.fillMaxSize().background(HeroScrim))
         // The reference recedes an adjacent card by scaling it down. Here the card is the whole
         // screen, so shrinking one would pull the background up between two pages; it recedes
         // into shadow instead, which reads the same way over a full-bleed picture.
@@ -519,7 +807,9 @@ private fun HeroArtPage(title: ShelfTitle, prefs: ArcPreferencesStore, slide: Fl
 }
 
 @Composable
-private fun CollectionRail(label: String, titles: List<ShelfTitle>, onAll: () -> Unit, onOpen: (ShelfTitle) -> Unit) {
+private fun CollectionRail(label: String, titles: List<ShelfTitle>, prefsStore: ArcPreferencesStore,
+                           savedIds: Set<Long>,
+                           onAll: () -> Unit, onOpen: (ShelfTitle) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalAlignment = Alignment.CenterVertically) {
             CollectionHeading(label, Modifier.weight(1f), small = true)
@@ -532,33 +822,74 @@ private fun CollectionRail(label: String, titles: List<ShelfTitle>, onAll: () ->
             modifier = Modifier.physicsBounceOverscroll(isHorizontal = true)
         ) {
             itemsIndexed(titles, key = { _, title -> title.group.key }) { index, title ->
-                StaggeredListItem(index) { CollectionPoster(title, Modifier.width(132.dp), onOpen) }
+                StaggeredListItem(index, "rail:$label:${title.group.key}") {
+                    CollectionPoster(title, Modifier.width(132.dp), prefsStore, savedIds, onOpen)
+                }
             }
         }
     }
 }
 
+/** One shelf card: the poster the title wears, its name, and what it is. */
 @Composable
-private fun CollectionPoster(title: ShelfTitle, modifier: Modifier, onOpen: (ShelfTitle) -> Unit) {
+private fun CollectionPoster(title: ShelfTitle, modifier: Modifier, prefsStore: ArcPreferencesStore,
+                             savedIds: Set<Long>, onOpen: (ShelfTitle) -> Unit) {
+    val artUrl = rememberShelfArtUrl(title, prefsStore)
     Column(modifier.jellyClick(role = Role.Button, onClickLabel = "View ${title.name}") { onOpen(title) },
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Box(Modifier.fillMaxWidth().aspectRatio(2f / 3f).clip(RoundedCornerShape(22.dp))) { CollectionArtwork(title.posterUrl) }
+        Box(Modifier.fillMaxWidth().aspectRatio(2f / 3f)
+            .graphicsLayer { clip = true; shape = RoundedCornerShape(22.dp) }) {
+            CollectionArtwork(artUrl)
+            // The mark of a film that will play with no signal at all, put on the picture rather than
+            // under it so a wall of posters still reads as pictures. It is the ledger's own answer — not
+            // Telegram's, which would cost one request per card to learn what a file on this device
+            // already says — and it waits for one kept copy in every part of the work, because a series
+            // with episode three saved is not a series you can watch offline, and a card that said
+            // otherwise would be the lie that gets someone onto a plane.
+            if (title.copySlots.isNotEmpty() && title.copySlots.all { slot -> slot.any { it in savedIds } }) {
+                Box(Modifier.align(Alignment.BottomStart).padding(8.dp).background(Color.Black.copy(alpha = 0.45f), CircleShape).padding(4.dp)) {
+                    Icon(
+                        imageVector = HugeIcons.Download,
+                        contentDescription = "Available offline",
+                        tint = Color.White,
+                        modifier = Modifier.size(12.dp)
+                    )
+                }
+            }
+        }
         Text(title.name, color = JellyOnSurface, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
         Text(if (title.isSeries) "Series" else "Movie", color = JellyOnSurfaceVariant, fontSize = 12.sp)
     }
 }
 
 @Composable
-private fun CollectionContinueCard(entry: CollectionResume, onPlay: () -> Unit) {
+private fun CollectionContinueCard(entry: CollectionResume, prefsStore: ArcPreferencesStore,
+                                   savedIds: Set<Long>, onPlay: () -> Unit) {
     val progress = entry.progress
     val part = entry.title?.group?.parts?.firstOrNull { it.id == progress.partId }
     val episode = part?.episode?.let { number -> part.season?.let { "S$it · E$number" } ?: "Episode $number" }
     val remaining = if (progress.lengthMs > 0L) "${(progress.remainingMs + 59_999L) / 60_000L}m left" else "Resume"
-    val caption = listOfNotNull(if (entry.local != null) "On Device" else "Telegram", episode, remaining).joinToString(" · ")
+    // The rail names the copy it is about to open, not the card that carries it: a film watched from
+    // `Movies/` is still a file on this phone even though its poster came off the channel.
+    val resume = entry.local ?: entry.title?.parts?.firstOrNull { it.stableId == progress.partId }
+        ?: entry.title?.representative
+    // "Offline" is the ledger's word, not Telegram's: this part's copy was verified byte for byte on this
+    // device, which is the one claim a flight cannot argue with. A channel file that says so without the
+    // entry behind it would promise a film the sweep has already handed back.
+    val caption = listOfNotNull(
+        when {
+            resume?.isOnPhone == true -> "On this phone"
+            progress.partId in savedIds -> "Offline"
+            else -> "On Telegram"
+        },
+        episode,
+        remaining
+    ).joinToString(" · ")
     Column(Modifier.width(248.dp).jellyClick(role = Role.Button, onClickLabel = "Resume ${entry.name}", onClick = onPlay),
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Box(Modifier.fillMaxWidth().height(140.dp).clip(RoundedCornerShape(22.dp))) {
-            if (entry.title != null) CollectionArtwork(entry.title.posterUrl) else entry.local?.let { CollectionLocalArtwork(it) }
+            val work = entry.title ?: entry.keptOf
+            if (work != null) CollectionShelfArt(work, prefsStore) else entry.local?.let { CollectionLocalArtwork(it) }
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.7f)))))
             Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.align(Alignment.Center)
                 .size(44.dp).background(Color.Black.copy(alpha = 0.35f), CircleShape).padding(8.dp))
@@ -574,6 +905,16 @@ private fun CollectionContinueCard(entry: CollectionResume, onPlay: () -> Unit) 
         Text(entry.name, fontSize = 15.sp, color = JellyOnSurface, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Text(caption, fontSize = 12.sp, color = JellyOnSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
+}
+
+/**
+ * One shelf title's artwork, asked through the store so the row redraws when the catalogue's wide shot
+ * lands. Read here rather than in a list's content lambda, which would freeze the row on whatever the
+ * first composition saw.
+ */
+@Composable
+private fun CollectionShelfArt(title: ShelfTitle, prefsStore: ArcPreferencesStore) {
+    CollectionArtwork(rememberShelfArtUrl(title, prefsStore))
 }
 
 @Composable
@@ -616,17 +957,60 @@ private fun CollectionSearchRow(name: String, source: String, onClick: () -> Uni
 }
 
 @Composable
-private fun CollectionHeading(text: String, modifier: Modifier = Modifier, small: Boolean = false) {
+internal fun CollectionHeading(text: String, modifier: Modifier = Modifier, small: Boolean = false) {
     Text(text, modifier.semantics { heading() }, color = JellyOnSurface, fontSize = if (small) 21.sp else 32.sp,
         fontWeight = FontWeight.Bold, lineHeight = if (small) 26.sp else 38.sp)
 }
 
+/**
+ * The Library screen's way into the Downloads page, with a dot while bytes are arriving.
+ *
+ * The dot is the part that has to be legible at a glance: from this screen a fetch is otherwise
+ * invisible, and the shade's progress row is collapsed, off, or buried under the dozen other things a
+ * phone notifies about. It animates rather than appearing, so a download started while the viewer is
+ * looking at the shelf reads as a change instead of as a mark that was always there.
+ */
 @Composable
-private fun CollectionPill(text: String, modifier: Modifier = Modifier, selected: Boolean = false, onClick: () -> Unit) {
+private fun CollectionDownloadsBadge(arriving: Int, onClick: () -> Unit) {
+    val live by animateFloatAsState(if (arriving > 0) 1f else 0f, label = "DownloadsBadgeLive")
+    Box(
+        Modifier.size(44.dp).clip(CircleShape).background(JellySurfaceContainer)
+            .jellyClick(role = Role.Button, onClickLabel = "Downloads") {
+                AppHaptics.click()
+                onClick()
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(HugeIcons.Download, "Downloads", tint = JellyOnSurface, modifier = Modifier.size(22.dp))
+        if (live > 0f) {
+            Box(
+                Modifier.align(Alignment.TopEnd).padding(3.dp).size(9.dp)
+                    .graphicsLayer { alpha = live; scaleX = live; scaleY = live }
+                    .clip(CircleShape).background(JellyAccent)
+            )
+        }
+    }
+}
+
+@Composable
+internal fun CollectionPill(text: String, modifier: Modifier = Modifier, selected: Boolean = false, onClick: () -> Unit) {
+    CollectionPill(modifier, selected, onClick) {
+        Text(text, color = if (selected) JellyOnPrimary else JellyOnSurface, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** The same pill with its own contents, for a hero action that carries more than a word. */
+@Composable
+internal fun CollectionPill(
+    modifier: Modifier = Modifier,
+    selected: Boolean = false,
+    onClick: () -> Unit,
+    content: @Composable () -> Unit
+) {
     Box(modifier.clip(RoundedCornerShape(28.dp)).background(if (selected) JellyPrimary else JellySurfaceContainer)
         .jellyClick(role = Role.Button, scaleDownTo = 0.95f, onClick = onClick)
         .heightIn(min = 48.dp).padding(horizontal = 18.dp, vertical = 12.dp), contentAlignment = Alignment.Center) {
-        Text(text, color = if (selected) JellyOnPrimary else JellyOnSurface, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        content()
     }
 }
 

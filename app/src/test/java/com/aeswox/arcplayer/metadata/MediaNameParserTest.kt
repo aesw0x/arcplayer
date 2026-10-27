@@ -15,6 +15,59 @@ class MediaNameParserTest {
     private fun parse(name: String) = MediaNameParser.parse(name, thisYear)
 
     @Test
+    fun aBracketedYearEndsTheNameEvenWhenTheTailIsFullOfWordsTheListDoesNotKnow() {
+        // Reported from the shelf. "chi" is the code for Mandarin and also the end of "Shang-Chi", so
+        // the first word read as a release tag, the name was cut to nothing, and a file with no name
+        // is never asked about at all — which is why it wore a grey box instead of a poster.
+        assertEquals(
+            MediaGuess.Movie("Shang-Chi and The Legend of The Ten Rings", 2021),
+            parse("Shang-Chi and The Legend of The Ten Rings (2021) DSNP WEB-DL.mkv")
+        )
+        assertEquals(MediaGuess.Movie("Ben-Hur", 1959), parse("Ben-Hur (1959) 1080p BluRay x264-PBS.mkv"))
+        assertEquals(MediaGuess.Movie("Kan", 2024), parse("Kan.2024.Tamil.1080p.mkv"))
+    }
+
+    @Test
+    fun everythingAfterTheYearIsTailWhateverItIsCalled() {
+        // The tag list is a bet about how uploaders type. The year is a fact about where the name
+        // ends, so an unknown tail costs nothing once the year is read as the boundary.
+        assertEquals(
+            MediaGuess.Movie("Inception", 2010),
+            parse("Inception (2010) ZZ9 UltraPack SomethingNew 1080p.mkv")
+        )
+    }
+
+    @Test
+    fun aTimestampIsNotReadAsAYear() {
+        // A device stamping its own export has a date glued together, and the digits inside it are not
+        // a year the catalogue can be searched with.
+        assertEquals(MediaGuess.Movie("Tokyo Story 20260805", null), parse("Tokyo Story 20260805.mkv"))
+    }
+
+    @Test
+    fun aYearStatedTwiceIsTheReleaseDateAndNotPartOfTheName() {
+        // Both of these are names someone typed with care, and both left the grey box on the shelf: the
+        // year written into the title and again in brackets puts the bare one inside the head, where a
+        // catalogue reads it as part of the name and answers nothing at all.
+        assertEquals(MediaGuess.Movie("Inception", 2010), parse("Inception 2010 (2010) English 720p.mkv"))
+        assertEquals(MediaGuess.Movie("Tenkon", 2025), parse("Tenkon 2025 (2025) {Tamil} [HQ] {HDRip}.mkv"))
+    }
+
+    @Test
+    fun aFranchiseWordInsideTheNameStaysWithIt() {
+        // The number that ends a title is its own, and the year comes after it — the cut is the year,
+        // not the first digit the tag list happens to recognise.
+        assertEquals(
+            MediaGuess.Episode("Avatar The Last Airbender", 1, 3, "The Switch Part 2"),
+            parse("Avatar The Last Airbender S01E03 The Switch Part 2 720p HEVC x264-EDHD [HQ].mkv")
+        )
+        assertEquals(
+            MediaGuess.Movie("The Book of Eli", 2010),
+            parse("The Book of Eli (2010) Multi-aud(Eng+Sp+Fre).mkv")
+        )
+    }
+
+    @Test
     fun anAmpersandIsPartOfTheNameAndNotNoise() {
         // Deleting the symbol left "Tom Jerry" as the query, which matches neither spelling the
         // catalogues use once TitleScore reads & as the word it stands for.
@@ -227,5 +280,17 @@ class MediaNameParserTest {
     fun aRealTitleThatMerelyStartsLikeAFileNumberStillGetsAsked() {
         assertEquals(MediaGuess.Movie("300", null), parse("300.mkv"))
         assertEquals(MediaGuess.Movie("Picnic", 1956), parse("Picnic.1956.1080p.mkv"))
+    }
+
+    @Test
+    fun anUnclosedBracketFromACutOffNameIsNoiseNotPartOfTheTitle() {
+        // The release block loses its closing bracket in transit, and an opener left behind is not a
+        // separator: "[English" is not the tag "english", so the cut that ends the title never fires
+        // and the app asks the catalogues for a film called "Ballerina [English".
+        assertEquals(
+            MediaGuess.Movie("Ballerina", 2025),
+            parse("Ballerina (2025) [English - 1080p HQ HDRip - x264 - [DDP 5..mkv")
+        )
+        assertEquals(MediaGuess.Movie("Inception", 2010), parse("Inception (2010) [English 1080p.mkv"))
     }
 }

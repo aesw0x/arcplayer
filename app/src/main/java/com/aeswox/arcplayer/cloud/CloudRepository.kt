@@ -1,11 +1,15 @@
 package com.aeswox.arcplayer.cloud
 
+import android.content.Context
+import android.content.Intent
 import android.os.SystemClock
 import android.system.Os
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.aeswox.arcplayer.stream.DeliveredRun
 import com.aeswox.arcplayer.stream.StreamWindow
 import com.aeswox.arcplayer.subtitle.SubtitleMatch
+import com.aeswox.arcplayer.ui.components.AppIntro
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -16,7 +20,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.drinkless.tdlib.TdApi
@@ -49,7 +56,17 @@ class CloudRepository(
     hasCredentials: Boolean,
     private val manifestPath: String,
     private val subtitleManifestPath: String,
+    private val ledgerPath: String,
     private val captionDirectory: String,
+    private val keptMedia: KeptMedia,
+    /**
+     * Used for one thing: starting and stopping [DownloadService], and posting what it shows.
+     *
+     * The application context, never the activity's. This object is owned by the process and outlives
+     * every screen, and the service it hosts has to be able to run after the last screen is gone — which
+     * is the entire reason it exists.
+     */
+    private val appContext: Context,
 ) {
 
     private val _authState = MutableStateFlow(CloudAuthMachine.initial(hasCredentials))
@@ -73,6 +90,50 @@ class CloudRepository(
     /** Keyed by TDLib file id, which is small and stable for the life of the client. */
     private val _progress = MutableStateFlow<Map<Int, CloudProgress>>(emptyMap())
     val progress: StateFlow<Map<Int, CloudProgress>> = _progress.asStateFlow()
+
+    /**
+     * The copies the viewer asked to keep, keyed by shelf stable id.
+     *
+     * This is the app's own promise, and it is the only thing that can tell a download from a leftover.
+     * TDLib has no word for "somebody meant this file to stay" — `PinFile` does not exist in this
+     * binding — so a finished offline film and a film abandoned in Recents answer every question the
+     * storage sweep asks identically, and the sweep deletes both unless something else is keeping score.
+     *
+     * Keyed by stable id rather than by file id, because a file id is a claim from whichever session
+     * wrote it down and TDLib hands those numbers out again.
+     */
+    private val _downloads = MutableStateFlow<Map<Long, DownloadEntry>>(emptyMap())
+    val downloads: StateFlow<Map<Long, DownloadEntry>> = _downloads.asStateFlow()
+
+    /**
+     * How far the films still arriving have come, in the form the notification shade draws.
+     *
+     * Kept here rather than inside [DownloadService] because the service is not the only reader: it needs
+     * this to name a notification when it is started, and the repository is the only place that knows
+     * which files are being fetched and how much of each has landed. Null between downloads, which is the
+     * signal the service stops on.
+     */
+    private val _downloadNotice = MutableStateFlow<DownloadNotices.Running?>(null)
+    val downloadNotice: StateFlow<DownloadNotices.Running?> = _downloadNotice.asStateFlow()
+
+    /**
+     * Files this launch is fetching whole, so nothing else may aim their download window.
+     *
+     * Session-only by design: a fetch that survived a restart is not running, and treating it as though
+     * it were would freeze the window planner on a file nobody is downloading.
+     */
+    private val fullFetches = ConcurrentHashMap<Int, Unit>()
+
+    @Volatile
+    private var ledgerRestored = false
+
+    /**
+     * One read-modify-write on the ledger at a time.
+     *
+     * A download, its pump and a relaunch of the shelf all touch the same map, and the promise is the
+     * only record of a film the viewer asked to keep: a lost update here is a copy the sweep deletes.
+     */
+    private val ledgerMutex = Mutex()
 
     private val _thumbnails = MutableStateFlow<Map<Long, ByteArray>>(emptyMap())
 
@@ -117,12 +178,42 @@ class CloudRepository(
     @Volatile
     private var strandedSwept = false
 
+    /**
+     * Whether the service that keeps fetches alive has been asked to run.
+     *
+     * Asked once per download rather than once per progress update: a start command redelivered every
+     * packet group would rebuild the notification it is trying not to rebuild twice.
+     */
+    @Volatile
+    private var downloadServiceWanted = false
+
+    /** The last state actually put on screen, which is the only thing a repaint can be judged against. */
+    @Volatile
+    private var downloadNoticePosted: DownloadNotices.Running? = null
+
+    /**
+     * One address for the fetch-keeping service, built the first time a film starts arriving.
+     *
+     * Reused for the stop as well as the start: [Context.stopService] matches the service by the
+     * component written on the intent, so it never needed the instance that started anything — a
+     * fresh intent per call reads like a no-op to a reader, and to the linter.
+     */
+    private val downloadServiceIntent: Intent by lazy { Intent(appContext, DownloadService::class.java) }
+
     init {
         scope.launch {
             bridge.authInputs.collect { input -> onAuthInput(input) }
         }
         scope.launch {
             bridge.updates.collect { update -> onUpdate(update) }
+        }
+        // The shade's copy of the download state, driven from the two flows it is made of so there is no
+        // third place that has to remember to say something. Every exit from a fetch changes one of them:
+        // the tap, the byte that lands, the copy that publishes, the give-up, the cancel, the removal.
+        scope.launch {
+            combine(_downloads, _progress) { entries, facts ->
+                DownloadNotices.running(entries, facts) { stableId -> titleOf(stableId) }
+            }.collect { notice -> renderDownloadNotice(notice) }
         }
     }
 
@@ -137,6 +228,10 @@ class CloudRepository(
      * native library, which is far too slow to do from a composition.
      */
     fun begin() {
+        // Its own launch: reading the promises off disk is a file read, and the shelf walk that follows
+        // hands the sweep its first chance to delete a saved film. Starting it here rather than waiting
+        // for the grid gives that sweep something to check against.
+        scope.launch { runCatching { restoreLedger() }.onFailure { Log.w(TAG, "download ledger", it) } }
         scope.launch {
             bridge.start()
             if (started) return@launch
@@ -431,8 +526,16 @@ class CloudRepository(
      *
      * Results are cached per chat because re-requesting is the difference between a tab that feels
      * instant and one that spins on every revisit.
+     *
+     * [walkChat] is moved off the caller's thread rather than left to inherit it. The screen asks for
+     * this from a `LaunchedEffect`, so without the switch everything in it that does not suspend —
+     * turning ~800 messages into cards, the thumbnail bytes, the caption scan — ran on the main thread
+     * inside the coldest window the app has. The requests themselves would just have resumed there.
      */
-    suspend fun loadVideos(chatId: Long, force: Boolean = false): List<CloudVideoItem> {
+    suspend fun loadVideos(chatId: Long, force: Boolean = false): List<CloudVideoItem> =
+        withContext(Dispatchers.Default) { walkChat(chatId, force) }
+
+    private suspend fun walkChat(chatId: Long, force: Boolean): List<CloudVideoItem> {
         if (!force) _videos.value[chatId]?.let { return it }
         val messages = searchByFilter(chatId, TdApi.SearchMessagesFilterVideo()) +
             searchByFilter(chatId, TdApi.SearchMessagesFilterDocument())
@@ -652,6 +755,7 @@ class CloudRepository(
             height = source.height,
             mimeType = source.mimeType ?: "video/mp4",
             supportsStreaming = source.supportsStreaming,
+            dateSec = message.date.toLong(),
         )
     }
 
@@ -822,6 +926,10 @@ class CloudRepository(
     }
 
     private suspend fun fetchHead(video: CloudVideoItem) {
+        // A ranged request is the one thing that can interrupt a download of the whole file, and a head
+        // request for 64 MB spent beside a film that is already arriving from byte zero is a worse trade
+        // than waiting for the fetch that is running.
+        if (fetchingWhole(video.fileId)) return
         bridge.call(
             TdApi.DownloadFile(video.fileId, PRIORITY, 0L, CloudWindowPlanner.DEFAULT_WINDOW_BYTES, false)
         )
@@ -854,6 +962,14 @@ class CloudRepository(
      * but the record is still being believed, and only Telegram can stop believing it.
      */
     private suspend fun dropRecord(video: CloudVideoItem): TdApi.File? {
+        // A copy the viewer asked to keep is not healed by taking it away, however much its record
+        // looks like the lying kind. And the case this guard exists for is the one where the record is
+        // telling the truth: a whole file that has been stretched by an open reports its full length and
+        // an allocation that only looks like a hole to a rule written for sparse windows.
+        if (promised(video.stableId)) {
+            Log.i(TAG, "kept copy file=${video.fileId} has a stale-looking record and is left alone")
+            return tryCall(TdApi.GetFile(video.fileId))
+        }
         Log.w(TAG, "dropping stale record for file ${video.fileId}")
         tryCall(TdApi.CancelDownloadFile(video.fileId, false))
         tryCall(TdApi.DeleteFile(video.fileId))
@@ -938,15 +1054,17 @@ class CloudRepository(
     }
 
     /**
-     * How many bytes the player could read right now at and ahead of [readPositionBytes], or null
-     * when Telegram did not answer inside a round trip.
+     * How many bytes the player could read right now at and ahead of [readPositionBytes] with nothing
+     * still arriving, or null when Telegram did not answer inside a round trip.
      *
      * The stall watchdog asks this on its own because the play head has stopped, and that is exactly
      * the moment the window's usual reporting route goes quiet. Only bytes actually on disk count:
-     * a ranged fetch in flight reports an empty prefix, which is the honest answer when the question
-     * is whether there is enough film to press play again.
+     * a ranged fetch in flight reports a prefix that will cover them shortly, and a player re-opened
+     * at the far end of what has landed reads zeroes and calls them the end of the film. Measured on
+     * the phone as a restart taken "with 48557525 bytes ahead" three milliseconds after a poll that
+     * said the window carrying those bytes was still downloading.
      */
-    suspend fun readableAhead(video: CloudVideoItem, readPositionBytes: Long): Long? {
+    suspend fun settledAhead(video: CloudVideoItem, readPositionBytes: Long): Long? {
         val facts = pollFacts(video.fileId) ?: return null
         publishProgress(video.fileId, facts)
         return StreamWindow.readableBytes(
@@ -955,11 +1073,17 @@ class CloudRepository(
             windowStart = facts.downloadOffset,
             windowLength = facts.downloadedPrefixSize,
             completed = facts.isDownloadingCompleted,
-            alreadyDelivered = deliveredRuns[video.fileId] ?: DeliveredRun.NONE
+            alreadyDelivered = deliveredRuns[video.fileId] ?: DeliveredRun.NONE,
+            includeInFlight = false
         )
     }
 
     private suspend fun aimWindowAt(video: CloudVideoItem, readPositionBytes: Long) {
+        // While a whole-file fetch owns this id, the play head does not get to move the window. The
+        // planner's job is to keep bytes arriving ahead of playback, and a fetch starting at byte zero
+        // is already doing that for all of them; re-aiming it would be a seek trading a finished
+        // download away for the next few megabytes. The pump publishes the progress this would have.
+        if (fetchingWhole(video.fileId)) return
         val facts = pollFacts(video.fileId) ?: return
         // Whoever moves the window has just asked Telegram about the file, so this is the poll that
         // can answer the loading line. A readout fed only by the waits goes still the moment nothing
@@ -1186,8 +1310,14 @@ class CloudRepository(
         val room = video.sizeBytes - cuesOffset
         if (room <= 0L) return false
         val limit = minOf(CUES_READ_BYTES, room)
+        // A download has this file coming from byte zero already, so the index is not worth a window of
+        // its own: it will land on the way to the rest of the film. This turns into a wait rather than a
+        // fetch, on the same budget, and a seek that arrives before it does falls back to the
+        // proportional byte guess the way a file with no cue table always does.
+        val downloading = fetchingWhole(video.fileId)
         val ask = suspend {
-            cappedCall(TdApi.DownloadFile(video.fileId, PRIORITY, cuesOffset, limit, false))
+            if (downloading) null
+            else cappedCall(TdApi.DownloadFile(video.fileId, PRIORITY, cuesOffset, limit, false))
         }
         ask()
         // Each poll is a TDLib round trip that can itself take seconds while the network is busy, so
@@ -1211,7 +1341,7 @@ class CloudRepository(
                 ) {
                     return true
                 }
-                if (watch.shouldRedirect(facts, giveUpAt)) {
+                if (!downloading && watch.shouldRedirect(facts, giveUpAt)) {
                     Log.i(TAG, "redirect file=${video.fileId} wanted=$cuesOffset (cue table)")
                     cappedCall(TdApi.CancelDownloadFile(video.fileId, false))
                     // The play-head planner would aim a whole window here, so the exact range is
@@ -1332,6 +1462,13 @@ class CloudRepository(
      * can the aim be re-planned from what is actually on disk.
      */
     private suspend fun redirectWindow(video: CloudVideoItem, positionBytes: Long) {
+        // The cancel is the dangerous half of this pair while a download is running: it would take back
+        // the whole-file fetch, and the aim that follows would put a 64 MB window where an offline film
+        // was being built. A seek into a film that is arriving anyway waits for it to arrive.
+        if (fetchingWhole(video.fileId)) {
+            Log.i(TAG, "seek waits for the download file=${video.fileId} wanted=$positionBytes")
+            return
+        }
         Log.i(TAG, "redirect file=${video.fileId} wanted=$positionBytes")
         cappedCall(TdApi.CancelDownloadFile(video.fileId, false))
         aimWindowAt(video, positionBytes)
@@ -1389,6 +1526,14 @@ class CloudRepository(
      */
     suspend fun forgetCopy(video: CloudVideoItem) {
         val fileId = video.fileId
+        // The second of the two doors a saved film can leave through: every watch closes by putting its
+        // file down, and a copy the viewer pressed Download on is watched like any other. Only the
+        // player's claim on it goes; the bytes and the running fetch stay exactly where they are.
+        if (promised(video.stableId)) {
+            inUse.remove(fileId)
+            Log.i(TAG, "kept title=${video.title} file=$fileId put down without deleting")
+            return
+        }
         tryCall(TdApi.CancelDownloadFile(fileId, false))
         val deleted = tryCall(TdApi.DeleteFile(fileId)) != null
         deliveredRuns.remove(fileId)
@@ -1399,6 +1544,424 @@ class CloudRepository(
     }
 
     /**
+     * Keep a copy of a shelf file on this device, and keep it past the end of the watch.
+     *
+     * The whole-file request is [TdApi.DownloadFile] with no limit, which is the same primitive
+     * [awaitCaption] uses for a few kilobytes of subtitle. What makes it a download rather than a bigger
+     * cache window is the promise written next to it: without that line the bytes are indistinguishable
+     * from a leftover and the launch sweep hands them back, and with it nothing in the app may delete
+     * them — not [forgetCopy] when the player closes, not [dropRecord] when a record looks stale, not the
+     * sweep when the shelf is walked.
+     *
+     * Nothing here survives a restart except the promise. TDLib does resume a partial download on its
+     * own, but the pump that verifies the bytes does not, so [restoreLedger] keeps only what it can
+     * confirm is whole.
+     */
+    suspend fun download(video: CloudVideoItem) {
+        val fileId = video.fileId
+        restoreLedger()
+        if (_downloads.value[video.stableId]?.isComplete == true) return
+        if (fetchingWhole(fileId)) return
+        fullFetches[fileId] = Unit
+        // The row is asked for here, with the promise, rather than when the bytes land — so the name is
+        // taken the moment the viewer asks, and a fetch interrupted halfway leaves a pending row that
+        // nothing but this app can see and a launch sweep deletes, instead of a film in the gallery that
+        // plays for two minutes and stops.
+        val handle = keptMedia.reserve(DownloadLedger.fileNameFor(video.title))
+        if (handle == null) {
+            fullFetches.remove(fileId)
+            Log.w(TAG, "download refused title=${video.title} file=$fileId, no folder to keep it in")
+            return
+        }
+        updateLedger { entries ->
+            entries + (video.stableId to DownloadEntry(
+                stableId = video.stableId,
+                chatId = video.chatId,
+                messageId = video.messageId,
+                fileId = fileId,
+                sizeBytes = video.sizeBytes,
+                path = handle,
+                isComplete = false,
+            ))
+        }
+        // The request goes out before TDLib has answered for it — `bridge.call` sends as it suspends and
+        // a late reply does not undo it — so a round trip that timed out is a fetch that is running, not
+        // one that failed. The pump finds out which it was, and asks again if the bytes stopped moving.
+        val answered = tryCall(TdApi.DownloadFile(fileId, PRIORITY, 0L, 0L, false))
+        Log.i(
+            TAG,
+            "download start title=${video.title} file=$fileId size=${video.sizeBytes} " +
+                "answered=${answered != null} into=$handle"
+        )
+        scope.launch {
+            runCatching { pumpDownload(video) }
+                .orCancelled()
+                .onFailure { Log.w(TAG, "download pump file=$fileId", it) }
+        }
+    }
+
+    /**
+     * Take the promise back, which is the only honest meaning of a cancel.
+     *
+     * The fetch is broken off and the line is deleted, but the bytes already landed are not touched:
+     * a partial copy with nobody asking for it is exactly what the launch sweep was built to reclaim,
+     * and reaching for the path by hand is the move that has hung every film this app ever broke.
+     */
+    suspend fun cancelDownload(video: CloudVideoItem) {
+        fullFetches.remove(video.fileId)
+        tryCall(TdApi.CancelDownloadFile(video.fileId, false))
+        val handle = _downloads.value[video.stableId]?.path.orEmpty()
+        updateLedger { it - video.stableId }
+        _progress.value = _progress.value - video.fileId
+        keptMedia.release(handle)
+        Log.i(TAG, "download cancelled title=${video.title} file=${video.fileId}")
+    }
+
+    /**
+     * Stop keeping a film that already landed, and take its bytes off the device.
+     *
+     * The promise goes first because [forgetCopy] refuses to touch a copy the viewer is keeping, and
+     * that refusal is the reason this is a separate call: pressing "Remove download" is the one moment
+     * the app is told it may give the bytes back.
+     *
+     * Two copies can leave, and they leave differently on purpose. Telegram's goes through [forgetCopy],
+     * the single door every other exit uses, because a record left naming bytes that are gone is how a
+     * later open plays a hole. Ours goes by its row, and the catalog unlinks the file with it — which is
+     * also why the film disappears from the gallery at the same moment it stops being offline here,
+     * rather than staying behind as a file nobody promised to keep.
+     */
+    suspend fun removeDownload(video: CloudVideoItem) {
+        fullFetches.remove(video.fileId)
+        val handle = _downloads.value[video.stableId]?.path.orEmpty()
+        updateLedger { it - video.stableId }
+        keptMedia.release(handle)
+        Log.i(TAG, "download removed title=${video.title} file=${video.fileId} kept=$handle")
+        forgetCopy(video)
+    }
+
+    /**
+     * Stop putting the film down because the bytes stopped arriving, not because a clock ran out.
+     *
+     * A four gigabyte file on a slow link takes an hour and is going fine the whole way; a budget
+     * measured in minutes would call that a failure. So the wait is on movement: a re-ask whenever the
+     * record reports the same byte count with nothing running, and a give-up once re-asking has stopped
+     * changing anything.
+     */
+    private suspend fun pumpDownload(video: CloudVideoItem) {
+        val fileId = video.fileId
+        val sizeBytes = video.sizeBytes
+        try {
+            var landedBytes = -1L
+            var movedAt = SystemClock.elapsedRealtime()
+            var asks = 1
+            var stores = 0
+            while (fetchingWhole(fileId)) {
+                val file = tryCall(TdApi.GetFile(fileId))
+                if (file != null) {
+                    val facts = file.toWindowFacts()
+                    // The same readout the player's loading line uses, so the download button has a
+                    // fraction to draw without opening a second progress channel.
+                    publishProgress(fileId, facts)
+                    val landed = existingPath(file)
+                    // Telegram's own "I have stopped writing here" is asked for alongside the byte count
+                    // because the two fail differently. Blocks measure what the filesystem committed, and
+                    // on a big film they reach the promised size while the last of it is still being
+                    // flushed — which is how a copy started a second too early comes out a different
+                    // length than the file it was reading.
+                    if (
+                        landed != null && facts.isDownloadingCompleted &&
+                        DownloadLedger.hasEveryByte(sizeBytes, allocatedBytes(landed))
+                    ) {
+                        val outcome = promoteDownload(video, landed, facts.fileSizeBytes)
+                        if (outcome == PublishOutcome.Held) return
+                        stores++
+                        // A row that is gone is not a race: the viewer cancelled, or the ledger lost the
+                        // line, and asking again cannot bring it back.
+                        if (outcome == PublishOutcome.NoHandle || stores >= MAX_STORE_ATTEMPTS) {
+                            giveUpDownload(
+                                video,
+                                "$outcome after $stores offer${if (stores == 1) "" else "s"} of a file that " +
+                                    "arrived in full (source=${allocatedBytes(landed)} of $sizeBytes)",
+                                DownloadFailure.WOULD_NOT_STORE,
+                            )
+                            return
+                        }
+                        // The promise stays written and the row stays reserved between attempts, because
+                        // the alternative is what this used to be: one refused copy deleted the record of
+                        // a film whose every byte was sitting on the device, and the next launch sweep
+                        // handed Telegram's copy back as unclaimed.
+                        Log.w(
+                            TAG,
+                            "download not stored file=$fileId — $outcome, offering it again in ${STORE_RETRY_MS}ms"
+                        )
+                        delay(STORE_RETRY_MS)
+                        continue
+                    }
+                    if (facts.downloadedSizeBytes > landedBytes) {
+                        landedBytes = facts.downloadedSizeBytes
+                        movedAt = SystemClock.elapsedRealtime()
+                    } else if (SystemClock.elapsedRealtime() - movedAt > FULL_DOWNLOAD_STALL_MS) {
+                        if (asks >= MAX_FULL_FETCH_ASKS) {
+                            giveUpDownload(
+                                video,
+                                "nothing arrived for ${FULL_DOWNLOAD_STALL_MS / 1000}s across " +
+                                    "$MAX_FULL_FETCH_ASKS asks, landed=${facts.downloadedSizeBytes}",
+                                DownloadFailure.STOPPED_ARRIVING,
+                            )
+                            return
+                        }
+                        asks++
+                        movedAt = SystemClock.elapsedRealtime()
+                        Log.i(TAG, "download stalled file=$fileId at=${facts.downloadedSizeBytes}, asking again")
+                        tryCall(TdApi.DownloadFile(fileId, PRIORITY, 0L, 0L, false))
+                    }
+                }
+                delay(FULL_DOWNLOAD_POLL_MS)
+            }
+        } finally {
+            // Whatever happened — completed, gave up, cancelled, or threw — the window is somebody
+            // else's business again from this moment.
+            fullFetches.remove(fileId)
+        }
+    }
+
+    /**
+     * Put a whole film in the device's catalog, and only then promise it.
+     *
+     * The order is the entire fix, twice over. TDLib's file tree is the one TDLib holds the keys to, and
+     * it uses them: a 1.85 GB copy that this pump had verified byte for byte was gone by the next launch,
+     * and the ledger — which had been pointed straight at Telegram's copy of it — correctly noticed the
+     * file was missing and dropped the promise. Anything meant to outlive Telegram's interest in it has
+     * to sit where Telegram cannot reach. And it has to sit where the rest of the phone can, which rules
+     * out this app's own corner of storage as surely as it rules out Telegram's: Android hides
+     * `Android/data` from the media catalog, so a film filed there is offline and invisible at once.
+     *
+     * Returns which of its clauses the catalog ended up applying, so the pump can tell a film that is
+     * holding from one that the copy refused and say which refusal it was.
+     */
+    private suspend fun promoteDownload(
+        video: CloudVideoItem,
+        source: String,
+        telegramSizeBytes: Long
+    ): PublishOutcome {
+        val stableId = video.stableId
+        val fileId = video.fileId
+        val handle = _downloads.value[stableId]?.path.orEmpty()
+        if (!DownloadLedger.isCatalogHandle(handle)) {
+            Log.w(TAG, "download has no reserved row file=$fileId")
+            return PublishOutcome.NoHandle
+        }
+        val published = keptMedia.publish(handle, source, video.sizeBytes)
+        if (published != PublishOutcome.Held) return published
+        updateLedger { entries ->
+            val entry = entries[stableId] ?: return@updateLedger entries
+            entries + (stableId to entry.copy(isComplete = true))
+        }
+        // Said here rather than from the service that was watching, because this is the one moment that
+        // knows the film is genuinely on the device: every byte has landed, been copied, and been checked
+        // against the length the shelf promised. A row posted after that is worth the sound it makes.
+        // It goes before the Telegram round trip below, which can time out on a bad link and would
+        // otherwise delay the news of a film that is already sitting there finished.
+        DownloadNotifier.postFinished(appContext, video.title, video.sizeBytes)
+        // Telegram may have its space back, since the film no longer depends on it. Left alone, the
+        // viewer is paying for the same film twice.
+        //
+        // Unless something is reading Telegram's copy right now. A watch that started before the down-
+        // load finished is streaming from exactly the file this would delete, and pulling the ground out
+        // from under a playing film is the failure every other rule in this file is built to avoid — so
+        // the duplicate stays, and the log says so rather than the app silently holding two copies.
+        if (inUse.containsKey(fileId)) {
+            Log.i(TAG, "download kept file=$fileId duplicate left in Telegram's folder, a watch owns it")
+        } else {
+            val released = tryCall(TdApi.DeleteFile(fileId)) != null
+            deliveredRuns.remove(fileId)
+            cueTables.remove(fileId)
+            Log.i(
+                TAG,
+                "download kept title=${video.title} file=$fileId kept=$handle " +
+                    "where=${keptMedia.pathOf(handle)} telegramSize=$telegramSizeBytes released=$released"
+            )
+        }
+        return PublishOutcome.Held
+    }
+
+    /**
+     * The fetch is not coming, or will not land, so stop promising the film and let the usual rules
+     * decide its bytes.
+     *
+     * Dropping the entry is the whole give-up: the button goes back to idle, and a partial copy that
+     * nobody asked for becomes what the launch sweep already knows how to reclaim. The row goes with it,
+     * because a pending row is invisible to everything except this app and would otherwise be left here
+     * forever holding a half-copied film nobody is waiting for.
+     *
+     * It says so out loud because a give-up that happens while the app is in a pocket is otherwise
+     * invisible: the ring would simply be idle again next time the shelf was opened, and a person who
+     * left a four gigabyte film downloading has no way to tell that it stopped from that.
+     */
+    private suspend fun giveUpDownload(video: CloudVideoItem, logLine: String, failure: DownloadFailure) {
+        val stableId = video.stableId
+        val handle = _downloads.value[stableId]?.path.orEmpty()
+        updateLedger { it - stableId }
+        keptMedia.release(handle)
+        DownloadNotifier.postFailed(appContext, video.title, failure.viewerLine)
+        Log.w(TAG, "download given up file=${video.fileId} — $logLine")
+    }
+
+    /**
+     * The two ways a fetch ends without a film, each with the sentence the viewer gets.
+     *
+     * Split from the log line because they are true for different reasons: one is a device that ran out
+     * of room, and the other is a connection that stopped answering. Telling a person "Telegram stopped
+     * sending it" when the storage folder refused the copy would send them to check their wifi.
+     */
+    private enum class DownloadFailure(val viewerLine: String) {
+        WOULD_NOT_STORE("No room to save it, or the media folder turned it away."),
+        STOPPED_ARRIVING("Telegram stopped sending it. Try again when the connection is steadier."),
+    }
+
+    /**
+     * How far the films still arriving have come, and what the phone should be told about it.
+     *
+     * Started once per download rather than once per update: an already-running service does not need to
+     * be told again that it is running, and its start command rebuilds the notification every time it is.
+     * Stopping is the mirror image, and the row goes with the service so no download progress is left
+     * hanging on the shade after nothing is arriving.
+     */
+    private fun renderDownloadNotice(next: DownloadNotices.Running?) {
+        if (next == null) {
+            val hadWork = _downloadNotice.value != null
+            _downloadNotice.value = null
+            downloadNoticePosted = null
+            if (!hadWork) return
+            if (downloadServiceWanted) {
+                appContext.stopService(downloadServiceIntent)
+                downloadServiceWanted = false
+            }
+            DownloadNotifier.clearRunning(appContext)
+            return
+        }
+        _downloadNotice.value = next
+        if (!downloadServiceWanted && startKeepAwake()) {
+            downloadServiceWanted = true
+        }
+        if (!DownloadNotices.needsRepaint(downloadNoticePosted, next)) return
+        downloadNoticePosted = next
+        DownloadNotifier.postRunning(appContext, next)
+    }
+
+    /**
+     * Ask for the service that holds the process open while bytes are arriving.
+     *
+     * Refused out loud rather than allowed to throw. Android answers a background start of a foreground
+     * service with an exception on Android 12 and up, and the collector that decides this is a coroutine
+     * on the download scope — left alone, one late start would take the fetches down with it, and the rows
+     * already on screen. Leaving [downloadServiceWanted] false means the next progress tick asks again,
+     * which is all that is left to do: the fetch continues either way, only the protection is missing.
+     */
+    private fun startKeepAwake(): Boolean =
+        runCatching { ContextCompat.startForegroundService(appContext, downloadServiceIntent) }
+            .onFailure { Log.w(TAG, "download service could not be started; fetch runs unprotected", it) }
+            .isSuccess
+
+    /**
+     * The name a film is known by on the shelf, or a plain word when the shelf has not answered yet.
+     *
+     * The card a download was tapped from is always in [videos], so this is a lookup and not a guess; the
+     * fallback is for the moment after a restart when a fetch is somehow running before the walk has
+     * filled the grid, and an empty title is a notification with nothing to read.
+     */
+    private fun titleOf(stableId: Long): String {
+        val named = _videos.value.values.asSequence()
+            .flatMap { it.asSequence() }
+            .firstOrNull { item -> item.stableId == stableId }
+            ?.title
+            .orEmpty()
+        return named.ifBlank { "Download" }
+    }
+
+    /**
+     * The handle to read this film from when the viewer kept it, or null when they did not.
+     *
+     * Answers from the promise alone, with no TDLib round trip, which is the point: a copy that has been
+     * verified byte for byte does not need Telegram to still be able to name it before the player can
+     * open it. The row check is the only re-ask, because the viewer can delete the film from the gallery
+     * without telling this app, and a handle handed over after that plays a hole.
+     *
+     * Suspends for that one query and does it off the main thread. The only caller is the player's open,
+     * which is the busiest moment this app spends on its main thread and the one already paid for once
+     * with an ANR.
+     */
+    suspend fun downloadedHandleFor(video: CloudVideoItem): String? {
+        val entry = _downloads.value[video.stableId] ?: return null
+        if (!entry.isComplete || !DownloadLedger.isCatalogHandle(entry.path)) return null
+        return entry.path.takeIf { keptMedia.isHeld(it) }
+    }
+
+    /** Whether the viewer asked to keep this shelf entry's copy — a reason never to delete it. */
+    private fun promised(stableId: Long): Boolean = _downloads.value.containsKey(stableId)
+
+    /** Whether a whole-file fetch of this id is running in this session, so its window is spoken for. */
+    private fun fetchingWhole(fileId: Int): Boolean = fullFetches.containsKey(fileId)
+
+    /**
+     * Read the promises back, and keep only the ones the device can still honor.
+     *
+     * Public because two callers have to be sure the read has happened before they act on an answer from
+     * these maps: the sweep, or a saved film would be reclaimed at launch, and the player's open, or a
+     * film on a plane would fall through to a network that cannot answer it. It returns at once once the
+     * first read has landed, so awaiting it is free for everybody after that.
+     *
+     * On the IO dispatcher for the same reason the shelf manifest is: this runs while the grid is being
+     * drawn, and a file read on the main thread is a frame that does not arrive.
+     *
+     * Anything incomplete is dropped rather than carried. A download interrupted by the app dying is not
+     * running when this answers, so an entry kept here would draw a ring around nothing and protect a
+     * partial copy from the sweep that exists to reclaim it.
+     *
+     * A line that does not name a catalog row is dropped too, and that is aimed at two specific pasts:
+     * the first build of this feature wrote down wherever Telegram happened to have the file, which for a
+     * whole-document fetch was Telegram's temporary directory — the one directory Telegram is entitled to
+     * empty, and did — and the second wrote down a path inside this app's own corner of storage, which
+     * survives but which no other app on the phone can see. Both read as a download to start again.
+     */
+    suspend fun restoreLedger() {
+        if (ledgerRestored) return
+        ledgerMutex.withLock {
+            if (ledgerRestored) return
+            // Whatever a copy cut short left behind is ours to reclaim. A pending row is invisible to
+            // every other app and to the gallery, so this needs none of the care the shelf sweep takes
+            // with Telegram's files.
+            keptMedia.discardUnfinished()
+            val decoded = withContext(Dispatchers.IO) {
+                val text = runCatching { File(ledgerPath).readText() }.getOrNull().orEmpty()
+                DownloadLedger.decode(text)
+            }
+            val survivors = decoded.filterValues { entry ->
+                entry.isComplete &&
+                    DownloadLedger.isCatalogHandle(entry.path) &&
+                    keptMedia.isHeld(entry.path)
+            }
+            if (decoded.size > survivors.size) {
+                Log.i(TAG, "ledger dropped ${decoded.size - survivors.size} unkeepable promises")
+            }
+            _downloads.value = survivors
+            ledgerRestored = true
+            if (survivors.isNotEmpty()) {
+                Log.i(TAG, "ledger restored ${survivors.size} kept copies from the media catalog")
+            }
+        }
+    }
+
+    private suspend fun updateLedger(change: (Map<Long, DownloadEntry>) -> Map<Long, DownloadEntry>) {
+        ledgerMutex.withLock {
+            _downloads.value = change(_downloads.value)
+            val text = DownloadLedger.encode(_downloads.value.values)
+            withContext(Dispatchers.IO) { runCatching { File(ledgerPath).writeText(text) } }
+                .onFailure { Log.w(TAG, "download ledger could not be written", it) }
+        }
+    }
+
+    /**
      * Once this launch has a shelf list straight from Telegram, hand back the copies no watch of this
      * session owns.
      *
@@ -1406,12 +1969,21 @@ class CloudRepository(
      * manifest's ids are a cache of an older conversation with Telegram, and measured on a phone they
      * mostly no longer answer: 58 of 61 came back refused, which is a sweep that reclaims nothing while
      * reporting itself done. Storage has no deadline, so it waits for ids that are live.
+     *
+     * It also waits until the app has finished arriving. The walk hands this the shelf's ids and it
+     * immediately asks Telegram about every one of them with `GetFile` — 61 requests on the same client
+     * threads the walk is still using, behind a ledger read off the disk — and it would do all of that
+     * while the home is drawing itself for the first time. Nothing here is urgent; the only price of
+     * holding it back is that the bytes it reclaims wait about a second and a half longer.
      */
     private fun scheduleStrandedSweep() {
         if (strandedSwept) return
         scope.launch {
+            AppIntro.awaitHomeRelease()
             runCatching { sweepStrandedDownloads() }
                 .onFailure { Log.w(TAG, "stranded download sweep", it) }
+            runCatching { adoptLegacyKeeps() }
+                .onFailure { Log.w(TAG, "legacy keep adoption", it) }
         }
     }
 
@@ -1436,6 +2008,10 @@ class CloudRepository(
      */
     private suspend fun sweepStrandedDownloads() {
         if (strandedSwept) return
+        // Awaited rather than assumed. The restore runs on its own launch when the tab opens and this
+        // fires off the shelf walk, so without the wait a sweep that got there first would delete every
+        // offline film on the device — and the promises with it, since only this pass writes back.
+        restoreLedger()
         val shelf = _videos.value.values.flatten()
         if (shelf.isEmpty()) return
         strandedSwept = true
@@ -1458,7 +2034,12 @@ class CloudRepository(
             // Read live, and read again after the round trip: a film the viewer tapped while Telegram
             // was answering is no longer a leftover, and the walk takes long enough for that to happen
             // on a shelf this size.
-            when (val verdict = DownloadSweep.verdict(claim, record, inUse.containsKey(item.fileId))) {
+            when (val verdict = DownloadSweep.verdict(
+                claim,
+                record,
+                inUse = inUse.containsKey(item.fileId),
+                kept = promised(item.stableId),
+            )) {
                 DownloadSweep.Verdict.STRANDED -> {
                     forgetCopy(item)
                     put++
@@ -1494,6 +2075,63 @@ class CloudRepository(
             "sweep put down $put of ${shelf.size} shelf copies, $held bytes their records claimed" +
                 if (reasons.isEmpty()) "" else " (left: $reasons)"
         )
+    }
+
+    /**
+     * Re-file the films an earlier build kept where nothing else on the phone could see them.
+     *
+     * Before the media catalog there was a version of this feature that wrote kept films into this app's
+     * own corner of external storage. The bytes there are durable and whole — Android simply hides that
+     * directory from the catalog, which is the one thing a kept film was supposed to stop being. And the
+     * ledger line naming it is dropped by [restoreLedger] as unkeepable, a correct verdict about a handle
+     * and a wrong one about the file, so the film ends up on the device, taking up its gigabyte, in no
+     * list anywhere. This is the pass that turns the file back into a handle.
+     *
+     * It runs off the shelf walk rather than at launch because the file's name is all the old line
+     * carried: the chat, the message and the file id are read back from the copy they came from, and
+     * without the shelf there is nothing to read them off.
+     */
+    private suspend fun adoptLegacyKeeps() {
+        val shelf = _videos.value.values.flatten()
+        if (shelf.isEmpty()) return
+        val stranded = withContext(Dispatchers.IO) {
+            val folder = appContext.getExternalFilesDir(null)?.let { File(it, LEGACY_KEEP_FOLDER) }
+                ?.takeIf { it.isDirectory } ?: return@withContext emptyList()
+            folder.listFiles()?.filter { it.isFile }.orEmpty()
+        }
+        if (stranded.isEmpty()) return
+        val byName = shelf.associateBy { DownloadLedger.fileNameFor(it.title) }
+        for (file in stranded) {
+            val item = byName[file.name] ?: continue
+            if (promised(item.stableId)) continue
+            if (!DownloadLedger.hasEveryByte(item.sizeBytes, file.length())) {
+                Log.i(TAG, "legacy keep ${file.name} holds ${file.length()} of ${item.sizeBytes}, left where it is")
+                continue
+            }
+            val handle = keptMedia.reserve(file.name) ?: continue
+            // One offer, not the three the pump gives a download: this pass runs off a shelf walk rather
+            // than a live fetch, so there is nothing to re-check against and the row would sit pending
+            // until the next launch. The old file stays wherever it is either way.
+            if (keptMedia.publish(handle, file.path, item.sizeBytes) != PublishOutcome.Held) {
+                keptMedia.release(handle)
+                continue
+            }
+            updateLedger { entries ->
+                entries + (item.stableId to DownloadEntry(
+                    stableId = item.stableId,
+                    chatId = item.chatId,
+                    messageId = item.messageId,
+                    fileId = item.fileId,
+                    sizeBytes = item.sizeBytes,
+                    path = handle,
+                    isComplete = true,
+                ))
+            }
+            // Every byte has been copied, counted and published by now, so the hidden file is the
+            // duplicate of the two — and a duplicate in a directory nobody can list only ever takes room.
+            val removed = runCatching { file.delete() }.getOrDefault(false)
+            Log.i(TAG, "legacy keep adopted title=${item.title} into=$handle oldCopyRemoved=$removed")
+        }
     }
 
     /**
@@ -1585,6 +2223,50 @@ class CloudRepository(
          * refuses the request outright.
          */
         const val PRIORITY = 32
+
+        /**
+         * How often the download pump asks Telegram how far the whole-file fetch has come.
+         *
+         * Slower than a play-head poll because nothing is waiting on it to draw: the ring reads the
+         * same published progress either way, and every one of these polls is a TDLib round trip that
+         * queues behind the transfer it is asking about.
+         */
+        const val FULL_DOWNLOAD_POLL_MS = 1_000L
+
+        /** How long a whole-file fetch may report the same byte count before this app asks again. */
+        const val FULL_DOWNLOAD_STALL_MS = 180_000L
+
+        /**
+         * How many times a stalled fetch is re-asked before the promise is taken back.
+         *
+         * A download that has stopped moving is usually a link that went away rather than a file that
+         * cannot be fetched, so the retries are few and far between: three asks spread over nine minutes
+         * covers a tunnel and then stops pretending.
+         */
+        const val MAX_FULL_FETCH_ASKS = 3
+
+        /**
+         * How many times a film that arrived in full is offered to the catalog before it is called a
+         * failure.
+         *
+         * More than one because the moment of completion is exactly when the copy is most likely to be
+         * wrong: the last blocks are still being committed, and a copy that reads a file Telegram has not
+         * finished closing comes out a different length than the one it started from. One offer and its
+         * failure used to delete the record of a download whose every byte was on the device, and the next
+         * launch sweep then handed Telegram's copy back — so a finished 2.87 GB film was thrown away
+         * because of a beat that went wrong, and re-pressing the button a minute later took two seconds.
+         */
+        const val MAX_STORE_ATTEMPTS = 3
+
+        /** How long between two offers, which is roughly how long a commit the kernel is behind takes. */
+        const val STORE_RETRY_MS = 5_000L
+
+        /**
+         * The folder the build before the media catalog filed kept films in, under this app's own corner
+         * of external storage. Nothing can list what is in there but this app, which is why [KeptMedia]
+         * replaced it.
+         */
+        const val LEGACY_KEEP_FOLDER = "Arc Player"
 
         const val POLL_INTERVAL_MS = 150L
 

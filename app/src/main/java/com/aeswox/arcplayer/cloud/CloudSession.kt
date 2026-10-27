@@ -52,15 +52,38 @@ object CloudSession {
             // can never be mistaken for one of its video files.
             manifestPath = File(rootDir(context), "shelf_manifest.txt").absolutePath,
             subtitleManifestPath = File(rootDir(context), "shelf_subtitles.txt").absolutePath,
+            // Beside the two shelf lists rather than inside Telegram's file folder: this one names files
+            // the app promised to keep, and a sweep that walks the folder mistaking one for a video is
+            // the failure this whole ledger exists to prevent.
+            ledgerPath = File(rootDir(context), "download_ledger.txt").absolutePath,
             // Under the system's cache rather than the app's files: a caption copied out of Telegram's
             // hands is worth nothing to anyone if the system wants its room back, and it is a few
             // kilobytes rather than a film.
             captionDirectory = File(context.cacheDir, "captions").absolutePath,
+            // The device's own media catalog, which is the only place on a phone that satisfies both
+            // halves of a download: Telegram cannot empty it, and the gallery can see what is in it.
+            keptMedia = KeptMedia(context.applicationContext),
+            // Held as the application context because this object is kept by the process, and the work
+            // it now hosts outlives the screen that asked for it: the download service is started from
+            // here, and is meant to keep running after every activity is gone.
+            appContext = context.applicationContext,
         )
         repository = created
         appliedCredentials = wanted
         return created
     }
+
+    /**
+     * The repository this process is already using, if there is one.
+     *
+     * [DownloadService] reads its whole picture through this, and must not ask for one the way the
+     * interface does: `setTdlibParameters` is accepted once per client, so a service that passed empty or
+     * different credentials would replace the live repository with a second client and leak the first —
+     * and the viewer's shelf would go quiet on a phone that only wanted a progress bar. Null means no
+     * session was ever built, which is a service with nothing to protect.
+     */
+    @Synchronized
+    fun peekRepository(): CloudRepository? = repository
 
     private fun storageDirs(context: Context): Pair<File, File> {
         val root = rootDir(context)

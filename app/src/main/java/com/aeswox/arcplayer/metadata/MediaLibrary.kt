@@ -72,6 +72,27 @@ object MediaLibrary {
     }
 
     /**
+     * Ask about one file straight away, because someone just opened the page that shows its name.
+     *
+     * The pass only re-asks a refusal when the matching rules change, which is otherwise the right
+     * economy: a catalogue that drew a blank gave a real answer, and asking again on every launch
+     * would spend the quota on the same dead names. But that also means a file refused because of a
+     * bug stays blank until a new build arrives, and opening its page is the one moment the viewer is
+     * saying they care about this title. So it gets another ask then — one per open, never two at a
+     * time, and with the marker dropped on the way out so the next open can ask again.
+     */
+    fun askNow(videoId: Long, fileName: String, apiKey: String, onFound: (Long, MediaCard) -> Unit) {
+        if (inFlight.putIfAbsent(videoId, Unit) != null) return
+        scope.launch {
+            try {
+                cardFor(fileName, apiKey)?.let { onFound(videoId, it) }
+            } finally {
+                inFlight.remove(videoId)
+            }
+        }
+    }
+
+    /**
      * The whole answer for one file name: parse, ask, refuse what is not close enough.
      *
      * Blocking, and never called from a composable. Null means nobody got back to us, which is not the

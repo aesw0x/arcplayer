@@ -14,8 +14,8 @@ import org.junit.Test
  */
 class CopyRankTest {
 
-    private fun rank(name: String, sizeGb: Long = 1, frameHeight: Int = 0) =
-        CopyRank.of(name, sizeGb * ONE_GB, frameHeight)
+    private fun rank(name: String, sizeGb: Long = 1, frameHeight: Int = 0, onPhone: Boolean = false) =
+        CopyRank.of(name, sizeGb * ONE_GB, frameHeight, onPhone)
 
     @Test
     fun resolutionIsTheFirstThingADecisionTurnsOn() {
@@ -75,6 +75,34 @@ class CopyRankTest {
         val small = rank("Inception.2010.mkv", 1)
 
         assertTrue(big > small)
+    }
+
+    @Test
+    fun aCopyAlreadyOnThePhoneWinsAThatSizeWouldDecide() {
+        val fetchedButBigger = rank("Inception.2010.mkv", 9)
+        val alreadyHere = rank("Inception.2010.mkv", 1, onPhone = true)
+
+        // Two names that say the same thing describe the same picture, and one of them needs no
+        // download to open.
+        assertTrue(alreadyHere > fetchedButBigger)
+    }
+
+    @Test
+    fun beingOnThePhoneDoesNotMakeAWorsePictureIntoABetterOne() {
+        val highDefinitionOnThePhone = rank("Dune.2021.1080p.WEB-DL.x264.mkv", onPhone = true)
+        val ultraDefinitionStillOnTheChannel = rank("Dune.2021.2160p.WEB-DL.x264.mkv")
+
+        assertTrue(ultraDefinitionStillOnTheChannel > highDefinitionOnThePhone)
+    }
+
+    @Test
+    fun aCleanCopyOnTheChannelOutweighsASubtitledOneAlreadyHere() {
+        val hardsubbedOnThePhone = rank("Movie.2019.1080p.x265.10bit.DTS.5.1.HardSubs.mkv", onPhone = true)
+        val cleanOnTheChannel = rank("Movie.2019.1080p.x265.10bit.DTS.5.1.mkv")
+
+        // Burnt-in captions are a worse picture, not merely a different one, and being already
+        // downloaded cannot make up for that.
+        assertTrue(cleanOnTheChannel > hardsubbedOnThePhone)
     }
 
     @Test

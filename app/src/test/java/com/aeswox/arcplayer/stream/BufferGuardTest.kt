@@ -19,7 +19,8 @@ class BufferGuardTest {
         watchedMs: Long = 60_000L,
         durationMs: Long = 1_425_000L,
         fileComplete: Boolean = false,
-        playOwedSinceMs: Long = BufferGuard.NEVER
+        playOwedSinceMs: Long = BufferGuard.NEVER,
+        firstFrameRendered: Boolean = true
     ) = BufferGuard.Snapshot(
         nowMs = nowMs,
         lastTickMs = lastTickMs,
@@ -30,7 +31,8 @@ class BufferGuardTest {
         watchedMs = watchedMs,
         durationMs = durationMs,
         fileComplete = fileComplete,
-        playOwedSinceMs = playOwedSinceMs
+        playOwedSinceMs = playOwedSinceMs,
+        firstFrameRendered = firstFrameRendered
     )
 
     @Test
@@ -77,10 +79,47 @@ class BufferGuardTest {
     }
 
     @Test
-    fun aPlayerThatNeverReportedIsNotStalled() {
+    fun aFrameOnScreenWithNoPlayHeadIsNotAStall() {
+        // The viewer opened the film and stopped on its first frame. Nothing has ever been reported, and
+        // that is a choice rather than a dead player.
         assertFalse(
             BufferGuard.isStalled(
-                running(nowMs = 200_000L, lastTickMs = BufferGuard.NEVER)
+                running(nowMs = 200_000L, lastTickMs = BufferGuard.NEVER, headMovedAtMs = 100_000L)
+            )
+        )
+        // Playing, or not, does not change it: the picture is there.
+        assertFalse(
+            BufferGuard.isStalled(
+                running(
+                    nowMs = 200_000L, lastTickMs = BufferGuard.NEVER, headMovedAtMs = 100_000L,
+                    playing = false
+                )
+            )
+        )
+    }
+
+    @Test
+    fun aBlackPlayerThatNeverReportedIsAStallOnceItsOpenIsOverdue() {
+        // The resume that ends with controls over a black screen. The container opened, no frame ever
+        // arrived, no play head ever came, and every rule in this file was excusing it — so nothing
+        // asked Telegram for the bytes that would have produced a picture.
+        val openedAt = 100_000L
+        assertTrue(
+            BufferGuard.isStalled(
+                running(
+                    nowMs = openedAt + BufferGuard.SILENT_SEEK_MS, lastTickMs = BufferGuard.NEVER,
+                    headMovedAtMs = openedAt, playing = false, firstFrameRendered = false
+                )
+            )
+        )
+        // An open that has not had its ten seconds yet is still an open, and a re-open spent on it is a
+        // film thrown back to its own keyframe. Measured against the constant for the same reason.
+        assertFalse(
+            BufferGuard.isStalled(
+                running(
+                    nowMs = openedAt + BufferGuard.SILENT_SEEK_MS - 1L, lastTickMs = BufferGuard.NEVER,
+                    headMovedAtMs = openedAt, playing = false, firstFrameRendered = false
+                )
             )
         )
     }
@@ -311,6 +350,73 @@ class BufferGuardTest {
             BufferGuard.shouldRestart(
                 nowMs = 200_000L, stalledSinceMs = 100_000L, bytesAhead = 20 * mb,
                 restarts = BufferGuard.MAX_RESTARTS, lastRestartMs = 100_000L
+            )
+        )
+    }
+
+    @Test
+    fun aFaultThatKillsThePlayerTwiceIsSteppedPast() {
+        // The loop this is the answer to: the film stops at one byte, the watchdog re-opens it at that
+        // same byte, a few seconds play, and the same byte stops them again. Repeating the aim repeats
+        // the failure, and the viewer watches one spinner come up four times over the same thirty
+        // seconds of a film.
+        val diedAt = 735_817L
+        assertEquals(
+            diedAt + BufferGuard.STEP_PAST_FAULT_MS,
+            BufferGuard.restartTargetMs(stalledAtMs = diedAt + 3_000L, lastAimMs = diedAt, durationMs = 5_925_000L)
+        )
+        // The first death has nothing to step past: the aim is where the viewer was, and skipping a
+        // scene to be rid of a stall that has not happened twice is a worse trade.
+        assertEquals(
+            diedAt,
+            BufferGuard.restartTargetMs(stalledAtMs = diedAt, lastAimMs = -1L, durationMs = 5_925_000L)
+        )
+    }
+
+    @Test
+    fun aStallSomewhereElseIsItsOwnProblem() {
+        // A film that got a minute clear of the last death and then stopped is a new fault, and the
+        // viewer's own play head is the right place to re-open it.
+        val earlier = 735_817L
+        val now = earlier + BufferGuard.FAULT_CLEARED_MS + 1L
+        assertEquals(
+            now,
+            BufferGuard.restartTargetMs(stalledAtMs = now, lastAimMs = earlier, durationMs = 5_925_000L)
+        )
+    }
+
+    @Test
+    fun theStepPastANearEndIsNotTaken() {
+        // There is nothing to skip into, and the tail is recoverable on the bytes it has anyway.
+        val durationMs = 5_925_000L
+        val diedAt = durationMs - 20_000L
+        assertEquals(
+            diedAt,
+            BufferGuard.restartTargetMs(stalledAtMs = diedAt, lastAimMs = diedAt, durationMs = durationMs)
+        )
+    }
+
+    @Test
+    fun aLinkThatSettlesNothingIsAdmittedRatherThanWaitedOnForever() {
+        // Restarts are gated on bytes that have landed, so a dead link never spends its three attempts
+        // and the cap on its own says nothing. This is the other way a wait ends.
+        assertFalse(
+            BufferGuard.isWaitingOnTheLink(
+                nowMs = 100_000L + BufferGuard.LINK_GIVE_UP_MS - 1, stalledSinceMs = 100_000L,
+                settledAhead = 2 * mb
+            )
+        )
+        assertTrue(
+            BufferGuard.isWaitingOnTheLink(
+                nowMs = 100_000L + BufferGuard.LINK_GIVE_UP_MS, stalledSinceMs = 100_000L,
+                settledAhead = 2 * mb
+            )
+        )
+        // Bytes that are arriving are not this wait. Without the pause the pill would come up over a
+        // download that is on its way.
+        assertFalse(
+            BufferGuard.isWaitingOnTheLink(
+                nowMs = 200_000L, stalledSinceMs = 100_000L, settledAhead = 20 * mb
             )
         )
     }

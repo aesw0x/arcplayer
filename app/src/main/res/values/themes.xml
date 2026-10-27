@@ -9,5 +9,15 @@
     <style name="Theme.ArcPlayer" parent="android:Theme.Material.NoActionBar">
         <item name="android:windowBackground">@android:color/transparent</item>
         <item name="android:forceDarkAllowed">false</item>
+        <!--
+            The system panel, told to show nothing but black. windowSplashScreenBackground and the icon
+            colour are the page's own black, and the icon itself is pointed at a transparent drawable, so
+            the only thing between the tap and the first drawn frame of the intro is the same black the
+            intro opens on. Without these the framework puts the launcher icon on the panel and the app
+            appears to splash twice.
+        -->
+        <item name="android:windowSplashScreenBackground">@android:color/black</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@android:color/black</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_transparent</item>
     </style>
 </resources>

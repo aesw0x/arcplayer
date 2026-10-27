@@ -28,6 +28,8 @@ data class CopyRank(
     val codec: Int,
     /** 1 while the picture is clean, 0 once a name admits burnt-in subtitles. */
     val cleanPicture: Int,
+    /** 1 for a copy already on this phone, 0 for one that has to be fetched. */
+    val phone: Int,
     val sizeBytes: Long
 ) : Comparable<CopyRank> {
 
@@ -42,10 +44,19 @@ data class CopyRank(
             .thenBy { it.bitDepth }
             .thenBy { it.codec }
             .thenBy { it.cleanPicture }
+            // Ahead of size, because two names that claim the same picture describe the same picture and
+            // the one already on the phone needs nothing. Behind everything the names claim, because a
+            // 4K copy is better than a 1080p one even when the 1080p is already here and the 4K is not.
+            .thenBy { it.phone }
             .thenBy { it.sizeBytes }
 
         /** [frameHeight] is Telegram's own figure and fills in only where the name states no resolution. */
-        fun of(fileName: String, sizeBytes: Long, frameHeight: Int = 0): CopyRank {
+        fun of(
+            fileName: String,
+            sizeBytes: Long,
+            frameHeight: Int = 0,
+            onPhone: Boolean = false
+        ): CopyRank {
             val read = ReleaseInfo.parse(fileName, frameHeight)
             val tags = read.tags.toSet()
             return CopyRank(
@@ -56,6 +67,7 @@ data class CopyRank(
                 bitDepth = if ("10-bit" in tags) 1 else 0,
                 codec = if ("HEVC" in tags || "AV1" in tags) 1 else 0,
                 cleanPicture = if ("Burned-in subs" in tags) 0 else 1,
+                phone = if (onPhone) 1 else 0,
                 sizeBytes = sizeBytes
             )
         }

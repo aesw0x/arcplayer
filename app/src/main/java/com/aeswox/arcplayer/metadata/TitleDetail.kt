@@ -253,7 +253,7 @@ object TmdbDetails {
             genres = response.optJSONArray("genres").namedValues(),
             startYear = yearOf(response.optString("first_air_date")),
             endYear = yearOf(response.optString("last_air_date")),
-            runtimeMinutes = response.optJSONArray("episode_run_time").optInt(0),
+            runtimeMinutes = response.optJSONArray("episode_run_time")?.optInt(0) ?: 0,
             directors = response.optJSONArray("created_by").objects().mapNotNull {
                 it.optString("name").nullIfBlank()
             },
@@ -301,17 +301,22 @@ object PlayOrder {
      *
      * [lastPlayedMs] is when each file was last handed to the player. A part nobody has opened is
      * offered at its best copy; a part that has been is opened on the copy it was last watched on.
+     *
+     * [savedIds] names the copies this device is holding. A saved file outranks both of those rules —
+     * see [pickCopy] — which is why the same set has to reach [progress] too, or the Continue Watching
+     * row would resume a position on a copy the Play button then refuses to open.
      */
     fun nextCopy(
         slots: List<List<Long>>,
         resumeMs: Map<Long, Long>,
         lengthsMs: Map<Long, Long> = emptyMap(),
-        lastPlayedMs: Map<Long, Long> = emptyMap()
+        lastPlayedMs: Map<Long, Long> = emptyMap(),
+        savedIds: Set<Long> = emptySet()
     ): Play? {
         val opening = slots.firstOrNull { it.isNotEmpty() } ?: return null
-        val openingCopy = pickCopy(opening, lastPlayedMs) ?: return null
+        val openingCopy = pickCopy(opening, lastPlayedMs, savedIds) ?: return null
         for (slot in slots) {
-            val chosen = pickCopy(slot, lastPlayedMs) ?: continue
+            val chosen = pickCopy(slot, lastPlayedMs, savedIds) ?: continue
             val position = slot.maxOfOrNull { resumeMs[it] ?: 0L } ?: 0L
             val length = slot.maxOfOrNull { lengthsMs[it] ?: 0L } ?: 0L
             if (position <= 0L) return Play(chosen, 0L)
@@ -330,10 +335,38 @@ object PlayOrder {
      * smaller upload is how you watch a film on a link that cannot carry the big one, and a Resume
      * that ignores that puts them back on the frame rate they just left — for a film whose picture
      * they have already been watching for an hour on the copy they picked.
+     *
+     * A copy this device is holding beats both of those, and not because it is better: it is the one
+     * that opens with the link dead. The reason the last-watched rule exists — the big file would not
+     * stream — is precisely the reason it stops applying once a file has been saved, because a saved
+     * file streams itself. Where several copies of one part are saved, the best ranked of them wins,
+     * since [slots] arrives in the order [CopyRank] gave it.
      */
-    private fun pickCopy(slot: List<Long>, lastPlayedMs: Map<Long, Long>): Long? {
+    private fun pickCopy(slot: List<Long>, lastPlayedMs: Map<Long, Long>, savedIds: Set<Long>): Long? {
+        slot.firstOrNull { it in savedIds }?.let { return it }
         val opened = slot.filter { (lastPlayedMs[it] ?: 0L) > 0L }
         return opened.maxByOrNull { lastPlayedMs.getValue(it) } ?: slot.firstOrNull()
+    }
+
+    /**
+     * Another copy of the same part to hand the player after one refused to open, or null when the part
+     * has run out of files.
+     *
+     * Only the slot the failed file belongs to can answer, because a second try means the same film in a
+     * different container — stepping on to the next episode because this one would not open is a different
+     * choice than the viewer made. [alreadyTried] is what stops a shelf of three bad uploads from
+     * cycling through them forever: once a part has offered every file it holds, the player has to say
+     * why rather than try again.
+     */
+    fun otherCopyOfPart(
+        slots: List<List<Long>>,
+        presentIds: List<Long>,
+        failedId: Long,
+        alreadyTried: Set<Long> = emptySet()
+    ): Long? {
+        val slot = slots.firstOrNull { failedId in it } ?: return null
+        val present = presentIds.toSet()
+        return slot.firstOrNull { it != failedId && it in present && it !in alreadyTried }
     }
 
     /**
@@ -366,10 +399,11 @@ object PlayOrder {
         slots: List<List<Long>>,
         resumeMs: Map<Long, Long>,
         lengthsMs: Map<Long, Long>,
-        lastPlayedMs: Map<Long, Long> = emptyMap()
+        lastPlayedMs: Map<Long, Long> = emptyMap(),
+        savedIds: Set<Long> = emptySet()
     ): Progress? {
         for (slot in slots) {
-            val partId = pickCopy(slot, lastPlayedMs) ?: continue
+            val partId = pickCopy(slot, lastPlayedMs, savedIds) ?: continue
             val position = slot.maxOfOrNull { resumeMs[it] ?: 0L } ?: 0L
             if (position <= 0L) continue
             val length = slot.maxOfOrNull { lengthsMs[it] ?: 0L } ?: 0L

@@ -1,0 +1,174 @@
+name: Release APKs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.version.outputs.changed }}
+      name: ${{ steps.version.outputs.name }}
+      code: ${{ steps.version.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check release version
+        id: version
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { execFileSync, spawnSync } = require('node:child_process');
+          const parse = text => Object.fromEntries(text.split(/\r?\n/)
+            .filter(line => /^(VERSION_NAME|VERSION_CODE)=/.test(line))
+            .map(line => line.trim().split('=')));
+          const current = parse(fs.readFileSync('version.properties', 'utf8'));
+          const name = current.VERSION_NAME;
+          const code = Number(current.VERSION_CODE);
+          if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(name) ||
+              !Number.isSafeInteger(code) || code < 1 || code > 2100000000) {
+            throw new Error('Use VERSION_NAME=x.y.z and a positive Android VERSION_CODE.');
+          }
+          let changed = true;
+          const before = process.env.BEFORE_SHA;
+          if (process.env.EVENT_NAME === 'push' && before && !/^0+$/.test(before)) {
+            const old = spawnSync('git', ['show', `${before}:version.properties`], { encoding: 'utf8' });
+            if (old.status === 0) {
+              const previous = parse(old.stdout);
+              changed = previous.VERSION_NAME !== name;
+              if (changed && code <= Number(previous.VERSION_CODE)) {
+                throw new Error('Increase VERSION_CODE whenever VERSION_NAME changes.');
+              }
+              if (!changed && code !== Number(previous.VERSION_CODE)) {
+                throw new Error('Bump VERSION_NAME and VERSION_CODE together.');
+              }
+            } else if (spawnSync('git', ['cat-file', '-e', `${before}^{commit}`]).status !== 0) {
+              throw new Error('The previous push commit is unavailable; cannot compare versions safely.');
+            }
+          }
+          const tags = execFileSync('git', ['tag', '--list', `v${name}`], { encoding: 'utf8' }).trim();
+          if (tags) changed = false;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `changed=${changed}\nname=${name}\ncode=${code}\n`);
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+            changed ? `Building Arc Player ${name} (${code}).\n` : `No unreleased version change: ${name}.\n`);
+          NODE
+
+  release:
+    needs: version
+    if: needs.version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - name: Install Android SDK
+        run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0'
+      - name: Build and verify signed APKs
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          RELEASE_STORE_FILE: ${{ runner.temp }}/arcplayer-release.jks
+          VERSION_NAME: ${{ needs.version.outputs.name }}
+          VERSION_CODE: ${{ needs.version.outputs.code }}
+        run: |
+          set -euo pipefail
+          for key in TG_API_ID TG_API_HASH TMDB_API_KEY RELEASE_KEYSTORE_BASE64 RELEASE_STORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD; do
+            if [ -z "${!key}" ]; then
+              printf '::error::Missing repository secret: %s\n' "$key"
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$RELEASE_STORE_FILE"
+          trap 'rm -f "$RELEASE_STORE_FILE"' EXIT
+          ./gradlew --no-daemon --no-build-cache --no-configuration-cache --console=plain \
+            :app:testDebugUnitTest :app:assembleRelease -PsplitApks=true
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const crypto = require('node:crypto');
+          const { execFileSync } = require('node:child_process');
+          const buildTools = path.join(process.env.ANDROID_HOME, 'build-tools/35.0.0');
+          const generated = fs.readFileSync('app/build/generated/source/buildConfig/release/com/aeswox/arcplayer/BuildConfig.java', 'utf8');
+          for (const key of ['TG_API_ID', 'TG_API_HASH', 'TMDB_API_KEY']) {
+            const literal = key === 'TG_API_ID' ? String(Number(process.env[key])) : JSON.stringify(process.env[key]);
+            if (!generated.includes(`${key} = ${literal};`)) throw new Error(`${key} was not compiled into the release.`);
+          }
+          fs.mkdirSync('dist', { recursive: true });
+          const checksums = [];
+          for (const abi of ['arm64-v8a', 'x86_64', 'universal']) {
+            const apk = `app/build/outputs/apk/release/app-${abi}-release.apk`;
+            execFileSync(path.join(buildTools, 'apksigner'), ['verify', '--verbose', apk]);
+            const badging = execFileSync(path.join(buildTools, 'aapt'), ['dump', 'badging', apk], { encoding: 'utf8' });
+            if (!badging.includes(`versionName='${process.env.VERSION_NAME}'`) ||
+                !badging.includes(`versionCode='${process.env.VERSION_CODE}'`)) throw new Error('APK version mismatch.');
+            const entries = execFileSync('unzip', ['-Z1', apk], { encoding: 'utf8' }).trim().split('\n');
+            const actual = [...new Set(entries.filter(x => x.startsWith('lib/')).map(x => x.split('/')[1]))].sort();
+            const expected = abi === 'universal' ? ['arm64-v8a', 'x86_64'] : [abi];
+            if (actual.join(',') !== expected.join(',')) throw new Error(`Unexpected architectures in ${abi}.`);
+            for (const arch of expected) for (const lib of ['libvlc.so', 'libvlcjni.so', 'libtdjni.so']) {
+              if (!entries.includes(`lib/${arch}/${lib}`)) throw new Error(`Missing ${arch}/${lib}.`);
+            }
+            const dex = Buffer.concat(entries.filter(x => /^classes\d*\.dex$/.test(x)).map(x =>
+              execFileSync('unzip', ['-p', apk, x], { maxBuffer: 64 * 1024 * 1024 })));
+            for (const key of ['TG_API_HASH', 'TMDB_API_KEY']) {
+              if (!dex.includes(Buffer.from(process.env[key]))) throw new Error(`${key} missing from ${abi} APK.`);
+            }
+            const name = `ArcPlayer-${process.env.VERSION_NAME}-${abi}.apk`;
+            fs.copyFileSync(apk, `dist/${name}`);
+            checksums.push(`${crypto.createHash('sha256').update(fs.readFileSync(apk)).digest('hex')}  ${name}`);
+            console.log(`Verified ${name}: signature, version, native libraries, and embedded API credentials.`);
+          }
+          fs.writeFileSync('dist/SHA256SUMS.txt', checksums.join('\n') + '\n');
+          NODE
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ArcPlayer-${{ needs.version.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.version.outputs.name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          gh release create "v$RELEASE_VERSION" dist/* \
+            --target "$RELEASE_COMMIT" \
+            --title "Arc Player $RELEASE_VERSION" \
+            --generate-notes \
+            --notes "Signed APKs for Android 12+. Choose arm64-v8a for most phones, x86_64 for compatible Intel/AMD devices, or universal for both supported architectures. SHA256SUMS.txt contains download checksums."
+      - name: Remove signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/arcplayer-release.jks"
