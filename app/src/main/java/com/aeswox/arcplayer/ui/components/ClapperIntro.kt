@@ -70,7 +70,8 @@ private val ArtCentre = Offset(11.98f, 11.95f)
  * that has not arrived yet shimmers and every element on the page fades and rises, both asking for a
  * frame sixty times a second over a page nobody can see yet. On the phone that competition was the whole
  * of the intro's stutter. So those two animations wait for this to clear, which also gives the home its
- * entrance after the clap rather than hidden behind it.
+ * entrance after the clap rather than hidden behind it — the hero's shutter is a third thing that asks,
+ * because a reveal spent under an opaque panel is a reveal nobody saw.
  */
 internal object AppIntro {
     var running by mutableStateOf(true)
@@ -302,6 +303,12 @@ private class ClapperMark {
  * against the black it stands on and the panel is then simply gone. Nothing in the app is ever behind an
  * alpha here, which matters because an ancestor alpha over the subtree that records the frosted glass is
  * exactly the case where Compose paints nothing.
+ *
+ * Dropping a panel of `#000000` onto a page of `#000000` is not a transition at all — it is one frame the
+ * viewer cannot tell apart from the last. That is the whole of the handover's budget spent on the mark,
+ * and it is what lets the home do its arriving in the open: [com.aeswox.arcplayer.ui.animations.rememberHeroArrival]
+ * lifts the hero's cover off the picture the moment this panel goes, so the first thing on screen after
+ * the clap is a picture coming up out of the same black the clapperboard was drawn on.
  */
 @Composable
 private fun ClapperIntroOverlay(clock: IntroClock) {

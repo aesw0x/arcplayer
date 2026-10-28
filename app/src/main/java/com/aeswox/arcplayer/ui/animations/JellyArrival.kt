@@ -2,6 +2,10 @@ package com.aeswox.arcplayer.ui.animations
 
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.EaseInOut
+import androidx.compose.animation.core.EaseOut
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.Spring
@@ -33,12 +37,13 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.IntOffset
 import com.aeswox.arcplayer.ui.components.AppIntro
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** Elements in one arriving group, and how far apart their entrances are spaced. */
 private const val STAGGERED_MAX_ITEMS = 10
 private const val STAGGER_INTERVAL_MS = 40L
-private const val ARRIVAL_DURATION_MS = 250
-private const val ARRIVAL_RISE_PX = 20f
+private const val ARRIVAL_DURATION_MS = 320
+private const val ARRIVAL_RISE_PX = 40f
 
 /**
  * Which entrances this session has already shown.
@@ -61,11 +66,16 @@ private val entrancesShown = HashSet<String>()
  * [arrivalKey] makes that entrance a once-per-element thing. Pass the same string the lazy list uses
  * as the item's key and the fade plays the first time that element is ever shown and never again, so
  * coming back to a tab lands on a page that is already filled rather than one refilling itself.
+ *
+ * [leadMs] holds the whole group back that much longer after the clapperboard has gone. Home uses it to
+ * keep its rails out of the way of the hero's own fade — one thing arriving after another is the
+ * difference between a sequence and a scuffle.
  */
 @Composable
 fun StaggeredListItem(
     index: Int,
     arrivalKey: String? = null,
+    leadMs: Long = 0L,
     modifier: Modifier = Modifier,
     content: @Composable () -> Unit
 ) {
@@ -80,7 +90,8 @@ fun StaggeredListItem(
         if (!seenBefore) AppIntro.awaitHomeRelease()
         // Only the first ten are spaced. A row scrolled into view later must not sit invisible for
         // the length of the whole stagger, which is what spacing every index would do.
-        if (!seenBefore && index < STAGGERED_MAX_ITEMS) delay(index * STAGGER_INTERVAL_MS)
+        val spacing = if (index < STAGGERED_MAX_ITEMS) index * STAGGER_INTERVAL_MS else 0L
+        if (!seenBefore) delay(leadMs + spacing)
         arrived = true
     }
     val alpha by animateFloatAsState(
@@ -94,6 +105,99 @@ fun StaggeredListItem(
         label = "arrival_rise"
     )
     Box(modifier.graphicsLayer { this.alpha = alpha; translationY = rise }) { content() }
+}
+
+/**
+ * The hero's own entrance, which is really the app's: the clapperboard leaves a black behind it and the
+ * picture is built out of that black rather than uncovered by a cut.
+ *
+ * The picture comes up out of the black and settles out of a sliver of oversize as it does — a projector
+ * finding its focus — and the words follow about a third of a second behind. Then, and not before, the
+ * rails start their own stagger ([StaggeredListItem]'s `leadMs`), so the handover reads as one thing
+ * arriving after another instead of four things arriving at once.
+ *
+ * Why the picture's fade is not simply `alpha`, and why the lettering's is:
+ *
+ * - The artwork's layer already carries the scroll's blur and dimming, and a second alpha stacked under
+ *   that is the case where Compose paints nothing. So the picture is revealed by the page's own black
+ *   *lifting off* it — [lit] is a cover's opacity falling, which is the same fade seen from the other
+ *   side and cannot be swallowed by a layer it does not own.
+ * - The lettering is the other way round: nothing paints a render effect over it and its pill is a tinted
+ *   solid rather than a glass consumer, so [wordsFade] is a plain alpha and the group fades as one.
+ *
+ * Every value here is read inside a draw lambda, never in a composition body, so the reveal redraws the
+ * hero's layers instead of recomposing the shelf sixty times a second — which is the very cost the
+ * curtain was raised to hold back.
+ */
+private const val RevealCoverMs = 900
+private const val RevealFocusMs = 1400
+private const val RevealOverscale = 0.03f
+private const val RevealLetteringDelayMs = 360L
+private const val RevealLetteringMs = 620
+
+/** How long Home holds its rails back so the picture goes up first. */
+const val HeroArrivalLeadMs = 620L
+
+class HeroArrival internal constructor(
+    private val cover: Animatable<Float, *>,
+    private val focus: Animatable<Float, *>,
+    private val lettering: Animatable<Float, *>,
+) {
+    /** How lit the picture is: 0 is still the page's own black, 1 is the photograph. */
+    fun lit(): Float = cover.value.coerceIn(0f, 1f)
+
+    /** Multiplies the artwork's rest scale; starts above 1 and falls to exactly 1. */
+    fun focusScale(): Float = 1f + RevealOverscale * (1f - focus.value.coerceIn(0f, 1f))
+
+    /** How far below its resting place the lettering still sits, in pixels. */
+    fun riseOffset(risePx: Float): Float = risePx * (1f - lettering.value.coerceIn(0f, 1f))
+
+    /** How dim the words and their pill still are: 1 is invisible. */
+    fun wordsFade(): Float = 1f - lettering.value.coerceIn(0f, 1f)
+}
+
+/**
+ * The arrival, started on a real signal rather than on a timer: the clapperboard has gone *and* the shelf
+ * has something to show.
+ *
+ * Either half alone is wrong. Started at the release alone, the fade runs over a page that is still black
+ * because the library has not answered yet. Started when the content lands alone, it plays under the
+ * curtain for anyone who opens the app fast.
+ *
+ * The one-shot guard is the cover's own value, not a flag of its own, and that is load-bearing: a
+ * `played` boolean has to be a key of this effect for it to work at all, and flipping it in the same
+ * frame the animation starts restarts the effect, which cancels the coroutine that is running the three
+ * tweens. The cover then freezes one frame in — a hero that never lights on the phone and lettering that
+ * never arrives. Keyed on [contentReady] alone, a completed arrival is recognised by the value it ended
+ * at, and an interrupted one resumes to the same end.
+ */
+@Composable
+fun rememberHeroArrival(contentReady: Boolean): HeroArrival {
+    val cover = remember { Animatable(0f) }
+    val focus = remember { Animatable(0f) }
+    val lettering = remember { Animatable(0f) }
+    // Whether this Home came into the world under the clapperboard, read once at its first composition.
+    // It is the difference between a page nobody watched being built and a picture that simply took its
+    // time: the first must be handed over already lit, the second must still fade up rather than pop.
+    val bornUnderCurtain = remember { AppIntro.running }
+    LaunchedEffect(contentReady) {
+        if (cover.value >= 1f) return@LaunchedEffect
+        if (!bornUnderCurtain && !AppIntro.running) {
+            cover.snapTo(1f)
+            focus.snapTo(1f)
+            lettering.snapTo(1f)
+            return@LaunchedEffect
+        }
+        AppIntro.awaitHomeRelease()
+        if (!contentReady) return@LaunchedEffect
+        launch { cover.animateTo(1f, tween(RevealCoverMs, easing = EaseInOut)) }
+        launch { focus.animateTo(1f, tween(RevealFocusMs, easing = EaseOut)) }
+        launch {
+            delay(RevealLetteringDelayMs)
+            lettering.animateTo(1f, tween(RevealLetteringMs, easing = FastOutSlowInEasing))
+        }
+    }
+    return HeroArrival(cover, focus, lettering)
 }
 
 /**

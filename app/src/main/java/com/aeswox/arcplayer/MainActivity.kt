@@ -21,6 +21,7 @@ import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Shader
 import android.media.AudioManager
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -100,6 +101,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.PressInteraction
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -161,6 +163,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -206,6 +209,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -347,7 +351,9 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.withContext
@@ -477,6 +483,13 @@ fun ArcPlayerTheme(content: @Composable () -> Unit) {
 /** Subtitle lift is asked for as a share of the picture's height, and 40 % is already most of a line. */
 private const val SUBTITLE_LIFT_MAX_PERCENT = 40
 
+/**
+ * Safe baseline margin (~6% of picture height) so subtitles never clip against the bottom
+ * of the phone in Cinema fill (2.35:1) mode or collide with the system gesture bar in Fit mode.
+ */
+private const val SUBTITLE_BASE_MARGIN_PERCENT = 6
+private const val SUBTITLE_LIFT_MIN_PERCENT = -SUBTITLE_BASE_MARGIN_PERCENT
+
 /** The band the size control is allowed to move inside, measured against the size the player uses today. */
 private const val SUBTITLE_SIZE_MIN_PERCENT = 60
 private const val SUBTITLE_SIZE_MAX_PERCENT = 200
@@ -545,6 +558,8 @@ class ArcPreferencesStore(context: Context) {
     var backgroundAudioEnabled by mutableStateOf(false)
         private set
     var autoPipEnabled by mutableStateOf(true)
+        private set
+    var doubleTapSeekSeconds by mutableIntStateOf(10)
         private set
 
     /**
@@ -637,7 +652,9 @@ class ArcPreferencesStore(context: Context) {
             gridColumns = prefs.getInt("grid_columns", 3).coerceIn(2, 4)
             backgroundAudioEnabled = prefs.getBoolean("bg_audio", false)
             autoPipEnabled = prefs.getBoolean("auto_pip", true)
-            subtitleLiftPercent = prefs.getInt("subtitle_lift_pct", 0).coerceIn(0, SUBTITLE_LIFT_MAX_PERCENT)
+            val loadedSeekSec = prefs.getInt("double_tap_seek_seconds", 10)
+            doubleTapSeekSeconds = if (loadedSeekSec in listOf(5, 10, 15, 20)) loadedSeekSec else 10
+            subtitleLiftPercent = prefs.getInt("subtitle_lift_pct", 0).coerceIn(SUBTITLE_LIFT_MIN_PERCENT, SUBTITLE_LIFT_MAX_PERCENT)
             subtitleSizePercent = prefs.getInt("subtitle_size_pct", 100).coerceIn(SUBTITLE_SIZE_MIN_PERCENT, SUBTITLE_SIZE_MAX_PERCENT)
 
             hapticsEnabled = prefs.getBoolean("haptics_enabled", true)
@@ -848,8 +865,19 @@ class ArcPreferencesStore(context: Context) {
         prefs.edit().putBoolean("auto_pip", enabled).apply()
     }
 
+    fun updateDoubleTapSeekSeconds(seconds: Int) {
+        val clamped = when {
+            seconds <= 7 -> 5
+            seconds <= 12 -> 10
+            seconds <= 17 -> 15
+            else -> 20
+        }
+        doubleTapSeekSeconds = clamped
+        prefs.edit().putInt("double_tap_seek_seconds", clamped).apply()
+    }
+
     fun updateSubtitleStyle(liftPercent: Int, sizePercent: Int) {
-        subtitleLiftPercent = liftPercent.coerceIn(0, SUBTITLE_LIFT_MAX_PERCENT)
+        subtitleLiftPercent = liftPercent.coerceIn(SUBTITLE_LIFT_MIN_PERCENT, SUBTITLE_LIFT_MAX_PERCENT)
         subtitleSizePercent = sizePercent.coerceIn(SUBTITLE_SIZE_MIN_PERCENT, SUBTITLE_SIZE_MAX_PERCENT)
         prefs.edit()
             .putInt("subtitle_lift_pct", subtitleLiftPercent)
@@ -1322,6 +1350,192 @@ object VideoThumbnailCache {
     }
 }
 
+object SeekPreviewCache {
+    private val maxKilobytes = (Runtime.getRuntime().maxMemory() / 1024L / 8L).toInt().coerceAtLeast(16 * 1024)
+
+    private val lruCache = object : LruCache<String, Bitmap>(maxKilobytes) {
+        override fun sizeOf(key: String, value: Bitmap): Int {
+            return (value.byteCount / 1024).coerceAtLeast(1)
+        }
+    }
+
+    fun get(uri: Uri, bucketMs: Long): Bitmap? = lruCache.get("${uri}_$bucketMs")
+
+    fun put(uri: Uri, bucketMs: Long, bitmap: Bitmap) {
+        lruCache.put("${uri}_$bucketMs", bitmap)
+    }
+
+    fun clear() {
+        lruCache.evictAll()
+    }
+}
+
+class SeekPreviewSession(
+    private val appContext: Context,
+    val uri: Uri
+) {
+    private val sessionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mutex = Mutex()
+    private var retriever: MediaMetadataRetriever? = null
+    private var activePfd: ParcelFileDescriptor? = null
+    private var isInitialized = false
+    private var isFailed = false
+
+    private fun openDataSource(ret: MediaMetadataRetriever): ParcelFileDescriptor? {
+        if (uri.scheme == ContentResolver.SCHEME_FILE || uri.scheme == null) {
+            val path = uri.path
+            if (!path.isNullOrBlank() && File(path).exists()) {
+                ret.setDataSource(path)
+                return null
+            }
+        }
+
+        // 1. ContentResolver openFileDescriptor (best for content URIs, MediaStore, SAF, Downloads)
+        val pfd = runCatching {
+            appContext.contentResolver.openFileDescriptor(uri, "r")
+        }.getOrNull()
+
+        if (pfd != null) {
+            try {
+                ret.setDataSource(pfd.fileDescriptor)
+                return pfd
+            } catch (t: Throwable) {
+                runCatching { pfd.close() }
+            }
+        }
+
+        // 2. Query MediaStore DATA column if available
+        if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
+            val dataPath = runCatching {
+                val proj = arrayOf(MediaStore.Video.Media.DATA)
+                appContext.contentResolver.query(uri, proj, null, null, null)?.use { cursor ->
+                    val col = cursor.getColumnIndex(MediaStore.Video.Media.DATA)
+                    if (col >= 0 && cursor.moveToFirst()) cursor.getString(col) else null
+                }
+            }.getOrNull()
+
+            if (!dataPath.isNullOrBlank() && File(dataPath).exists()) {
+                try {
+                    ret.setDataSource(dataPath)
+                    return null
+                } catch (_: Throwable) {}
+            }
+        }
+
+        // 3. Fallback: Context + Uri
+        ret.setDataSource(appContext, uri)
+        return null
+    }
+
+    fun warmUp(initialPositionMs: Long = 0L) {
+        sessionScope.launch {
+            val bucketMs = ((initialPositionMs / 2500L) * 2500L).coerceAtLeast(0L)
+            getFrame(bucketMs)
+        }
+    }
+
+    fun prefetchNeighbors(centerBucketMs: Long, durationMs: Long) {
+        sessionScope.launch {
+            val offsets = longArrayOf(2500L, -2500L, 5000L, -5000L)
+            for (offset in offsets) {
+                if (!isActive) break
+                val targetMs = centerBucketMs + offset
+                if (targetMs in 0L..durationMs) {
+                    if (SeekPreviewCache.get(uri, targetMs) == null) {
+                        getFrame(targetMs)
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun getFrame(
+        bucketMs: Long,
+        targetWidthPx: Int = 220,
+        targetHeightPx: Int = 124
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        val cached = SeekPreviewCache.get(uri, bucketMs)
+        if (cached != null) return@withContext cached
+
+        mutex.withLock {
+            val doubleCheck = SeekPreviewCache.get(uri, bucketMs)
+            if (doubleCheck != null) return@withLock doubleCheck
+            if (isFailed) return@withLock null
+
+            if (!isInitialized) {
+                try {
+                    val ret = MediaMetadataRetriever()
+                    activePfd = openDataSource(ret)
+                    retriever = ret
+                    isInitialized = true
+                } catch (t: Throwable) {
+                    isFailed = true
+                    closeInternal()
+                    return@withLock null
+                }
+            }
+
+            val ret = retriever ?: return@withLock null
+            val timeUs = (bucketMs * 1000L).coerceAtLeast(0L)
+
+            var bmp: Bitmap? = null
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                bmp = runCatching {
+                    ret.getScaledFrameAtTime(
+                        timeUs,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                        targetWidthPx,
+                        targetHeightPx
+                    )
+                }.getOrNull()
+            }
+            if (bmp == null) {
+                bmp = runCatching {
+                    ret.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                }.getOrNull()
+            }
+            if (bmp == null) {
+                bmp = runCatching {
+                    ret.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_PREVIOUS_SYNC)
+                }.getOrNull()
+            }
+
+            if (bmp != null) {
+                if (bmp.width > targetWidthPx * 1.4f || bmp.height > targetHeightPx * 1.4f) {
+                    val aspect = bmp.width.toFloat() / bmp.height.coerceAtLeast(1)
+                    val dstW = targetWidthPx
+                    val dstH = (targetWidthPx / aspect).toInt().coerceAtLeast(1)
+                    val scaled = runCatching {
+                        Bitmap.createScaledBitmap(bmp, dstW, dstH, true)
+                    }.getOrNull()
+                    if (scaled != null && scaled !== bmp) {
+                        bmp.recycle()
+                        bmp = scaled
+                    }
+                }
+                SeekPreviewCache.put(uri, bucketMs, bmp)
+            }
+            bmp
+        }
+    }
+
+    private fun closeInternal() {
+        runCatching { retriever?.close() }
+        runCatching { activePfd?.close() }
+        retriever = null
+        activePfd = null
+    }
+
+    fun close() {
+        sessionScope.cancel()
+        CoroutineScope(Dispatchers.IO).launch {
+            mutex.withLock {
+                closeInternal()
+            }
+        }
+    }
+}
+
 suspend fun loadVideoThumbnailCancellable(
     contentResolver: ContentResolver,
     uri: Uri,
@@ -1524,7 +1738,7 @@ class ArcVlcPlayerEngine(
      * and a property read before its own initialiser runs reads zero rather than what the viewer asked.
      */
     var subtitleLiftPercent by mutableIntStateOf(
-        initialSubtitleLiftPercent.coerceIn(0, SUBTITLE_LIFT_MAX_PERCENT)
+        initialSubtitleLiftPercent.coerceIn(SUBTITLE_LIFT_MIN_PERCENT, SUBTITLE_LIFT_MAX_PERCENT)
     )
         private set
     var subtitleSizePercent by mutableIntStateOf(
@@ -1568,8 +1782,9 @@ class ArcVlcPlayerEngine(
             "--no-drop-late-frames",
             "--no-skip-frames"
         )
-        if (subtitleLiftPercent > 0) {
-            args += "--sub-margin=${subtitleWindowHeightPx() * subtitleLiftPercent / 100}"
+        val effectiveLiftPercent = (SUBTITLE_BASE_MARGIN_PERCENT + subtitleLiftPercent).coerceIn(0, SUBTITLE_LIFT_MAX_PERCENT)
+        if (effectiveLiftPercent > 0) {
+            args += "--sub-margin=${subtitleWindowHeightPx() * effectiveLiftPercent / 100}"
         }
         if (subtitleSizePercent != 100) {
             args += "--sub-text-scale=$subtitleSizePercent"
@@ -2231,7 +2446,7 @@ class ArcVlcPlayerEngine(
     }
 
     private fun setSubtitleStyle(liftPercent: Int, sizePercent: Int) {
-        val nextLift = liftPercent.coerceIn(0, SUBTITLE_LIFT_MAX_PERCENT)
+        val nextLift = liftPercent.coerceIn(SUBTITLE_LIFT_MIN_PERCENT, SUBTITLE_LIFT_MAX_PERCENT)
         val nextSize = sizePercent.coerceIn(SUBTITLE_SIZE_MIN_PERCENT, SUBTITLE_SIZE_MAX_PERCENT)
         if (nextLift == subtitleLiftPercent && nextSize == subtitleSizePercent) return
         subtitleLiftPercent = nextLift
@@ -6911,6 +7126,67 @@ private fun SettingsContent(
                         )
                     }
 
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Double-Tap Seek Interval", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                                Text("Skip step for double and multi-tap seek", fontSize = 12.sp, color = OneUiTextSecondary)
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = OneUiPillSelected
+                            ) {
+                                Text(
+                                    text = "${prefsStore.doubleTapSeekSeconds}s",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = OneUiSelectedFill,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+                        Slider(
+                            value = prefsStore.doubleTapSeekSeconds.toFloat(),
+                            onValueChange = { newVal ->
+                                val snapped = (kotlin.math.round(newVal / 5f) * 5f).toInt().coerceIn(5, 20)
+                                if (snapped != prefsStore.doubleTapSeekSeconds) {
+                                    prefsStore.updateDoubleTapSeekSeconds(snapped)
+                                    AppHaptics.tick()
+                                }
+                            },
+                            valueRange = 5f..20f,
+                            steps = 2,
+                            colors = SliderDefaults.colors(
+                                thumbColor = OneUiSelectedFill,
+                                activeTrackColor = OneUiSelectedFill,
+                                inactiveTrackColor = OneUiPillSelected
+                            )
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            listOf(5, 10, 15, 20).forEach { s ->
+                                Text(
+                                    text = "${s}s",
+                                    fontSize = 11.sp,
+                                    color = if (prefsStore.doubleTapSeekSeconds == s) OneUiSelectedFill else OneUiTextSecondary,
+                                    fontWeight = if (prefsStore.doubleTapSeekSeconds == s) FontWeight.Bold else FontWeight.Normal,
+                                    modifier = Modifier.clickable {
+                                        if (prefsStore.doubleTapSeekSeconds != s) {
+                                            prefsStore.updateDoubleTapSeekSeconds(s)
+                                            AppHaptics.tick()
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -7729,6 +8005,12 @@ private enum class ActiveGestureMode {
     CHROME
 }
 
+private enum class FastSeekSide {
+    NONE,
+    LEFT,
+    RIGHT
+}
+
 /**
  * The film's own lettering, held over the picture while the stream catches up.
  *
@@ -7860,6 +8142,12 @@ private fun HeroVlcVideoPlayerScreen(
     var gestureGaugeFraction by remember { mutableStateOf<Float?>(null) }
     var isBoostGauge by remember { mutableStateOf(false) }
     var scrubFraction by remember { mutableStateOf<Float?>(null) }
+    var multiTapSide by remember { mutableStateOf(FastSeekSide.NONE) }
+    var multiTapSeconds by remember { mutableIntStateOf(0) }
+    var multiTapResetJob by remember { mutableStateOf<Job?>(null) }
+    var pendingSingleTapJob by remember { mutableStateOf<Job?>(null) }
+    var lastTapTimestamp by remember { mutableLongStateOf(0L) }
+    var lastTapPosition by remember { mutableStateOf(Offset.Zero) }
 
     /** Where the last scrub tick was felt, as a fraction of the run. */
     var lastScrubTick by remember { mutableFloatStateOf(0f) }
@@ -8376,33 +8664,15 @@ private fun HeroVlcVideoPlayerScreen(
     }
 
     /**
-     * Turn the screen to the shape the film was shot in.
+     * Default the player screen to landscape orientation.
      *
-     * Opening a player used to leave the requested orientation at `UNSPECIFIED`, which hands the
-     * decision to the system — and a phone with auto-rotate switched off answers "portrait". A 16:9
-     * film then played as a letterbox strip down the middle of the screen while the same file in
-     * another app turned itself. Those apps win because they ask for a sensor mode instead:
-     * [ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE] and its portrait twin follow how the device
-     * is actually held and ignore the user's rotation setting, so the film turns without switching
-     * auto-rotate back on for the rest of the phone.
-     *
-     * The film's own aspect ratio is the only honest signal of which way it wants to go, and 1 is the
-     * divide: at a square the two orientations give the same picture, so it leans toward the one that
-     * also fits the transport controls. [ArcVlcPlayerEngine.videoLayoutKnown] holds the decision back
-     * until libVLC has reported a track, because the placeholder ratio is 16:9 and a vertical clip
-     * would otherwise swing to landscape and straight back a few hundred milliseconds later.
-     *
-     * Keyed on the ratio rather than run once per open so that switching to a copy of a different
-     * shape is followed. The Rotate tool stays the manual override: a tap moves none of these three
-     * keys, so nothing here re-runs to argue with it, and the choice stands until the next film.
+     * The player defaults to [ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE] immediately upon opening,
+     * allowing sensor flips between standard and reverse landscape. When the player exits, [onDispose]
+     * restores [ActivityInfo.SCREEN_ORIENTATION_PORTRAIT] so the rest of the app remains locked in portrait.
+     * The Rotate tool in player controls acts as a manual toggle to portrait if desired.
      */
-    LaunchedEffect(video.id, vlcEngine.videoLayoutKnown, vlcEngine.videoAspectRatio) {
-        if (!vlcEngine.videoLayoutKnown) return@LaunchedEffect
-        activity?.requestedOrientation = if (vlcEngine.videoAspectRatio >= 1f) {
-            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        } else {
-            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-        }
+    LaunchedEffect(video.id) {
+        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
     }
 
     DisposableEffect(hostView, vlcEngine.isPlaying) {
@@ -8435,13 +8705,14 @@ private fun HeroVlcVideoPlayerScreen(
                 lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
                 win.attributes = lp
             }
-            // Handed back to the viewer's own setting rather than to no opinion. UNSPECIFIED reads as
-            // "leave the screen where it is", so after a film that turned itself sideways the home was
-            // measured still lying landscape on a phone whose auto-rotate is off, with nothing left to
-            // stand it up. FULL_USER is the one request that answers to that switch: it follows the
-            // sensor when auto-rotate is on, and returns to the rotation the viewer locked when it is
-            // off — which is the portrait this app's home is drawn for.
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+            // Back to the lock the rest of the app lives in, not to the viewer's own switch. FULL_USER
+            // follows auto-rotate, so on a phone with that turned on the home was measured lying
+            // landscape after a film that had turned itself sideways — and there is no landscape home
+            // to lie in. PORTRAIT is what the manifest launches into, so this is the same opinion the
+            // app had before the player ever spoke up.
+            pendingSingleTapJob?.cancel()
+            multiTapResetJob?.cancel()
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             vlcEngine.release()
         }
     }
@@ -8601,41 +8872,163 @@ private fun HeroVlcVideoPlayerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black.copy(alpha = (1f - dragProgress * 0.75f).coerceIn(0f, 1f)))
-            .pointerInput(isControlsLocked, zoomScale) {
-                detectTapGestures(
-                    onTap = {
-                        if (trackSheet != TrackSheet.NONE) {
-                            trackSheet = TrackSheet.NONE
-                        } else {
-                            showControls = !showControls
+            .pointerInput(isControlsLocked, trackSheet) {
+                val touchSlop = viewConfiguration.touchSlop
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val downTime = SystemClock.uptimeMillis()
+                    val downPos = down.position
+                    var moved = false
+
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        if (event.changes.any { it.isConsumed }) {
+                            moved = true
+                            break
                         }
-                    },
-                    onDoubleTap = { offset ->
-                        if (isControlsLocked) return@detectTapGestures
-                        val width = size.width.toFloat()
-                        when {
-                            zoomScale > 1.05f -> {
-                                zoomScale = 1f
-                                panOffset = Offset.Zero
-                                gestureHudText = "Zoom 1.0x"
-                            }
-                            offset.x < width * 0.35f -> {
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                        if (!change.pressed) {
+                            // Finger lifted cleanly
+                            break
+                        }
+                        if ((change.position - downPos).getDistance() > touchSlop) {
+                            moved = true
+                            break
+                        }
+                    }
+
+                    if (!moved && (SystemClock.uptimeMillis() - downTime) < 500L) {
+                        val now = SystemClock.uptimeMillis()
+                        val screenWidth = size.width.toFloat()
+                        val isLeft = downPos.x < screenWidth * 0.35f
+                        val isRight = downPos.x > screenWidth * 0.65f
+
+                        val stepSec = prefsStore.doubleTapSeekSeconds
+                        val stepMs = stepSec * 1000L
+
+                        if (!isControlsLocked) {
+                            // 1. Chained multi-tap on the same side (triple tap, 4th tap, etc.)
+                            if (multiTapSide == FastSeekSide.LEFT && isLeft) {
+                                multiTapResetJob?.cancel()
+                                pendingSingleTapJob?.cancel()
+                                multiTapSeconds += stepSec
                                 AppHaptics.tick()
-                                vlcEngine.seekByDelta(-10_000L)
-                                gestureHudText = "-10s"
+                                vlcEngine.seekByDelta(-stepMs)
+                                gestureHudText = "-${multiTapSeconds}s"
+                                multiTapResetJob = coroutineScope.launch {
+                                    delay(650L)
+                                    multiTapSide = FastSeekSide.NONE
+                                    multiTapSeconds = 0
+                                }
+                                lastTapTimestamp = now
+                                lastTapPosition = downPos
+                                return@awaitEachGesture
                             }
-                            offset.x > width * 0.65f -> {
+
+                            if (multiTapSide == FastSeekSide.RIGHT && isRight) {
+                                multiTapResetJob?.cancel()
+                                pendingSingleTapJob?.cancel()
+                                multiTapSeconds += stepSec
                                 AppHaptics.tick()
-                                vlcEngine.seekByDelta(10_000L)
-                                gestureHudText = "+10s"
+                                vlcEngine.seekByDelta(stepMs)
+                                gestureHudText = "+${multiTapSeconds}s"
+                                multiTapResetJob = coroutineScope.launch {
+                                    delay(650L)
+                                    multiTapSide = FastSeekSide.NONE
+                                    multiTapSeconds = 0
+                                }
+                                lastTapTimestamp = now
+                                lastTapPosition = downPos
+                                return@awaitEachGesture
                             }
-                            else -> {
-                                AppHaptics.click()
-                                vlcEngine.togglePlayPause()
+                        }
+
+                        // If user tapped a different area during an active multi-tap session, reset it
+                        if (multiTapSide != FastSeekSide.NONE) {
+                            multiTapResetJob?.cancel()
+                            multiTapSide = FastSeekSide.NONE
+                            multiTapSeconds = 0
+                        }
+
+                        // 2. Check if this is a double-tap
+                        val timeSinceLast = now - lastTapTimestamp
+                        val isSameArea = when {
+                            isLeft && lastTapPosition.x < screenWidth * 0.35f -> true
+                            isRight && lastTapPosition.x > screenWidth * 0.65f -> true
+                            !isLeft && !isRight && lastTapPosition.x in (screenWidth * 0.35f)..(screenWidth * 0.65f) &&
+                                (downPos - lastTapPosition).getDistance() < 120.dp.toPx() -> true
+                            else -> false
+                        }
+                        val isDoubleTap = timeSinceLast < 320L && isSameArea
+
+                        if (isDoubleTap) {
+                            pendingSingleTapJob?.cancel()
+                            lastTapTimestamp = 0L
+
+                            if (!isControlsLocked) {
+                                when {
+                                    isLeft -> {
+                                        multiTapSide = FastSeekSide.LEFT
+                                        multiTapSeconds = stepSec
+                                        AppHaptics.tick()
+                                        vlcEngine.seekByDelta(-stepMs)
+                                        gestureHudText = "-${stepSec}s"
+                                        multiTapResetJob = coroutineScope.launch {
+                                            delay(650L)
+                                            multiTapSide = FastSeekSide.NONE
+                                            multiTapSeconds = 0
+                                        }
+                                    }
+                                    isRight -> {
+                                        multiTapSide = FastSeekSide.RIGHT
+                                        multiTapSeconds = stepSec
+                                        AppHaptics.tick()
+                                        vlcEngine.seekByDelta(stepMs)
+                                        gestureHudText = "+${stepSec}s"
+                                        multiTapResetJob = coroutineScope.launch {
+                                            delay(650L)
+                                            multiTapSide = FastSeekSide.NONE
+                                            multiTapSeconds = 0
+                                        }
+                                    }
+                                    zoomScale > 1.05f -> {
+                                        coroutineScope.launch {
+                                            AppHaptics.click()
+                                            gestureHudText = "Original"
+                                            panOffset = Offset.Zero
+                                            Animatable(zoomScale).animateTo(
+                                                targetValue = 1f,
+                                                animationSpec = spring(
+                                                    dampingRatio = Spring.DampingRatioLowBouncy,
+                                                    stiffness = Spring.StiffnessMediumLow
+                                                )
+                                            ) {
+                                                zoomScale = value
+                                            }
+                                        }
+                                    }
+                                    else -> {
+                                        AppHaptics.click()
+                                        vlcEngine.togglePlayPause()
+                                    }
+                                }
+                            }
+                        } else {
+                            // First tap!
+                            lastTapTimestamp = now
+                            lastTapPosition = downPos
+                            pendingSingleTapJob?.cancel()
+                            pendingSingleTapJob = coroutineScope.launch {
+                                delay(280L)
+                                if (trackSheet != TrackSheet.NONE) {
+                                    trackSheet = TrackSheet.NONE
+                                } else {
+                                    showControls = !showControls
+                                }
                             }
                         }
                     }
-                )
+                }
             }
             .pointerInput(isControlsLocked, trackSheet) {
                 if (isControlsLocked || trackSheet != TrackSheet.NONE) return@pointerInput
@@ -8663,9 +9056,10 @@ private fun HeroVlcVideoPlayerScreen(
                             val zoomChange = event.calculateZoom()
                             val panChange = event.calculatePan()
                             if (zoomChange != 1f || panChange != Offset.Zero) {
-                                zoomScale = (zoomScale * zoomChange).coerceIn(0.5f, 4.0f)
-                                panOffset = if (zoomScale > 1f) panOffset + panChange else Offset.Zero
-                                gestureHudText = String.format(Locale.US, "Zoom %.1fx", zoomScale)
+                                val newZoom = (zoomScale * zoomChange).coerceIn(0.7f, 4.0f)
+                                zoomScale = newZoom
+                                panOffset = if (newZoom > 1f) panOffset + panChange else Offset.Zero
+                                gestureHudText = String.format(Locale.US, "Zoom %.2fx", newZoom)
                                 event.changes.forEach { if (it.positionChanged()) it.consume() }
                             }
                         } else if (pressedCount == 1 && mode != ActiveGestureMode.PINCH_ZOOM) {
@@ -8768,6 +9162,82 @@ private fun HeroVlcVideoPlayerScreen(
 
                     gestureGaugeFraction = null
                     isBoostGauge = false
+                    if (mode == ActiveGestureMode.PINCH_ZOOM) {
+                        val currentZoom = zoomScale
+                        val fillScale = if (fitW > 0 && fitH > 0) {
+                            max(containerW / fitW.toFloat(), containerH / fitH.toFloat())
+                        } else 1f
+
+                        val targetZoom: Float
+                        val hudLabel: String
+
+                        if (scaleMode == VideoScaleMode.CROP) {
+                            // In CROP mode, base framing already fills container width.
+                            // A pinch outward snaps to 1.34x to eliminate 2.35:1 letterbox bars.
+                            val cinemaTarget = 1.34f
+                            when {
+                                currentZoom < 1.15f -> {
+                                    targetZoom = 1.0f
+                                    hudLabel = "Crop to fit"
+                                }
+                                currentZoom in 1.15f..1.60f -> {
+                                    targetZoom = cinemaTarget
+                                    hudLabel = "Cinema fill (2.35:1)"
+                                }
+                                else -> {
+                                    targetZoom = currentZoom
+                                    hudLabel = String.format(Locale.US, "Zoom %.1fx", currentZoom)
+                                }
+                            }
+                        } else {
+                            // In FIT mode:
+                            // Snap 1: 1.0f (Original)
+                            // Snap 2: fillScale (Zoomed to fill container)
+                            // Snap 3: cinemaTarget (Cinema fill for 2.35:1 letterbox bars)
+                            val hasFill = fillScale > 1.06f
+                            val cinemaTarget = if (videoRatio in 1.7f..1.85f) fillScale * 1.34f else fillScale * 1.18f
+
+                            when {
+                                currentZoom < 1.08f -> {
+                                    targetZoom = 1.0f
+                                    hudLabel = "Original"
+                                }
+                                hasFill && currentZoom in 1.08f..(fillScale + (cinemaTarget - fillScale) * 0.45f) -> {
+                                    targetZoom = fillScale
+                                    hudLabel = "Zoomed to fill"
+                                }
+                                currentZoom in (fillScale + (cinemaTarget - fillScale) * 0.45f)..(cinemaTarget * 1.25f) -> {
+                                    targetZoom = cinemaTarget
+                                    hudLabel = "Cinema fill (2.35:1)"
+                                }
+                                else -> {
+                                    targetZoom = currentZoom
+                                    hudLabel = String.format(Locale.US, "Zoom %.1fx", currentZoom)
+                                }
+                            }
+                        }
+
+                        if (abs(currentZoom - targetZoom) > 0.01f) {
+                            coroutineScope.launch {
+                                AppHaptics.click()
+                                gestureHudText = hudLabel
+                                if (targetZoom <= 1.02f || targetZoom == fillScale || targetZoom == 1.34f) {
+                                    panOffset = Offset.Zero
+                                }
+                                Animatable(currentZoom).animateTo(
+                                    targetValue = targetZoom,
+                                    animationSpec = spring(
+                                        dampingRatio = Spring.DampingRatioLowBouncy,
+                                        stiffness = Spring.StiffnessMediumLow
+                                    )
+                                ) {
+                                    zoomScale = value
+                                }
+                            }
+                        } else {
+                            gestureHudText = hudLabel
+                        }
+                    }
                     if (mode == ActiveGestureMode.BRIGHTNESS || mode == ActiveGestureMode.VOLUME || mode == ActiveGestureMode.HORIZONTAL_SEEK) {
                         gestureHudText = null
                     }
@@ -9080,7 +9550,7 @@ private fun HeroVlcVideoPlayerScreen(
                     }
             ) {
                 Row(
-                    horizontalArrangement = Arrangement.End,
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -9098,26 +9568,6 @@ private fun HeroVlcVideoPlayerScreen(
                             bottom = 36.dp
                         )
                 ) {
-                    val isFav = prefsStore.favoriteIds.contains(video.id)
-                    IconButton(onClick = {
-                        AppHaptics.favorite(!isFav)
-                        prefsStore.toggleFavorite(video.id)
-                    }) {
-                        Icon(
-                            imageVector = if (isFav) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                            contentDescription = if (isFav) "Remove from favorites" else "Add to favorites",
-                            tint = if (isFav) OneUiAccent else Color.White,
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
-                    IconButton(onClick = { isControlsLocked = true }) {
-                        Icon(
-                            imageVector = Icons.Default.Lock,
-                            contentDescription = "Lock controls",
-                            tint = Color.White,
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
                     IconButton(
                         onClick = {
                             android.util.Log.i("ArcPlayer", "player closed: back arrow")
@@ -9131,6 +9581,29 @@ private fun HeroVlcVideoPlayerScreen(
                             tint = Color.White,
                             modifier = Modifier.size(26.dp)
                         )
+                    }
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        val isFav = prefsStore.favoriteIds.contains(video.id)
+                        IconButton(onClick = {
+                            AppHaptics.favorite(!isFav)
+                            prefsStore.toggleFavorite(video.id)
+                        }) {
+                            Icon(
+                                imageVector = if (isFav) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                                contentDescription = if (isFav) "Remove from favorites" else "Add to favorites",
+                                tint = if (isFav) OneUiAccent else Color.White,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        IconButton(onClick = { isControlsLocked = true }) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = "Lock controls",
+                                tint = Color.White,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
                     }
                 }
 
@@ -9216,10 +9689,23 @@ private fun HeroVlcVideoPlayerScreen(
                             bottom = navBarBottom + 12.dp
                         )
                 ) {
+                    val seekbarInteractionSource = remember { MutableInteractionSource() }
+                    val isSeekbarPressed by seekbarInteractionSource.collectIsPressedAsState()
+                    val isSeekbarDragged by seekbarInteractionSource.collectIsDraggedAsState()
+                    val isScrubbing = isSeekbarPressed || isSeekbarDragged || scrubFraction != null
+
+                    val titleAlpha by animateFloatAsState(
+                        targetValue = if (isScrubbing) 0f else 1f,
+                        animationSpec = tween(140),
+                        label = "playerTitleAlpha"
+                    )
+
                     Column(
-                        modifier = Modifier.fillMaxWidth(
-                            if (isLandscape && (nextUpEarly || nextUpSeconds > 0)) 0.48f else 1f
-                        )
+                        modifier = Modifier
+                            .fillMaxWidth(
+                                if (isLandscape && (nextUpEarly || nextUpSeconds > 0)) 0.48f else 1f
+                            )
+                            .graphicsLayer { alpha = titleAlpha }
                     ) {
                         Text(
                             text = playerTitle,
@@ -9241,55 +9727,253 @@ private fun HeroVlcVideoPlayerScreen(
                             )
                         }
                     }
-                    Slider(
-                        value = scrubFraction
-                            ?: (vlcEngine.currentPositionMs.toFloat() / vlcEngine.durationMs.coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f),
-                        onValueChange = { fraction ->
-                            scrubFraction = fraction
-                            // A tick every 3.5% of the run. Denser than that and a long drag buzzes
-                            // instead of ratcheting, which is the one thing that tells a finger how far
-                            // it has travelled without the viewer reading a number.
-                            if (abs(fraction - lastScrubTick) >= 0.035f) {
-                                lastScrubTick = fraction
-                                AppHaptics.tick()
+
+                    val animatedTrackStroke by animateDpAsState(
+                        targetValue = if (isScrubbing) 8.5.dp else 4.5.dp,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioMediumBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        ),
+                        label = "seekbarStroke"
+                    )
+
+                    val animatedThumbRadius by animateDpAsState(
+                        targetValue = if (isScrubbing) 8.5.dp else 0.dp,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioMediumBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        ),
+                        label = "seekbarThumb"
+                    )
+
+                    val animatedHaloRadius by animateDpAsState(
+                        targetValue = if (isScrubbing) 15.dp else 0.dp,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioMediumBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        ),
+                        label = "seekbarHalo"
+                    )
+
+                    val localMediaUri = remember(openedMedia, cloudSource) {
+                        if (cloudSource == null && openedMedia?.uri != null && openedMedia?.uri != Uri.EMPTY) {
+                            openedMedia?.uri
+                        } else null
+                    }
+                    val previewSession = remember(localMediaUri) {
+                        localMediaUri?.let { SeekPreviewSession(context.applicationContext, it) }
+                    }
+                    DisposableEffect(previewSession) {
+                        onDispose {
+                            previewSession?.close()
+                        }
+                    }
+
+                    LaunchedEffect(previewSession) {
+                        previewSession?.warmUp(vlcEngine.currentPositionMs)
+                    }
+
+                    val currentScrubFraction = scrubFraction
+                        ?: (vlcEngine.currentPositionMs.toFloat() / vlcEngine.durationMs.coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f)
+                    val scrubTargetMs = (currentScrubFraction * vlcEngine.durationMs).toLong().coerceIn(0L, vlcEngine.durationMs)
+                    val bucketMs = remember(scrubTargetMs) { (scrubTargetMs / 2500L) * 2500L }
+
+                    var previewBitmap by remember(localMediaUri) { mutableStateOf<Bitmap?>(null) }
+
+                    LaunchedEffect(bucketMs, localMediaUri, isScrubbing, previewSession) {
+                        if (!isScrubbing || localMediaUri == null || previewSession == null) {
+                            if (!isScrubbing) {
+                                delay(220L)
+                                previewBitmap = null
                             }
-                        },
-                        onValueChangeFinished = {
-                            val fraction = scrubFraction
-                            scrubFraction = null
-                            if (fraction != null) {
-                                AppHaptics.click()
-                                vlcEngine.seekTo((fraction * vlcEngine.durationMs).toLong())
-                            }
-                        },
-                        thumb = { Spacer(modifier = Modifier.size(12.dp)) },
-                        track = { slider ->
-                            Canvas(modifier = Modifier.fillMaxWidth().height(12.dp)) {
-                                val playedEnd = Offset(size.width * slider.value, center.y)
-                                drawLine(
-                                    color = Color.White.copy(alpha = 0.32f),
-                                    start = Offset(0f, center.y),
-                                    end = Offset(size.width, center.y),
-                                    strokeWidth = 3.dp.toPx(),
-                                    cap = StrokeCap.Round
-                                )
-                                drawLine(
-                                    color = Color.White,
-                                    start = Offset(0f, center.y),
-                                    end = playedEnd,
-                                    strokeWidth = 3.dp.toPx(),
-                                    cap = StrokeCap.Round
-                                )
-                                if (scrubFraction != null) {
-                                    drawCircle(Color.White, radius = 6.dp.toPx(), center = playedEnd)
+                            return@LaunchedEffect
+                        }
+                        val cached = SeekPreviewCache.get(localMediaUri, bucketMs)
+                        if (cached != null) {
+                            previewBitmap = cached
+                            previewSession.prefetchNeighbors(bucketMs, vlcEngine.durationMs)
+                            return@LaunchedEffect
+                        }
+                        val frame = previewSession.getFrame(bucketMs)
+                        if (frame != null) {
+                            previewBitmap = frame
+                            previewSession.prefetchNeighbors(bucketMs, vlcEngine.durationMs)
+                        }
+                    }
+
+                    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                        val totalW = maxWidth
+                        val previewW = 152.dp
+                        val previewH = if (videoRatio > 0.5f) {
+                            (previewW / videoRatio.coerceIn(1.2f, 2.4f))
+                        } else 86.dp
+
+                        val previewAlpha by animateFloatAsState(
+                            targetValue = if (isScrubbing) 1f else 0f,
+                            animationSpec = tween(140),
+                            label = "previewAlpha"
+                        )
+                        val previewScale by animateFloatAsState(
+                            targetValue = if (isScrubbing) 1f else 0.85f,
+                            animationSpec = spring(
+                                dampingRatio = Spring.DampingRatioLowBouncy,
+                                stiffness = Spring.StiffnessMediumLow
+                            ),
+                            label = "previewScale"
+                        )
+
+                        if (previewAlpha > 0.01f) {
+                            val bmp = previewBitmap
+                            val showThumbnail = localMediaUri != null && bmp != null
+                            val bubbleW = if (showThumbnail) previewW else 84.dp
+                            val bubbleH = if (showThumbnail) previewH else 34.dp
+
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .offset {
+                                        val totalPx = totalW.roundToPx()
+                                        val bubbleWPx = bubbleW.roundToPx()
+                                        val bubbleHPx = bubbleH.roundToPx()
+                                        val thumbCenterPx = (totalPx * currentScrubFraction).toInt()
+                                        val leftPx = (thumbCenterPx - bubbleWPx / 2).coerceIn(0, (totalPx - bubbleWPx).coerceAtLeast(0))
+                                        val topPx = -bubbleHPx - 14.dp.roundToPx()
+                                        IntOffset(leftPx, topPx)
+                                    }
+                                    .graphicsLayer {
+                                        alpha = previewAlpha
+                                        scaleX = previewScale
+                                        scaleY = previewScale
+                                        transformOrigin = TransformOrigin(0.5f, 1f)
+                                    }
+                            ) {
+                                if (showThumbnail) {
+                                    val nonNullBmp = bmp ?: return@Box
+                                    Surface(
+                                        shape = RoundedCornerShape(14.dp),
+                                        color = Color(0xFF141318),
+                                        border = BorderStroke(1.5.dp, Color.White.copy(alpha = 0.35f)),
+                                        shadowElevation = 12.dp,
+                                        modifier = Modifier
+                                            .width(previewW)
+                                            .height(previewH)
+                                    ) {
+                                        Box(modifier = Modifier.fillMaxSize()) {
+                                            Image(
+                                                bitmap = nonNullBmp.asImageBitmap(),
+                                                contentDescription = null,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(28.dp)
+                                                    .align(Alignment.BottomCenter)
+                                                    .background(
+                                                        Brush.verticalGradient(
+                                                            listOf(Color.Transparent, Color.Black.copy(alpha = 0.88f))
+                                                        )
+                                                    ),
+                                                contentAlignment = Alignment.BottomCenter
+                                            ) {
+                                                Text(
+                                                    text = formatDuration(scrubTargetMs),
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color.White,
+                                                    modifier = Modifier.padding(bottom = 4.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Surface(
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = Color(0xFF141318).copy(alpha = 0.92f),
+                                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.28f)),
+                                        shadowElevation = 8.dp
+                                    ) {
+                                        Text(
+                                            text = formatDuration(scrubTargetMs),
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color.White,
+                                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 5.dp)
+                                        )
+                                    }
                                 }
                             }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(36.dp)
-                            .semantics { contentDescription = "Playback position" }
-                    )
+                        }
+
+                        Slider(
+                            value = scrubFraction
+                                ?: (vlcEngine.currentPositionMs.toFloat() / vlcEngine.durationMs.coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f),
+                            onValueChange = { fraction ->
+                                scrubFraction = fraction
+                                // A tick every 3.5% of the run. Denser than that and a long drag buzzes
+                                // instead of ratcheting, which is the one thing that tells a finger how far
+                                // it has travelled without the viewer reading a number.
+                                if (abs(fraction - lastScrubTick) >= 0.035f) {
+                                    lastScrubTick = fraction
+                                    AppHaptics.tick()
+                                }
+                            },
+                            onValueChangeFinished = {
+                                val fraction = scrubFraction
+                                scrubFraction = null
+                                if (fraction != null) {
+                                    AppHaptics.click()
+                                    vlcEngine.seekTo((fraction * vlcEngine.durationMs).toLong())
+                                }
+                            },
+                            interactionSource = seekbarInteractionSource,
+                            thumb = { Spacer(modifier = Modifier.size(if (isScrubbing) 24.dp else 16.dp)) },
+                            track = { slider ->
+                                Canvas(modifier = Modifier.fillMaxWidth().height(32.dp)) {
+                                    val trackWidth = size.width
+                                    val centerY = center.y
+                                    val playedEnd = Offset(trackWidth * slider.value, centerY)
+                                    val strokePx = animatedTrackStroke.toPx()
+
+                                    drawLine(
+                                        color = Color.White.copy(alpha = 0.32f),
+                                        start = Offset(0f, centerY),
+                                        end = Offset(trackWidth, centerY),
+                                        strokeWidth = strokePx,
+                                        cap = StrokeCap.Round
+                                    )
+                                    drawLine(
+                                        color = Color.White,
+                                        start = Offset(0f, centerY),
+                                        end = playedEnd,
+                                        strokeWidth = strokePx,
+                                        cap = StrokeCap.Round
+                                    )
+                                    if (animatedThumbRadius > 0.5.dp) {
+                                        val haloPx = animatedHaloRadius.toPx()
+                                        if (haloPx > 0f) {
+                                            drawCircle(
+                                                color = Color.White.copy(alpha = 0.24f),
+                                                radius = haloPx,
+                                                center = playedEnd
+                                            )
+                                        }
+                                        drawCircle(
+                                            color = Color.White,
+                                            radius = animatedThumbRadius.toPx(),
+                                            center = playedEnd
+                                        )
+                                    }
+                                }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(40.dp)
+                                .semantics { contentDescription = "Playback position" }
+                        )
+                    }
                     val timeText = "${formatDuration(scrubFraction?.let { (it * vlcEngine.durationMs).toLong() } ?: vlcEngine.currentPositionMs)} / ${formatDuration(vlcEngine.durationMs)}"
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -9635,10 +10319,10 @@ private fun HeroVlcVideoPlayerScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = if (vlcEngine.subtitleLiftPercent == 0) {
-                            "Subtitle Position: Default"
-                        } else {
-                            "Subtitle Position: +${vlcEngine.subtitleLiftPercent}%"
+                        text = when {
+                            vlcEngine.subtitleLiftPercent == 0 -> "Subtitle Position: Default"
+                            vlcEngine.subtitleLiftPercent > 0 -> "Subtitle Position: +${vlcEngine.subtitleLiftPercent}%"
+                            else -> "Subtitle Position: ${vlcEngine.subtitleLiftPercent}%"
                         },
                         fontSize = 12.5.sp,
                         color = Color.White.copy(alpha = 0.85f)

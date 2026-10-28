@@ -50,9 +50,17 @@
         android:theme="@style/Theme.ArcPlayer">
         <!-- Everything that can shift while a film is running is handled in place rather than by a
              relaunch: a recreated activity loses the open playback, so the player closes on its own. -->
+        <!--
+            Portrait is the only layout every page here is drawn for, so the app asks for it up front
+            rather than leaving the choice to whatever way the phone happens to be held. This is the
+            launch-time declaration only: the player calls setRequestedOrientation once libVLC has
+            reported the film's own shape, and a runtime request outranks the manifest, so landscape
+            films still turn the screen. When the player closes, MainActivity hands back to portrait.
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:screenOrientation="portrait"
             android:supportsPictureInPicture="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|density|uiMode|fontScale|locale|layoutDirection"
             android:windowSoftInputMode="adjustResize">

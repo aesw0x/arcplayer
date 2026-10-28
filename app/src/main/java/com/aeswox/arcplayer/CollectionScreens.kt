@@ -79,10 +79,13 @@ import com.aeswox.arcplayer.metadata.PlayOrder
 import com.aeswox.arcplayer.metadata.TitleCandidate
 import com.aeswox.arcplayer.metadata.TitleGroups
 import com.aeswox.arcplayer.metadata.formatRuntime
+import com.aeswox.arcplayer.ui.animations.HeroArrival
+import com.aeswox.arcplayer.ui.animations.HeroArrivalLeadMs
 import com.aeswox.arcplayer.ui.animations.JellySkeleton
 import com.aeswox.arcplayer.ui.animations.StaggeredListItem
 import com.aeswox.arcplayer.ui.animations.jellyClick
 import com.aeswox.arcplayer.ui.animations.physicsBounceOverscroll
+import com.aeswox.arcplayer.ui.animations.rememberHeroArrival
 import com.aeswox.arcplayer.ui.components.HugeIcons
 import com.aeswox.arcplayer.ui.haptics.AppHaptics
 import com.aeswox.arcplayer.ui.theme.Accent as JellyAccent
@@ -131,6 +134,15 @@ internal data class CollectionResume(
  */
 internal class CollectionShelf(
     val authorized: Boolean,
+    /**
+     * Whether the library has answered, as opposed to still being asked.
+     *
+     * The session takes about a second to restore, and for all of that second `authorized` is simply not
+     * known yet — which the pages were reading as "not connected", printing a "Connect Telegram" card
+     * over a collection that was already on its way. The two are different facts and now carry different
+     * flags, so a page with nothing to show can hold its black instead of guessing.
+     */
+    val connectionKnown: Boolean,
     val loading: Boolean,
     val gone: Boolean,
     val readFailed: Boolean,
@@ -166,6 +178,7 @@ internal class CollectionShelf(
  */
 private fun buildCollectionShelf(
     authorized: Boolean,
+    connectionKnown: Boolean,
     shelfId: Long,
     videosByChat: Map<Long, List<CloudVideoItem>>,
     loading: Boolean,
@@ -252,6 +265,7 @@ private fun buildCollectionShelf(
     }.take(12)
     return CollectionShelf(
         authorized = authorized,
+        connectionKnown = connectionKnown,
         loading = loading,
         gone = gone,
         readFailed = readFailed,
@@ -291,6 +305,10 @@ internal fun rememberCollectionShelf(
     val auth by repository.authState.collectAsState()
     val downloads by repository.downloads.collectAsState()
     val authorized = auth.stage == CloudAuthStage.AUTHORIZED
+    // A stage still sitting at READY_TO_START with nothing to report is the auth machine's own word for
+    // "connecting" — see TelegramStep.CONNECTING. Telegram has not yet said whether this install has a
+    // session, so neither "connected" nor "not connected" is a true thing to draw.
+    val connectionKnown = authorized || auth.stage != CloudAuthStage.READY_TO_START || auth.error != null
     val shelfId = prefsStore.movieFolderChatId
     val owner = LocalLifecycleOwner.current
     var loading by remember(repository, authorized, shelfId) { mutableStateOf(false) }
@@ -322,10 +340,10 @@ internal fun rememberCollectionShelf(
 
     // Handed back as the state rather than its contents: the tabs read it in their own scope, so a late
     // catalogue answer redraws the page that shows it instead of only the page that asked.
-    val shelf = remember(repository, prefsStore, snapshot, authorized, shelfId) {
+    val shelf = remember(repository, prefsStore, snapshot, authorized, connectionKnown, shelfId) {
         derivedStateOf {
             buildCollectionShelf(
-                authorized, shelfId, videosByChat, loading, gone, readFailed, prefsStore, snapshot,
+                authorized, connectionKnown, shelfId, videosByChat, loading, gone, readFailed, prefsStore, snapshot,
                 downloads
             )
         }
@@ -359,6 +377,7 @@ internal fun CollectionScreens(
     if (tab == BottomNavTab.SETTINGS) return
     val shelf = shelfState.value
     val authorized = shelf.authorized
+    val connectionKnown = shelf.connectionKnown
     val loading = shelf.loading
     val gone = shelf.gone
     val readFailed = shelf.readFailed
@@ -456,7 +475,9 @@ internal fun CollectionScreens(
                                     CollectionDownloadsBadge(activeDownloads, onOpenDownloads)
                                 }
                             }
-                            Text(
+                            // Held back with the card it counts for: "0 titles" is not a fact while the
+                            // session is still restoring, it is the absence of one.
+                            if (connectionKnown) Text(
                                 buildString {
                                     append("${titles.size} ${if (titles.size == 1) "title" else "titles"} · Telegram and this phone")
                                     // Said out loud because a device file the catalogue would not name is filed here
@@ -491,7 +512,7 @@ internal fun CollectionScreens(
                             }
                         }
                     }
-                    if (filtered.isEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
+                    if (filtered.isEmpty() && (connectionKnown || titles.isNotEmpty())) item(span = { GridItemSpan(maxLineSpan) }) {
                         CollectionEmpty(if (titles.isEmpty()) emptyMessage else "No ${selectedFilter.label.lowercase()} yet.", onManageCollection, onOpenDevice, manageLabel)
                     }
                     itemsIndexed(filtered, key = { _, title -> title.group.key }) { index, title ->
@@ -549,47 +570,62 @@ internal fun CollectionScreens(
                     val heroHeight = rememberCollectionHeroHeight()
                     val heroPager = rememberPagerState(pageCount = { featured.size })
                     val heroPull = remember { Animatable(0f) }
+                    val heroArrival = rememberHeroArrival(featured.isNotEmpty())
+                    // The rails wait for the picture. A lead that applies when there is no picture to
+                    // wait for would just be a delay, so it is only paid when the hero has something to
+                    // fade up.
+                    val railsLeadMs = if (featured.isNotEmpty()) HeroArrivalLeadMs else 0L
                     // The backdrop lives outside the scrolling column on purpose. The bounce
                     // overscroll translates the whole column — title, pills and dots ride it down —
                     // while this layer follows only the real scroll, so mid-stretch the picture
                     // holds the top edge and no page background opens up above it.
-                    if (featured.isNotEmpty()) PinnedHeroArtwork(featured, prefsStore, heroPager, homeScroll, heroHeight, heroPull)
+                    if (featured.isNotEmpty()) {
+                        PinnedHeroArtwork(featured, prefsStore, heroPager, homeScroll, heroHeight, heroPull, heroArrival)
+                    }
                     LazyColumn(
                         state = homeScroll, modifier = Modifier.physicsBounceOverscroll(displacement = heroPull).fillMaxSize(),
                         contentPadding = PaddingValues(bottom = bottomInset + 120.dp),
                         verticalArrangement = Arrangement.spacedBy(32.dp)
                     ) {
                         item(key = "hero") {
-                            CollectionHero(featured, prefsStore, topInset, onOpenTitle, heroPager, heroHeight)
+                            // Nothing to show and nothing honest to say about it yet. The heading and its
+                            // "Connect Telegram" card answer a question Telegram has not answered, and they
+                            // used to print for the second the session takes to restore — a flash of a lie
+                            // over a collection already on its way. The page's own black is the same black
+                            // the clapperboard stood on, so holding it costs nothing to look at.
+                            if (featured.isEmpty() && !connectionKnown) Spacer(Modifier.height(topInset + 32.dp))
+                            else CollectionHero(featured, prefsStore, topInset, onOpenTitle, heroPager, heroHeight, heroArrival)
                         }
                         if (readFailed && titles.isNotEmpty()) item {
                             Text("Couldn't refresh. Showing your saved collection.", color = JellyOnSurfaceVariant, modifier = Modifier.padding(horizontal = 24.dp))
                         }
                         if (continuing.isNotEmpty()) item(key = "continue") {
                             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                                CollectionHeading("Continue Watching", Modifier.padding(horizontal = 24.dp), small = true)
+                                StaggeredListItem(0, "continue-heading", railsLeadMs) {
+                                    CollectionHeading("Continue Watching", Modifier.padding(horizontal = 24.dp), small = true)
+                                }
                                 LazyRow(
                                     contentPadding = PaddingValues(horizontal = 24.dp),
                                     horizontalArrangement = Arrangement.spacedBy(16.dp),
                                     modifier = Modifier.physicsBounceOverscroll(isHorizontal = true)
                                 ) {
                                     itemsIndexed(continuing, key = { _, entry -> entry.key }) { index, entry ->
-                                        StaggeredListItem(index, "continue:${entry.key}") { CollectionContinueCard(entry, prefsStore, savedIds) { playResume(entry) } }
+                                        StaggeredListItem(index, "continue:${entry.key}", railsLeadMs) { CollectionContinueCard(entry, prefsStore, savedIds) { playResume(entry) } }
                                     }
                                 }
                             }
                         }
-                        if (titles.isEmpty()) item(key = "empty") {
+                        if (titles.isEmpty() && connectionKnown) item(key = "empty") {
                             Box(Modifier.padding(horizontal = 24.dp)) { CollectionEmpty(emptyMessage, onManageCollection, onOpenDevice, manageLabel) }
                         }
                         if (titles.isNotEmpty()) item(key = "recent") {
-                            CollectionRail("Recently Added", titles.take(16), prefsStore, savedIds, { browse = CollectionFilter.ALL }, onOpenTitle)
+                            CollectionRail("Recently Added", titles.take(16), prefsStore, savedIds, { browse = CollectionFilter.ALL }, onOpenTitle, railsLeadMs)
                         }
                         if (movies.isNotEmpty()) item(key = "movies") {
-                            CollectionRail("Your Movies", movies.take(16), prefsStore, savedIds, { browse = CollectionFilter.MOVIES }, onOpenTitle)
+                            CollectionRail("Your Movies", movies.take(16), prefsStore, savedIds, { browse = CollectionFilter.MOVIES }, onOpenTitle, railsLeadMs)
                         }
                         if (series.isNotEmpty()) item(key = "series") {
-                            CollectionRail("Your Series", series.take(16), prefsStore, savedIds, { browse = CollectionFilter.SERIES }, onOpenTitle)
+                            CollectionRail("Your Series", series.take(16), prefsStore, savedIds, { browse = CollectionFilter.SERIES }, onOpenTitle, railsLeadMs)
                         }
                     }
                 }
@@ -646,7 +682,8 @@ internal val HeroFeather = Brush.verticalGradient(listOf(JellyBackground.copy(al
 
 @Composable
 private fun CollectionHero(titles: List<ShelfTitle>, prefs: ArcPreferencesStore, topInset: Dp,
-                           onOpen: (ShelfTitle) -> Unit, pager: PagerState, heroHeight: Dp) {
+                           onOpen: (ShelfTitle) -> Unit, pager: PagerState, heroHeight: Dp,
+                           arrival: HeroArrival) {
     if (titles.isEmpty()) {
         Column(Modifier.padding(start = 24.dp, end = 24.dp, top = topInset + 32.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("ONLY YOURS", color = JellyOnSurfaceVariant, fontSize = 12.sp, letterSpacing = 2.sp)
@@ -683,7 +720,15 @@ private fun CollectionHero(titles: List<ShelfTitle>, prefs: ArcPreferencesStore,
                 // The group wants to sit lower than the hero box allows, so the last 3 dp hang past
                 // its bottom edge into the gap above the next section.
                 Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(start = 24.dp, end = 24.dp)
-                    .graphicsLayer { alpha = 1f - recede; translationY = 3.dp.toPx() },
+                    // The lettering and the pill climb into the frame together, a third of a second after
+                    // the picture starts to light, and they fade on the way up. One layer carries both the
+                    // pager's own recede and the arrival's fade: the pill is a tinted solid rather than a
+                    // glass consumer — it sits inside the shelf's recorded subtree and cannot sample it —
+                    // so an alpha over it costs nothing but the second layer it would otherwise need.
+                    .graphicsLayer {
+                        alpha = (1f - recede) * (1f - arrival.wordsFade())
+                        translationY = 3.dp.toPx() + arrival.riseOffset(24.dp.toPx())
+                    },
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     if (logo != null) Image(logo.asImageBitmap(), title.name, contentScale = ContentScale.Fit,
@@ -710,7 +755,8 @@ private fun CollectionHero(titles: List<ShelfTitle>, prefs: ArcPreferencesStore,
  */
 @Composable
 private fun PinnedHeroArtwork(titles: List<ShelfTitle>, prefs: ArcPreferencesStore, pager: PagerState,
-                              scroll: LazyListState, heroHeight: Dp, pull: Animatable<Float, *>) {
+                              scroll: LazyListState, heroHeight: Dp, pull: Animatable<Float, *>,
+                              arrival: HeroArrival) {
     val layerHeightPx = with(LocalDensity.current) { heroHeight.toPx() }
     val maxBlurPx = with(LocalDensity.current) { 28.dp.toPx() }
     Box(Modifier.graphicsLayer {
@@ -729,7 +775,7 @@ private fun PinnedHeroArtwork(titles: List<ShelfTitle>, prefs: ArcPreferencesSto
         val offsetFraction = pager.currentPageOffsetFraction
         for (index in (pager.currentPage - 1)..(pager.currentPage + 1)) {
             if (index !in titles.indices) continue
-            HeroArtPage(titles[index], prefs, index - pager.currentPage - offsetFraction)
+            HeroArtPage(titles[index], prefs, index - pager.currentPage - offsetFraction, arrival)
         }
     }
     // The cover rides that edge — real scroll plus the overscroll stretch — and hides the overdraw
@@ -787,7 +833,7 @@ private fun defocusAndDim(radiusPx: Float, keep: Float): RenderEffect {
 
 /** One backdrop page of the pinned layer, sliding with the same offset the pager gives its page. */
 @Composable
-private fun HeroArtPage(title: ShelfTitle, prefs: ArcPreferencesStore, slide: Float) {
+private fun HeroArtPage(title: ShelfTitle, prefs: ArcPreferencesStore, slide: Float, arrival: HeroArrival) {
     val poster = rememberCachedArt(title.posterUrl, 1_000)
     val nearby = abs(slide) <= 1f
     val detail = if (nearby) TitleDetailFetch(title.providerId, title.isSeries, prefs) else null
@@ -795,10 +841,18 @@ private fun HeroArtPage(title: ShelfTitle, prefs: ArcPreferencesStore, slide: Fl
     Box(Modifier.graphicsLayer { translationX = slide * size.width }.fillMaxSize().clipToBounds()) {
         if (backdrop == null) CollectionImage(null, awaiting = true)
         else Image(backdrop.asImageBitmap(), null, contentScale = ContentScale.Crop,
+            // The 1.18 is not decoration: it is the slack the parallax needs to slide within without ever
+            // exposing an edge. The arrival's own overshoot rides on top of it and falls away, so the
+            // picture lands on a scale it already had rather than on one invented for the entrance.
             modifier = Modifier.fillMaxSize().graphicsLayer {
-                scaleX = 1.18f; scaleY = 1.18f
+                val focus = arrival.focusScale()
+                scaleX = 1.18f * focus; scaleY = 1.18f * focus
                 translationX = -slide * size.width * 0.1f
             })
+        // The reveal: the page's own black lifting off the picture. It is a fade the same way alpha is,
+        // seen from the other side, and it can be put on a layer it owns instead of one the scroll's blur
+        // and dimming already hold — under that render effect a nested alpha paints nothing at all.
+        Box(Modifier.fillMaxSize().graphicsLayer { alpha = 1f - arrival.lit() }.background(JellyBackground))
         Box(Modifier.fillMaxSize().background(HeroScrim))
         // The reference recedes an adjacent card by scaling it down. Here the card is the whole
         // screen, so shrinking one would pull the background up between two pages; it recedes
@@ -810,12 +864,14 @@ private fun HeroArtPage(title: ShelfTitle, prefs: ArcPreferencesStore, slide: Fl
 @Composable
 private fun CollectionRail(label: String, titles: List<ShelfTitle>, prefsStore: ArcPreferencesStore,
                            savedIds: Set<Long>,
-                           onAll: () -> Unit, onOpen: (ShelfTitle) -> Unit) {
+                           onAll: () -> Unit, onOpen: (ShelfTitle) -> Unit, leadMs: Long = 0L) {
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalAlignment = Alignment.CenterVertically) {
-            CollectionHeading(label, Modifier.weight(1f), small = true)
-            Text("See all", color = JellyOnSurfaceVariant, fontSize = 13.sp,
-                modifier = Modifier.jellyClick(role = Role.Button, onClickLabel = "See all $label", onClick = onAll).padding(vertical = 12.dp, horizontal = 8.dp))
+        StaggeredListItem(0, "rail-heading:$label", leadMs) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalAlignment = Alignment.CenterVertically) {
+                CollectionHeading(label, Modifier.weight(1f), small = true)
+                Text("See all", color = JellyOnSurfaceVariant, fontSize = 13.sp,
+                    modifier = Modifier.jellyClick(role = Role.Button, onClickLabel = "See all $label", onClick = onAll).padding(vertical = 12.dp, horizontal = 8.dp))
+            }
         }
         LazyRow(
             contentPadding = PaddingValues(horizontal = 24.dp),
@@ -823,7 +879,7 @@ private fun CollectionRail(label: String, titles: List<ShelfTitle>, prefsStore: 
             modifier = Modifier.physicsBounceOverscroll(isHorizontal = true)
         ) {
             itemsIndexed(titles, key = { _, title -> title.group.key }) { index, title ->
-                StaggeredListItem(index, "rail:$label:${title.group.key}") {
+                StaggeredListItem(index, "rail:$label:${title.group.key}", leadMs) {
                     CollectionPoster(title, Modifier.width(132.dp), prefsStore, savedIds, onOpen)
                 }
             }
@@ -858,7 +914,14 @@ private fun CollectionPoster(title: ShelfTitle, modifier: Modifier, prefsStore: 
                 }
             }
         }
-        Text(title.name, color = JellyOnSurface, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        // Two lines are paid for whether the title uses one or both. In a LazyRow only the cards on
+        // screen are composed, so the rail is as tall as the tallest of *those* — and a card that
+        // grew a line only while "Catch Me If You Can" happened to be visible moved everything below
+        // the rail by a line every time it scrolled past. The line height is pinned so the block is
+        // two lines of a known height rather than two lines of whatever the font's own leading is.
+        Text(title.name, modifier = Modifier.height(48.dp), color = JellyOnSurface,
+            fontWeight = FontWeight.SemiBold, fontSize = 14.sp, lineHeight = 20.sp,
+            maxLines = 2, overflow = TextOverflow.Ellipsis)
         Text(if (title.isSeries) "Series" else "Movie", color = JellyOnSurfaceVariant, fontSize = 12.sp)
     }
 }
