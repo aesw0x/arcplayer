@@ -137,7 +137,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -229,8 +228,6 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
@@ -252,6 +249,13 @@ import com.aeswox.arcplayer.ui.animations.jellyCombinedClickable
 import com.aeswox.arcplayer.ui.animations.jellyTabCrossSlide
 import com.aeswox.arcplayer.ui.animations.jellySkeletonSweep
 import com.aeswox.arcplayer.ui.animations.physicsBounceOverscroll
+import com.aeswox.arcplayer.ui.components.AppIntro
+import com.aeswox.arcplayer.update.Release
+import com.aeswox.arcplayer.update.UpdateCard
+import com.aeswox.arcplayer.update.UpdateCheck
+import com.aeswox.arcplayer.update.UpdateDownload
+import com.aeswox.arcplayer.update.UpdateManager
+import com.aeswox.arcplayer.update.UpdateProgress
 import com.aeswox.arcplayer.ui.components.ClapperIntroGate
 import com.aeswox.arcplayer.ui.components.FrostedDialog
 import com.aeswox.arcplayer.ui.components.FrostedModalPanel
@@ -277,12 +281,10 @@ import com.aeswox.arcplayer.ui.jelly.jellySource
 import com.aeswox.arcplayer.backdrop.backdrops.LayerBackdrop
 import com.aeswox.arcplayer.backdrop.backdrops.rememberLayerBackdrop
 import com.aeswox.arcplayer.cloud.CloudAuthStage
-import com.aeswox.arcplayer.cloud.CloudAuthState
 import com.aeswox.arcplayer.cloud.CloudRepository
 import com.aeswox.arcplayer.cloud.CloudSession
 import com.aeswox.arcplayer.cloud.CloudVideoItem
 import com.aeswox.arcplayer.cloud.CloudWindowPlanner
-import com.aeswox.arcplayer.cloud.CodeHint
 import com.aeswox.arcplayer.cloud.DownloadEntry
 import com.aeswox.arcplayer.cloud.DownloadLedger
 import com.aeswox.arcplayer.cloud.DownloadNotifier
@@ -585,6 +587,25 @@ class ArcPreferencesStore(context: Context) {
         private set
 
     /**
+     * Whether the first-launch tour of the Telegram setup has already been put in front of the viewer.
+     *
+     * Stamped when the page is shown, not when it is dismissed: the promise made to the viewer is that
+     * this happens once, and an install killed halfway across the page has still had its one showing.
+     */
+    var telegramWelcomeSeen by mutableStateOf(false)
+        private set
+
+    /**
+     * The build the viewer last turned down.
+     *
+     * Held as a version rather than as a date or a switch, because the promise a dismissal makes is about
+     * that one release: the next is a different thing to consider, and an app that nagged about it would
+     * be an app switched off at the first opportunity.
+     */
+    var updateDismissedVersion by mutableStateOf("")
+        private set
+
+    /**
      * When each file was last played, keyed by its stable id — from the channel or off this phone.
      *
      * The one figure that lets a shelf card say "Resume" instead of "Play" when the copy the viewer last
@@ -629,6 +650,8 @@ class ArcPreferencesStore(context: Context) {
             telegramApiHash = prefs.getString("tg_api_hash", "").orEmpty()
 
             movieFolderChatId = prefs.getLong("movie_folder_chat_id", 0L)
+            telegramWelcomeSeen = prefs.getBoolean("telegram_welcome_seen", false)
+            updateDismissedVersion = prefs.getString("update_dismissed_version", "").orEmpty()
 
             val watchedJson = JSONObject(prefs.getString("cloud_watched_at", "{}") ?: "{}")
             watchedJson.keys().forEach { key ->
@@ -773,6 +796,18 @@ class ArcPreferencesStore(context: Context) {
     fun rememberMovieFolder(chatId: Long) {
         movieFolderChatId = chatId
         prefs.edit().putLong("movie_folder_chat_id", chatId).apply()
+    }
+
+    /** Stamp that the first-launch tour has been shown, so it never shows a second time. */
+    fun rememberTelegramWelcome() {
+        telegramWelcomeSeen = true
+        prefs.edit().putBoolean("telegram_welcome_seen", true).apply()
+    }
+
+    /** Turn one release down. The next one is still welcome to ask. */
+    fun dismissUpdate(version: String) {
+        updateDismissedVersion = version
+        prefs.edit().putString("update_dismissed_version", version).apply()
     }
 
     /**
@@ -2413,8 +2448,10 @@ fun ArcPlayerHomeScreen() {
     var pendingPlaylistVideoId by remember { mutableStateOf<Long?>(null) }
 
     var cloudScreenName by rememberSaveable { mutableStateOf(CloudScreen.SHELF.name) }
+    var telegramOnboardingStarted by rememberSaveable { mutableStateOf(false) }
     var cloudNotice by remember { mutableStateOf<String?>(null) }
     val openLibraryBrowser: (LibraryPage, CloudScreen) -> Unit = { page, screen ->
+        telegramOnboardingStarted = false
         mainTabName = BottomNavTab.LIBRARY.name
         libraryPageName = page.name
         cloudScreenName = screen.name
@@ -2469,6 +2506,68 @@ fun ArcPlayerHomeScreen() {
     // rebuilds the repository is the only thing that drives it again.
     LaunchedEffect(cloudRepository) {
         cloudRepository.begin()
+    }
+    val telegramAuth by cloudRepository.authState.collectAsState()
+    val showingTelegramSetup = showingBrowser && livePage == LibraryPage.CLOUD &&
+        cloudScreenName == CloudScreen.SHELF.name &&
+        (telegramAuth.stage != CloudAuthStage.AUTHORIZED || telegramOnboardingStarted)
+
+    // The tour is the front door, so on a first install it opens by itself. Held until the clapperboard
+    // has lifted: navigating underneath the overlay left the browser mid-slide when the mark went away.
+    // A chat id on disk is the only thing that vetoes it — it means this install already made a
+    // collection, whatever the session happens to report tonight — and skipping it leaves the
+    // "Connect Telegram" pill on Home exactly where it always was.
+    LaunchedEffect(Unit) {
+        AppIntro.awaitHomeRelease()
+        if (!prefsStore.telegramWelcomeSeen && prefsStore.movieFolderChatId == 0L) {
+            prefsStore.rememberTelegramWelcome()
+            openLibraryBrowser(LibraryPage.CLOUD, CloudScreen.SHELF)
+        }
+    }
+
+    // The updater asks once per launch, and only after the heavy work has landed: `awaitHomeRelease` is
+    // the same hand the clapperboard, the staggered entrances and the stranded-download sweep wait on, and
+    // the extra beat keeps the answer from arriving while the shelf is still assembling itself. Settings
+    // asks the same question on tap, which is why the answers are kept apart below rather than collapsed
+    // into a null — a card nobody asked for says nothing when GitHub cannot be reached, but a button
+    // someone pressed has to say which of the two happened.
+    val updateManager = remember { UpdateManager(context) }
+    var updateRelease by remember { mutableStateOf<Release?>(null) }
+    var updateChecking by remember { mutableStateOf(false) }
+    var updateUnreachable by remember { mutableStateOf(false) }
+    var updateDismissed by remember { mutableStateOf(false) }
+    var updateDownload by remember { mutableStateOf<UpdateDownload>(UpdateDownload.Idle) }
+    val checkForUpdates: () -> Unit = {
+        if (!updateChecking) {
+            updateChecking = true
+            updateUnreachable = false
+            coroutineScope.launch {
+                when (val answer = updateManager.check()) {
+                    is UpdateCheck.Available -> updateRelease = answer.release
+                    // A clean "nothing newer" also retires an offer from a check that guessed wrong.
+                    UpdateCheck.Current -> updateRelease = null
+                    // A release found by an earlier answer survives a flaky network.
+                    UpdateCheck.Unreachable -> updateUnreachable = true
+                }
+                updateChecking = false
+            }
+        }
+    }
+    LaunchedEffect(Unit) {
+        AppIntro.awaitHomeRelease()
+        delay(1_200)
+        checkForUpdates()
+    }
+    // "Later" is a decision about the card, not about the release — Settings still offers it.
+    val updateOffer = updateRelease?.takeUnless { it.version == prefsStore.updateDismissedVersion }
+    val offerUpdate: (Release) -> Unit = { release ->
+        updateManager.download(coroutineScope, release) { updateDownload = it }
+    }
+    val installUpdate: () -> Unit = {
+        // Bytes first, permission second: one tap always does something, and asking for a setting before
+        // there is a file to install only spends a trip to the system screens.
+        if (updateManager.install()) updateDismissed = true
+        else runCatching { context.startActivity(updateManager.installPermissionRequest()) }
     }
 
     // Same reasoning one layer down: the shelf written down by the last read is lifted off the disk
@@ -2655,6 +2754,7 @@ fun ArcPlayerHomeScreen() {
     // screen with nothing behind it.
     val leaveDetailScreen: () -> Unit = {
         cloudNotice = null
+        telegramOnboardingStarted = false
         when {
             openedPlaylistName != null -> openedPlaylistName = null
             openedFolderBucketId != null -> openedFolderBucketId = null
@@ -3139,6 +3239,9 @@ fun ArcPlayerHomeScreen() {
                                         topPadding = browserTopPadding,
                                         bottomPadding = bottomContentPad,
                                         screen = cloudScreen,
+                                        onboardingStarted = telegramOnboardingStarted,
+                                        onOnboardingStartedChange = { telegramOnboardingStarted = it },
+                                        onboardingBottomPadding = navBarBottomPadding,
                                         openedPlaylistName = openedPlaylistName,
                                         statusText = cloudStatus,
                                         morphingVideoKey = morphingVideoKey,
@@ -3189,6 +3292,21 @@ fun ArcPlayerHomeScreen() {
                                         onAskNotifications = {
                                             notificationsLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
                                         },
+                                        updateChecking = updateChecking,
+                                        updateUnreachable = updateUnreachable,
+                                        updateRelease = updateRelease,
+                                        updateDownload = updateDownload,
+                                        onUpdateAction = {
+                                            // The same three verbs the card offers, in the order the page's
+                                            // own label promises: a finished file installs, a found release
+                                            // downloads, and anything else asks GitHub again.
+                                            val release = updateRelease
+                                            when {
+                                                updateDownload is UpdateDownload.Ready -> installUpdate()
+                                                release != null -> offerUpdate(release)
+                                                else -> checkForUpdates()
+                                            }
+                                        },
                                         gridState = menuGridState,
                                         header = {
                                             BrowserHeading(
@@ -3237,7 +3355,7 @@ fun ArcPlayerHomeScreen() {
                 }
 
                     AnimatedVisibility(
-                        visible = showingBrowser && showScrollToTopButton,
+                        visible = showingBrowser && !showingTelegramSetup && showScrollToTopButton,
                         enter = fadeIn(tween(180)) + scaleIn(
                             initialScale = 0.72f,
                             animationSpec = spring(
@@ -3262,34 +3380,68 @@ fun ArcPlayerHomeScreen() {
                         )
                     }
 
-                    Box(
-                        Modifier.align(Alignment.BottomCenter).fillMaxWidth()
-                            .height(92.dp + navBarBottomPadding)
-                            .background(Brush.verticalGradient(
-                                0f to OneUiBackground.copy(alpha = 0f),
-                                0.25f to OneUiBackground.copy(alpha = 0.28f),
-                                0.62f to OneUiBackground.copy(alpha = 0.76f),
-                                1f to OneUiBackground
-                            ))
-                    )
-                    OneUiFloatingBottomBar(
-                        selectedTab = mainTab,
-                        hazeState = jellyHazeState,
-                        backdrop = jellyBackdrop,
-                        onTabSelected = { tab ->
-                            mainTabName = tab.name
-                            libraryPageName = null
-                            shelfTitle = null
-                            openedFolderBucketId = null
-                            openedPlaylistName = null
-                            cloudScreenName = CloudScreen.SHELF.name
-                            isSearchExpanded = false
-                            searchQuery = ""
-                        },
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 12.dp + navBarBottomPadding)
-                    )
+                    if (!showingTelegramSetup) {
+                        Box(
+                            Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                                .height(92.dp + navBarBottomPadding)
+                                .background(Brush.verticalGradient(
+                                    0f to OneUiBackground.copy(alpha = 0f),
+                                    0.25f to OneUiBackground.copy(alpha = 0.28f),
+                                    0.62f to OneUiBackground.copy(alpha = 0.76f),
+                                    1f to OneUiBackground
+                                ))
+                        )
+                        OneUiFloatingBottomBar(
+                            selectedTab = mainTab,
+                            hazeState = jellyHazeState,
+                            backdrop = jellyBackdrop,
+                            onTabSelected = { tab ->
+                                mainTabName = tab.name
+                                libraryPageName = null
+                                shelfTitle = null
+                                openedFolderBucketId = null
+                                openedPlaylistName = null
+                                cloudScreenName = CloudScreen.SHELF.name
+                                isSearchExpanded = false
+                                searchQuery = ""
+                            },
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 12.dp + navBarBottomPadding)
+                        )
+                    }
+
+                    // The offer floats above the capsule rather than joining the scroll: glass is only
+                    // affordable to something that is not inside what it blurs, and a card that pushed the
+                    // hero down two seconds after the app opened would read as the collection changing
+                    // shape. It steps aside for anything that owns the screen.
+                    updateOffer?.let { offered ->
+                        UpdateCard(
+                            visible = !updateDismissed && !showingBrowser && !showingTelegramSetup &&
+                                shelfTitle == null,
+                            release = offered,
+                            download = updateDownload,
+                            hazeState = jellyHazeState,
+                            backdrop = jellyBackdrop,
+                            onUpdate = {
+                                AppHaptics.click()
+                                offerUpdate(offered)
+                            },
+                            onInstall = {
+                                AppHaptics.click()
+                                installUpdate()
+                            },
+                            onDismiss = {
+                                AppHaptics.click()
+                                prefsStore.dismissUpdate(offered.version)
+                                updateDismissed = true
+                            },
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(horizontal = 20.dp)
+                                .padding(bottom = 116.dp + navBarBottomPadding)
+                        )
+                    }
 
                     // The page a shelf poster opens. It sits over everything, including the bar,
                     // because the reference page carries its own back arrow and owns the whole screen.
@@ -3772,6 +3924,9 @@ private fun CloudTabContent(
     topPadding: Dp,
     bottomPadding: Dp,
     screen: CloudScreen,
+    onboardingStarted: Boolean,
+    onOnboardingStartedChange: (Boolean) -> Unit,
+    onboardingBottomPadding: Dp,
     openedPlaylistName: String?,
     statusText: String?,
     morphingVideoKey: String?,
@@ -3794,15 +3949,57 @@ private fun CloudTabContent(
         else -> "Library"
     }
     val authState by repository.authState.collectAsState()
-    if (screen == CloudScreen.SHELF && authState.stage != CloudAuthStage.AUTHORIZED) {
-        CloudAuthGrid(
-            repository = repository,
-            prefsStore = prefsStore,
+    if (screen == CloudScreen.SHELF && (authState.stage != CloudAuthStage.AUTHORIZED || onboardingStarted)) {
+        val busy by repository.busy.collectAsState()
+        val scope = rememberCoroutineScope()
+        var settingUp by remember { mutableStateOf(false) }
+        var setupError by remember { mutableStateOf<String?>(null) }
+        TelegramOnboarding(
             state = authState,
-            gridState = gridState,
-            header = { BrowserHeading(heading, onBack, null) },
+            busy = busy,
+            started = onboardingStarted,
+            hasCollection = prefsStore.movieFolderChatId != 0L,
+            setupBusy = settingUp,
+            setupError = setupError,
             topPadding = topPadding,
-            bottomPadding = bottomPadding
+            bottomPadding = onboardingBottomPadding,
+            onStart = {
+                onOnboardingStartedChange(true)
+                if (authState.stage == CloudAuthStage.FAILED ||
+                    (authState.stage == CloudAuthStage.READY_TO_START && authState.error != null)) {
+                    repository.retryAuthorization()
+                } else repository.begin()
+            },
+            onWelcome = { onOnboardingStartedChange(false) },
+            onExit = onBack,
+            onPhone = repository::submitPhoneNumber,
+            onCode = repository::submitCode,
+            onPassword = repository::submitPassword,
+            onRegistration = repository::submitRegistration,
+            onKeys = prefsStore::updateTelegramCredentials,
+            onChangeNumber = repository::resetToPhoneNumber,
+            onSetup = {
+                if (!settingUp) {
+                    if (prefsStore.movieFolderChatId != 0L) onOnboardingStartedChange(false)
+                    else {
+                        settingUp = true
+                        setupError = null
+                        scope.launch {
+                            try {
+                                val shelf = repository.ensureShelf(prefsStore.movieFolderChatId)
+                                prefsStore.rememberMovieFolder(shelf)
+                                onOnboardingStartedChange(false)
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                setupError = "Your collection couldn't be set up. Check your connection and try again."
+                            } finally {
+                                settingUp = false
+                            }
+                        }
+                    }
+                }
+            }
         )
         return
     }
@@ -3875,37 +4072,6 @@ private class CloudGridArgs(
      */
     val onShelfPlay: (CloudVideoItem, List<CloudVideoItem>, List<List<Long>>, MediaCard?) -> Unit
 )
-
-@Composable
-private fun CloudAuthGrid(
-    repository: CloudRepository,
-    prefsStore: ArcPreferencesStore,
-    state: CloudAuthState,
-    gridState: LazyGridState,
-    header: @Composable () -> Unit,
-    topPadding: Dp,
-    bottomPadding: Dp
-) {
-    val busy by repository.busy.collectAsState()
-    LazyVerticalGrid(
-        state = gridState,
-        columns = GridCells.Fixed(1),
-        modifier = Modifier.physicsBounceOverscroll().fillMaxSize(),
-        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = topPadding, bottom = bottomPadding)
-    ) {
-        item(key = "cloud_auth_heading") {
-            header()
-        }
-        item(key = "cloud_auth_panel") {
-            CloudAuthPanel(
-                state = state,
-                busy = busy,
-                repository = repository,
-                prefsStore = prefsStore
-            )
-        }
-    }
-}
 
 /**
  * The shelf: one private channel, its files gathered into one card per work.
@@ -6133,271 +6299,6 @@ private fun CloudEmptyRow(
     }
 }
 
-@Composable
-private fun CloudSubmitButton(
-    label: String,
-    enabled: Boolean,
-    busy: Boolean,
-    onClick: () -> Unit
-) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Button(onClick = onClick, enabled = enabled) {
-            Text(label)
-        }
-        if (busy) {
-            Spacer(modifier = Modifier.width(12.dp))
-            CircularProgressIndicator(
-                modifier = Modifier.size(16.dp),
-                strokeWidth = 2.dp
-            )
-        }
-    }
-}
-
-/**
- * The whole sign-in flow, driven only by [CloudAuthState.stage].
- *
- * Nothing here decides what comes next - the reducer in [CloudAuthMachine] does, from TDLib's own
- * authorization updates. This composable only renders whichever prompt the stage names, so a state
- * Telegram has not reached can never be offered to the user.
- */
-@Composable
-private fun CloudAuthPanel(
-    state: CloudAuthState,
-    busy: Boolean,
-    repository: CloudRepository,
-    prefsStore: ArcPreferencesStore
-) {
-    var firstField by remember(state.stage) { mutableStateOf("") }
-    var secondField by remember(state.stage) { mutableStateOf("") }
-
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = CardCornerShape,
-        color = OneUiPillSurface
-    ) {
-        Column(modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 18.dp, bottom = 20.dp)) {
-            Text(
-                text = cloudAuthHeading(state.stage),
-                fontSize = 17.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = OneUiTextPrimary
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = cloudAuthBody(state.stage, state),
-                fontSize = 13.sp,
-                lineHeight = 18.sp,
-                color = OneUiTextSecondary
-            )
-
-            state.error?.let { message ->
-                Spacer(modifier = Modifier.height(10.dp))
-                Text(
-                    text = message,
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.error
-                )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            when (state.stage) {
-                CloudAuthStage.MISSING_CREDENTIALS -> {
-                    OutlinedTextField(
-                        value = firstField,
-                        onValueChange = { firstField = it },
-                        label = { Text("api_id") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = secondField,
-                        onValueChange = { secondField = it },
-                        label = { Text("api_hash") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    CloudSubmitButton(
-                        label = "Save and connect",
-                        enabled = firstField.toIntOrNull() != null && secondField.isNotBlank(),
-                        busy = false,
-                        onClick = {
-                            prefsStore.updateTelegramCredentials(
-                                firstField.trim().toIntOrNull() ?: 0,
-                                secondField
-                            )
-                        }
-                    )
-                }
-
-                CloudAuthStage.WAITING_FOR_PHONE_NUMBER -> {
-                    OutlinedTextField(
-                        value = firstField,
-                        onValueChange = { firstField = it },
-                        label = { Text("Phone number with country code") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    CloudSubmitButton(
-                        label = "Send code",
-                        enabled = firstField.isNotBlank() && !busy,
-                        busy = busy,
-                        onClick = { repository.submitPhoneNumber(firstField) }
-                    )
-                }
-
-                CloudAuthStage.WAITING_FOR_CODE -> {
-                    OutlinedTextField(
-                        value = firstField,
-                        onValueChange = { firstField = it },
-                        label = { Text(cloudCodeLabel(state.codeHint)) },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = if (state.codeHint?.digitsOnly == true) {
-                                KeyboardType.NumberPassword
-                            } else {
-                                KeyboardType.Ascii
-                            }
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    CloudSubmitButton(
-                        label = "Sign in",
-                        enabled = firstField.length >= 5 && !busy,
-                        busy = busy,
-                        onClick = { repository.submitCode(firstField.trim()) }
-                    )
-                }
-
-                CloudAuthStage.WAITING_FOR_PASSWORD -> {
-                    OutlinedTextField(
-                        value = firstField,
-                        onValueChange = { firstField = it },
-                        label = { Text("Two-step verification password") },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    CloudSubmitButton(
-                        label = "Unlock",
-                        enabled = firstField.isNotBlank() && !busy,
-                        busy = busy,
-                        onClick = { repository.submitPassword(firstField) }
-                    )
-                }
-
-                CloudAuthStage.WAITING_FOR_REGISTRATION -> {
-                    OutlinedTextField(
-                        value = firstField,
-                        onValueChange = { firstField = it },
-                        label = { Text("First name") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = secondField,
-                        onValueChange = { secondField = it },
-                        label = { Text("Last name") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    CloudSubmitButton(
-                        label = "Create account",
-                        enabled = firstField.isNotBlank() && !busy,
-                        busy = busy,
-                        onClick = { repository.submitRegistration(firstField, secondField) }
-                    )
-                }
-
-                CloudAuthStage.FAILED, CloudAuthStage.CLOSED -> CloudSubmitButton(
-                    label = "Enter a number",
-                    enabled = !busy,
-                    busy = busy,
-                    onClick = { repository.resetToPhoneNumber() }
-                )
-
-                CloudAuthStage.READY_TO_START -> CloudSubmitButton(
-                    label = "Connect to Telegram",
-                    enabled = !busy,
-                    busy = busy,
-                    onClick = { repository.begin() }
-                )
-
-                else -> CloudSubmitButton(
-                    label = "Working…",
-                    enabled = false,
-                    busy = true,
-                    onClick = {}
-                )
-            }
-        }
-    }
-}
-
-private fun cloudAuthHeading(stage: CloudAuthStage): String = when (stage) {
-    CloudAuthStage.MISSING_CREDENTIALS -> "Telegram keys"
-    CloudAuthStage.READY_TO_START,
-    CloudAuthStage.WAITING_FOR_PARAMETERS,
-    CloudAuthStage.REQUESTING_CODE,
-    CloudAuthStage.CHECKING_CODE -> "Signing in"
-    CloudAuthStage.WAITING_FOR_PHONE_NUMBER -> "Your number"
-    CloudAuthStage.WAITING_FOR_CODE -> "Confirmation code"
-    CloudAuthStage.WAITING_FOR_PASSWORD -> "Password required"
-    CloudAuthStage.WAITING_FOR_REGISTRATION -> "New account"
-    CloudAuthStage.AUTHORIZED -> "Signed in"
-    CloudAuthStage.CLOSED -> "Session closed"
-    CloudAuthStage.FAILED -> "Sign-in failed"
-}
-
-private fun cloudAuthBody(stage: CloudAuthStage, state: CloudAuthState): String = when (stage) {
-    CloudAuthStage.MISSING_CREDENTIALS ->
-        "Arc Player needs an api_id and api_hash from my.telegram.org before it can talk to " +
-            "Telegram. They are stored on this device only."
-    CloudAuthStage.READY_TO_START ->
-        "Nothing has been sent yet. Connecting starts a Telegram session for this device."
-    CloudAuthStage.WAITING_FOR_PARAMETERS ->
-        "Starting TDLib and registering this app with Telegram…"
-    CloudAuthStage.WAITING_FOR_PHONE_NUMBER ->
-        "Enter the number that belongs to your Telegram account, including the country code."
-    CloudAuthStage.REQUESTING_CODE ->
-        "Asking Telegram for a code for ${state.lastPhoneNumber}…"
-    CloudAuthStage.WAITING_FOR_CODE ->
-        "Telegram sent a code to ${state.lastPhoneNumber}. ${state.codeHint?.codeLength
-            ?.takeIf { it > 0 }
-            ?.let { "It is $it characters long." } ?: ""}"
-    CloudAuthStage.CHECKING_CODE ->
-        "Waiting for Telegram to confirm…"
-    CloudAuthStage.WAITING_FOR_PASSWORD ->
-        "This account has two-step verification turned on."
-    CloudAuthStage.WAITING_FOR_REGISTRATION ->
-        "No Telegram account uses this number yet, so it will be registered as a new one."
-    CloudAuthStage.AUTHORIZED -> ""
-    CloudAuthStage.CLOSED ->
-        "Telegram closed this session."
-    CloudAuthStage.FAILED ->
-        "Telegram refused the request. If this keeps happening, restart Arc Player - TDLib clients " +
-            "cannot be rebuilt inside a running process."
-}
-
-private fun cloudCodeLabel(hint: CodeHint?): String = when {
-    hint == null -> "Code"
-    hint.codeLength > 0 -> "${hint.codeLength}-digit code"
-    hint.digitsOnly -> "Code"
-    else -> "Code words"
-}
-
 /**
  * Whether the system has promised not to put this install to sleep.
  *
@@ -6791,6 +6692,11 @@ private fun SettingsContent(
     repository: CloudRepository,
     onManageCollection: () -> Unit,
     onAskNotifications: () -> Unit,
+    updateChecking: Boolean,
+    updateUnreachable: Boolean,
+    updateRelease: Release?,
+    updateDownload: UpdateDownload,
+    onUpdateAction: () -> Unit,
     gridState: LazyGridState,
     header: @Composable () -> Unit,
     topPadding: Dp,
@@ -6807,6 +6713,28 @@ private fun SettingsContent(
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         exemptFromSleep = isExemptFromSleep(context)
         notificationsAllowed = DownloadNotifier.canNotify(context)
+    }
+
+    // One line carries both the answer and the doing, in that order of priority: a transfer that has
+    // started is a louder fact than the button that started it, and the reason the home card stays
+    // silent about a failed check does not apply here — this question was asked out loud, so an
+    // unanswered one has to be admitted.
+    val updateCaption = when {
+        updateDownload is UpdateDownload.Running ->
+            "Downloading Arc Player ${updateRelease?.version.orEmpty()}… ${(updateDownload.fraction * 100).toInt()}%"
+        updateDownload is UpdateDownload.Ready -> "It is on this phone, waiting to be installed."
+        updateDownload is UpdateDownload.Failed -> "The download stopped. It can be tried again."
+        updateChecking -> "Asking GitHub…"
+        updateRelease != null -> "Arc Player ${updateRelease.version} is out."
+        updateUnreachable -> "Couldn't reach GitHub."
+        else -> "This is the newest release."
+    }
+    val updateActionLabel = when {
+        updateDownload is UpdateDownload.Ready -> "Install"
+        updateDownload is UpdateDownload.Failed -> "Retry"
+        updateChecking -> "Checking"
+        updateRelease != null -> "Update"
+        else -> "Check"
     }
 
     LazyVerticalGrid(
@@ -7090,6 +7018,52 @@ private fun SettingsContent(
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        item(key = "menu_updates") {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = OneUiCardSurface,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Text(
+                        text = "Updates",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = OneUiTextPrimary
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Version", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Text(BuildConfig.VERSION_NAME, fontSize = 13.sp, color = OneUiTextSecondary)
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Check for updates", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(updateCaption, fontSize = 12.sp, color = OneUiTextSecondary)
+                        }
+                        if (updateDownload !is UpdateDownload.Running) {
+                            TextButton(onClick = onUpdateAction, enabled = !updateChecking) {
+                                Text(updateActionLabel, color = OneUiAccent)
+                            }
+                        }
+                    }
+
+                    if (updateDownload is UpdateDownload.Running) {
+                        UpdateProgress(updateDownload.fraction)
                     }
                 }
             }
@@ -9978,8 +9952,8 @@ private fun PermissionRequestView(onGrantClick: () -> Unit) {
             onClick = onGrantClick,
             shape = RoundedCornerShape(24.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = OneUiTextPrimary,
-                contentColor = Color.White
+                containerColor = OneUiSelectedFill,
+                contentColor = OneUiOnSelectedFill
             ),
             contentPadding = PaddingValues(horizontal = 28.dp, vertical = 12.dp)
         ) {

@@ -36,6 +36,10 @@
     <!-- The settings row that asks the system to stop putting this app to sleep -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- The updater fetches a signed release and hands it to the installer, which is the one thing on
+         Android that still needs asking about rather than merely declaring. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <application
         android:name=".ArcPlayerApplication"
         android:allowBackup="true"

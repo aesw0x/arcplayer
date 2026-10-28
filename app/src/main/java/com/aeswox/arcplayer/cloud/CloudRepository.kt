@@ -255,6 +255,11 @@ class CloudRepository(
      */
     fun resetToPhoneNumber() = launchInput { CloudAuthInput.PhoneNumberNeeded }
 
+    fun retryAuthorization() = launchInput {
+        if (_authState.value.parametersAccepted) CloudAuthInput.PhoneNumberNeeded
+        else CloudAuthInput.StartRequested
+    }
+
     private fun launchInput(input: () -> CloudAuthInput) {
         bridge.submit(input())
     }

@@ -2,6 +2,7 @@ package com.aeswox.arcplayer.cloud
 
 import android.os.Build
 import android.util.Log
+import com.aeswox.arcplayer.BuildConfig
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -134,6 +135,12 @@ class TdBridge(
                 type is TdApi.AuthenticationCodeTypeMissedCall,
             allowFlashCall = type is TdApi.AuthenticationCodeTypeFlashCall,
             allowMissedCall = type is TdApi.AuthenticationCodeTypeMissedCall,
+            delivery = when (type) {
+                is TdApi.AuthenticationCodeTypeTelegramMessage -> CodeDelivery.TELEGRAM
+                is TdApi.AuthenticationCodeTypeSms -> CodeDelivery.SMS
+                is TdApi.AuthenticationCodeTypeCall -> CodeDelivery.CALL
+                else -> CodeDelivery.OTHER
+            },
         )
     }
 
@@ -180,7 +187,7 @@ class TdBridge(
             systemLanguageCode = "en"
             deviceModel = Build.MODEL ?: "Android"
             systemVersion = "Android ${Build.VERSION.RELEASE}"
-            applicationVersion = APP_VERSION
+            applicationVersion = BuildConfig.VERSION_NAME
         }
         call(parameters)
     }
@@ -189,7 +196,6 @@ class TdBridge(
 
     private companion object {
         const val TAG = "ArcTdBridge"
-        const val APP_VERSION = "1.0.0"
         const val MAX_LOG_VERBOSITY = 2
     }
 }

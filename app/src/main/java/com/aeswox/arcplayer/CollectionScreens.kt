@@ -424,8 +424,9 @@ internal fun CollectionScreens(
         gone -> "This Telegram collection is unavailable. Choose your collection to get started again."
         else -> "Your next favourite is already yours. Add movies or episodes to your Telegram collection to see them here."
     }
+    val manageLabel = if (authorized) "Manage collection" else "Connect Telegram"
     val shortcuts = listOf("On Device" to onOpenDevice, "All videos" to onOpenAllVideos,
-        "Playlists" to onOpenPlaylists, "Manage collection" to onManageCollection)
+        "Playlists" to onOpenPlaylists, manageLabel to onManageCollection)
 
     Box(Modifier.fillMaxSize().background(JellyBackground)) {
         when {
@@ -491,7 +492,7 @@ internal fun CollectionScreens(
                         }
                     }
                     if (filtered.isEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
-                        CollectionEmpty(if (titles.isEmpty()) emptyMessage else "No ${selectedFilter.label.lowercase()} yet.", onManageCollection, onOpenDevice)
+                        CollectionEmpty(if (titles.isEmpty()) emptyMessage else "No ${selectedFilter.label.lowercase()} yet.", onManageCollection, onOpenDevice, manageLabel)
                     }
                     itemsIndexed(filtered, key = { _, title -> title.group.key }) { index, title ->
                         StaggeredListItem(index, "shelf:${title.group.key}") {
@@ -579,7 +580,7 @@ internal fun CollectionScreens(
                             }
                         }
                         if (titles.isEmpty()) item(key = "empty") {
-                            Box(Modifier.padding(horizontal = 24.dp)) { CollectionEmpty(emptyMessage, onManageCollection, onOpenDevice) }
+                            Box(Modifier.padding(horizontal = 24.dp)) { CollectionEmpty(emptyMessage, onManageCollection, onOpenDevice, manageLabel) }
                         }
                         if (titles.isNotEmpty()) item(key = "recent") {
                             CollectionRail("Recently Added", titles.take(16), prefsStore, savedIds, { browse = CollectionFilter.ALL }, onOpenTitle)
@@ -993,8 +994,8 @@ private fun CollectionDownloadsBadge(arriving: Int, onClick: () -> Unit) {
 }
 
 @Composable
-internal fun CollectionPill(text: String, modifier: Modifier = Modifier, selected: Boolean = false, onClick: () -> Unit) {
-    CollectionPill(modifier, selected, onClick) {
+internal fun CollectionPill(text: String, modifier: Modifier = Modifier, selected: Boolean = false, enabled: Boolean = true, onClick: () -> Unit) {
+    CollectionPill(modifier, selected, onClick, enabled) {
         Text(text, color = if (selected) JellyOnPrimary else JellyOnSurface, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
     }
 }
@@ -1005,10 +1006,12 @@ internal fun CollectionPill(
     modifier: Modifier = Modifier,
     selected: Boolean = false,
     onClick: () -> Unit,
+    enabled: Boolean = true,
     content: @Composable () -> Unit
 ) {
-    Box(modifier.clip(RoundedCornerShape(28.dp)).background(if (selected) JellyPrimary else JellySurfaceContainer)
-        .jellyClick(role = Role.Button, scaleDownTo = 0.95f, onClick = onClick)
+    Box(modifier.then(if (enabled) Modifier else Modifier.graphicsLayer { alpha = 0.5f })
+        .clip(RoundedCornerShape(28.dp)).background(if (selected) JellyPrimary else JellySurfaceContainer)
+        .jellyClick(role = Role.Button, scaleDownTo = 0.95f, enabled = enabled, onClick = onClick)
         .heightIn(min = 48.dp).padding(horizontal = 18.dp, vertical = 12.dp), contentAlignment = Alignment.Center) {
         content()
     }
@@ -1024,13 +1027,13 @@ private fun CollectionBack(onBack: () -> Unit) {
 }
 
 @Composable
-private fun CollectionEmpty(message: String, onManage: () -> Unit, onDevice: () -> Unit) {
+private fun CollectionEmpty(message: String, onManage: () -> Unit, onDevice: () -> Unit, manageLabel: String) {
     // One step above the page, not two: the pills inside are a container, and a container has to
     // sit lighter than the card it rests on or it reads as a hole punched in it.
     Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).background(JellySurface).padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text(message, color = JellyOnSurfaceVariant, fontSize = 15.sp, lineHeight = 23.sp)
-        CollectionPill("Manage collection", onClick = onManage)
+        CollectionPill(manageLabel, selected = manageLabel == "Connect Telegram", onClick = onManage)
         CollectionPill("On Device", onClick = onDevice)
     }
 }

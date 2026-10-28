@@ -252,6 +252,285 @@ class CloudAuthMachineTest {
     }
 }
 
+class TelegramAuthPresentationTest {
+
+    @Test
+    fun repeatedSubmissionsDoNotSendAgainOrReplaceTheRetryForm() {
+        val submissions = listOf(
+            CloudAuthStage.WAITING_FOR_PHONE_NUMBER to CloudAuthInput.PhoneSubmitted("+15550109922"),
+            CloudAuthStage.WAITING_FOR_CODE to CloudAuthInput.CodeSubmitted("12345"),
+            CloudAuthStage.WAITING_FOR_PASSWORD to CloudAuthInput.PasswordSubmitted("test-password"),
+            CloudAuthStage.WAITING_FOR_REGISTRATION to CloudAuthInput.RegistrationSubmitted("Test", "User")
+        )
+        submissions.forEach { (stage, input) ->
+            val pending = CloudAuthMachine.transition(CloudAuthState(stage), input)
+            assertTrue(pending.effect != CloudAuthEffect.None)
+            submissions.forEach { (_, duplicate) ->
+                val ignored = CloudAuthMachine.transition(pending.state, duplicate)
+                assertEquals(pending.state, ignored.state)
+                assertEquals(CloudAuthEffect.None, ignored.effect)
+            }
+            val rejected = CloudAuthMachine.transition(pending.state, CloudAuthInput.Rejected("TEST_REJECTION"))
+            assertEquals(stage, rejected.state.stage)
+            assertEquals("TEST_REJECTION", rejected.state.error)
+            val retry = CloudAuthMachine.transition(rejected.state, input)
+            assertEquals(pending.effect, retry.effect)
+            assertEquals(stage, retry.state.retryStage)
+        }
+    }
+
+    @Test
+    fun reAnnouncedStageDuringACheckStillReturnsToTheFormOnError() {
+        val pending = CloudAuthMachine.transition(
+            CloudAuthState(CloudAuthStage.WAITING_FOR_CODE), CloudAuthInput.CodeSubmitted("12345")
+        ).state
+        // TDLib re-sends the current authorization state when its connection bounces, which clears
+        // the retry memory. A rejection that lands afterwards must still redress the same form.
+        val reAnnounced = CloudAuthMachine.transition(
+            pending, CloudAuthInput.CodeNeeded(CodeHint(codeLength = 5, delivery = CodeDelivery.TELEGRAM))
+        ).state
+        assertEquals(CloudAuthStage.WAITING_FOR_CODE, reAnnounced.stage)
+        assertNull(reAnnounced.retryStage)
+        val rejected = CloudAuthMachine.transition(reAnnounced, CloudAuthInput.Rejected("PHONE_CODE_INVALID")).state
+        assertEquals(CloudAuthStage.WAITING_FOR_CODE, rejected.stage)
+        assertEquals(TelegramStep.CODE, telegramStep(rejected, started = true))
+    }
+
+    @Test
+    fun rejectedStartupOffersRecoveryAndCanResendParameters() {
+        val connecting = CloudAuthMachine.transition(
+            CloudAuthMachine.initial(hasCredentials = true), CloudAuthInput.StartRequested
+        ).state
+        val rejected = CloudAuthMachine.transition(connecting, CloudAuthInput.Rejected("NETWORK_ERROR")).state
+        assertEquals(TelegramStep.RECOVERY, telegramStep(rejected, started = true))
+        val retried = CloudAuthMachine.transition(rejected, CloudAuthInput.StartRequested)
+        assertTrue(retried.effect is CloudAuthEffect.SendParameters)
+        assertEquals(TelegramStep.CONNECTING, telegramStep(retried.state, started = true))
+    }
+
+    @Test
+    fun backendProgressDoesNotSkipWelcomeBeforeExplicitStart() {
+        val initial = CloudAuthMachine.initial(hasCredentials = true)
+        val connecting = CloudAuthMachine.transition(initial, CloudAuthInput.StartRequested).state
+        val phone = CloudAuthMachine.transition(connecting, CloudAuthInput.PhoneNumberNeeded).state
+        val code = CloudAuthMachine.transition(phone, CloudAuthInput.CodeNeeded(CodeHint())).state
+
+        listOf(initial, connecting, phone, code).forEach { state ->
+            assertEquals("before explicit start: ${state.stage}", TelegramStep.WELCOME, telegramStep(state, started = false))
+        }
+    }
+
+    @Test
+    fun alreadyAuthorizedSessionShowsConnectedOnlyAfterExplicitStart() {
+        val authorized = CloudAuthMachine.transition(
+            CloudAuthMachine.initial(hasCredentials = true),
+            CloudAuthInput.Authorized
+        ).state
+        assertEquals(TelegramStep.WELCOME, telegramStep(authorized, started = false))
+        assertEquals(TelegramStep.CONNECTED, telegramStep(authorized, started = true))
+    }
+
+    @Test
+    fun startupShowsConnectingUntilTelegramRequestsAForm() {
+        val initial = CloudAuthMachine.initial(hasCredentials = true)
+        assertEquals(TelegramStep.CONNECTING, telegramStep(initial, started = true))
+        val connecting = CloudAuthMachine.transition(initial, CloudAuthInput.StartRequested).state
+        assertEquals(TelegramStep.CONNECTING, telegramStep(connecting, started = true))
+        val phone = CloudAuthMachine.transition(connecting, CloudAuthInput.PhoneNumberNeeded).state
+        assertEquals(TelegramStep.PHONE, telegramStep(phone, started = true))
+    }
+
+    @Test
+    fun missingCredentialsShowKeysOnlyAfterExplicitStart() {
+        val missing = CloudAuthMachine.initial(hasCredentials = false)
+        assertEquals(TelegramStep.WELCOME, telegramStep(missing, started = false))
+        assertEquals(TelegramStep.KEYS, telegramStep(missing, started = true))
+    }
+
+    @Test
+    fun closedSessionAndRejectionWithoutRetryTargetShowRecovery() {
+        val checking = CloudAuthState(CloudAuthStage.CHECKING_CODE)
+        val closed = CloudAuthMachine.transition(checking, CloudAuthInput.Closed).state
+        val failed = CloudAuthMachine.transition(checking, CloudAuthInput.Rejected("AUTH_FAILED")).state
+
+        listOf(closed, failed).forEach { state ->
+            assertEquals(TelegramStep.WELCOME, telegramStep(state, started = false))
+            assertEquals(TelegramStep.RECOVERY, telegramStep(state, started = true))
+        }
+    }
+
+    @Test
+    fun phoneFormStaysVisibleWhileRequestingCodeAndAfterRejection() {
+        assertFormRetained(
+            before = CloudAuthState(CloudAuthStage.WAITING_FOR_PHONE_NUMBER),
+            input = CloudAuthInput.PhoneSubmitted("+1 (555) 010-9922"),
+            expectedStep = TelegramStep.PHONE,
+            rejection = "PHONE_NUMBER_INVALID",
+            busyStage = CloudAuthStage.REQUESTING_CODE
+        )
+    }
+
+    @Test
+    fun codeFormAndDeliveryHintStayAvailableWhileCheckingAndAfterRejection() {
+        assertFormRetained(
+            before = CloudAuthState(
+                CloudAuthStage.WAITING_FOR_CODE,
+                codeHint = CodeHint(codeLength = 5, delivery = CodeDelivery.TELEGRAM),
+                lastPhoneNumber = "+15550109922"
+            ),
+            input = CloudAuthInput.CodeSubmitted("12345"),
+            expectedStep = TelegramStep.CODE,
+            rejection = "PHONE_CODE_INVALID"
+        )
+    }
+
+    @Test
+    fun passwordRetryTargetKeepsPasswordFormInsteadOfCodeOrSpinner() {
+        assertFormRetained(
+            before = CloudAuthState(CloudAuthStage.WAITING_FOR_PASSWORD),
+            input = CloudAuthInput.PasswordSubmitted("two-step password"),
+            expectedStep = TelegramStep.PASSWORD,
+            rejection = "PASSWORD_HASH_INVALID"
+        )
+    }
+
+    @Test
+    fun registrationRetryTargetKeepsRegistrationFormInsteadOfCodeOrSpinner() {
+        assertFormRetained(
+            before = CloudAuthState(CloudAuthStage.WAITING_FOR_REGISTRATION),
+            input = CloudAuthInput.RegistrationSubmitted("Alice", "R"),
+            expectedStep = TelegramStep.REGISTER,
+            rejection = "FIRSTNAME_INVALID"
+        )
+    }
+
+    @Test
+    fun checkingWithoutRetryTargetStillShowsCodeFieldsNotSpinner() {
+        val checking = CloudAuthState(CloudAuthStage.CHECKING_CODE)
+        assertEquals(TelegramStep.CODE, telegramStep(checking, started = true))
+        assertEquals(TelegramStep.WELCOME, telegramStep(checking, started = false))
+    }
+
+    @Test
+    fun telegramDeliveryDirectsUsersToAnExistingSessionNotSms() {
+        val instruction = telegramCodeInstruction(CodeHint(codeLength = 5, delivery = CodeDelivery.TELEGRAM))
+        assertTrue(instruction.contains("already signed in"))
+        assertTrue(instruction.contains("Telegram service chat"))
+        assertTrue(!instruction.contains("text messages", ignoreCase = true))
+        assertTrue(!instruction.contains("SMS", ignoreCase = true))
+    }
+
+    @Test
+    fun smsAndCallDeliveryNameTheActualChannel() {
+        assertEquals(
+            "Check your text messages for the code from Telegram.",
+            telegramCodeInstruction(CodeHint(delivery = CodeDelivery.SMS))
+        )
+        assertEquals(
+            "Use the code delivered by Telegram's phone call.",
+            telegramCodeInstruction(CodeHint(delivery = CodeDelivery.CALL))
+        )
+    }
+
+    @Test
+    fun missingOrUnknownDeliveryDoesNotGuessAChannelFromCodeFormat() {
+        val hints = listOf(
+            null,
+            CodeHint(),
+            CodeHint(codeLength = 5, delivery = CodeDelivery.OTHER),
+            CodeHint(codeLength = 6, digitsOnly = false, allowFlashCall = true, allowMissedCall = true)
+        )
+        hints.forEach { hint ->
+            assertEquals(
+                "delivery hint: $hint",
+                "Check the code delivery instructions in Telegram, then enter your sign-in code here.",
+                telegramCodeInstruction(hint)
+            )
+        }
+    }
+
+    @Test
+    fun invalidPhoneAndCodeErrorsExplainHowToCorrectTheInput() {
+        assertEquals(
+            "That number isn't valid. Include + and your country code.",
+            telegramAuthError("400: PHONE_NUMBER_INVALID")
+        )
+        assertEquals(
+            "That code didn't match. Check it and try again.",
+            telegramAuthError("400: PHONE_CODE_INVALID")
+        )
+    }
+
+    @Test
+    fun expiredCodeExplainsHowToRequestANewOne() {
+        assertEquals(
+            "This code has expired. Use Change number to request a new one.",
+            telegramAuthError("PHONE_CODE_EXPIRED")
+        )
+    }
+
+    @Test
+    fun invalidPasswordAsksForTelegramTwoStepVerificationPassword() {
+        assertEquals(
+            "That password didn't match. Enter your Telegram two-step verification password.",
+            telegramAuthError("400: PASSWORD_HASH_INVALID")
+        )
+    }
+
+    @Test
+    fun bothFloodErrorFormatsAskTheUserToWait() {
+        listOf("429: FLOOD_WAIT_60", "429: Too Many Requests: retry after 60").forEach { message ->
+            assertEquals(
+                message,
+                "Telegram needs you to wait before trying again. Please try later.",
+                telegramAuthError(message)
+            )
+        }
+    }
+
+    @Test
+    fun unknownTechnicalOrEmptyErrorsHaveAFriendlyFallback() {
+        listOf("UNEXPECTED_AUTH_ERROR", "400: Unexpected_AUTH_ERROR", "").forEach { message ->
+            assertEquals(
+                message,
+                "Telegram couldn't complete this request. Please try again.",
+                telegramAuthError(message)
+            )
+        }
+    }
+
+    @Test
+    fun alreadyReadableErrorsKeepTheirUsefulExplanation() {
+        val message = "A first name is required."
+        assertEquals(message, telegramAuthError(message))
+    }
+
+    private fun assertFormRetained(
+        before: CloudAuthState,
+        input: CloudAuthInput,
+        expectedStep: TelegramStep,
+        rejection: String,
+        busyStage: CloudAuthStage = CloudAuthStage.CHECKING_CODE
+    ) {
+        assertEquals("before submission", expectedStep, telegramStep(before, started = true))
+        val pending = CloudAuthMachine.transition(before, input).state
+        assertEquals(busyStage, pending.stage)
+        assertEquals(before.stage, pending.retryStage)
+        assertEquals("fields stay visible during submission", expectedStep, telegramStep(pending, started = true))
+        assertEquals(before.codeHint, pending.codeHint)
+        assertNull(pending.error)
+
+        val rejected = CloudAuthMachine.transition(pending, CloudAuthInput.Rejected(rejection))
+        assertEquals(before.stage, rejected.state.stage)
+        assertEquals("fields stay visible after rejection", expectedStep, telegramStep(rejected.state, started = true))
+        assertEquals(before.codeHint, rejected.state.codeHint)
+        assertEquals(pending.lastPhoneNumber, rejected.state.lastPhoneNumber)
+        assertEquals(rejection, rejected.state.error)
+        assertNull(rejected.state.retryStage)
+        assertTrue(rejected.effect is CloudAuthEffect.None)
+    }
+}
+
 class CloudWindowPlannerTest {
 
     private fun wholeFile() = WindowFacts(

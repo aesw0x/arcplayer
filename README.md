@@ -43,9 +43,9 @@ Get signed APKs from [GitHub Releases](https://github.com/aesw0x/arcplayer/relea
 
 | APK | Choose this for |
 |---|---|
-| `ArcPlayer-1.0.0-arm64-v8a.apk` | Most current Android phones and tablets. **Recommended.** |
-| `ArcPlayer-1.0.0-x86_64.apk` | Compatible Intel/AMD Android devices and x86_64 emulators. |
-| `ArcPlayer-1.0.0-universal.apk` | Both supported architectures in one larger download. |
+| `ArcPlayer-x.y.z-arm64-v8a.apk` | Most current Android phones and tablets. **Recommended.** |
+| `ArcPlayer-x.y.z-x86_64.apk` | Compatible Intel/AMD Android devices and x86_64 emulators. |
+| `ArcPlayer-x.y.z-universal.apk` | Both supported architectures in one larger download. |
 
 The version portion of each filename changes with each release. These builds do not support 32-bit ARM or 32-bit x86. The universal APK contains the two supported 64-bit architectures, not every Android architecture.
 
