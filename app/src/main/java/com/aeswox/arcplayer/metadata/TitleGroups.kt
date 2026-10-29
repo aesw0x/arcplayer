@@ -109,7 +109,8 @@ object TitleGroups {
         val series: String,
         val season: Int?,
         val episode: Int,
-        val episodeTitle: String?
+        val episodeTitle: String?,
+        val year: Int? = null
     )
 
     /**
@@ -140,7 +141,7 @@ object TitleGroups {
                     .getOrPut(TitleScore.key(guess.series)) { ArrayList() }
                     .add(
                         EpisodeEntry(
-                            candidate, index, guess.series, guess.season, guess.episode, guess.episodeTitle
+                            candidate, index, guess.series, guess.season, guess.episode, guess.episodeTitle, guess.year
                         )
                     )
 
@@ -162,7 +163,7 @@ object TitleGroups {
             buckets.forEach { (bucketKey, numbered) ->
                 consumed += bucketKey
                 movies.getValue(bucketKey).forEach { entry ->
-                    moved += EpisodeEntry(entry.candidate, entry.at, numbered.stem, null, numbered.number, null)
+                    moved += EpisodeEntry(entry.candidate, entry.at, numbered.stem, null, numbered.number, null, entry.year)
                 }
             }
             // Filed into the bucket that is already there rather than started as a new one, which is
@@ -268,11 +269,13 @@ object TitleGroups {
                     .thenByDescending { it.second }
             )
             .map { it.first }
+        val knownYears = entries.mapNotNull { it.year }
+        val year = if (knownYears.isEmpty()) null else mostCommonYear(knownYears)
         return TitleGroup(
             key = key,
             kind = TitleKind.SERIES,
             displayTitle = entries.minBy { it.at }.series,
-            year = null,
+            year = year,
             parts = sorted.map {
                 TitlePart(
                     id = it.candidate.id,

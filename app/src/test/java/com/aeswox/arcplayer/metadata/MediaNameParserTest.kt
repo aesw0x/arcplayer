@@ -84,6 +84,22 @@ class MediaNameParserTest {
     }
 
     @Test
+    fun episodeWithYearInTitleOrBrackets() {
+        assertEquals(
+            MediaGuess.Episode("One Piece", null, 126, null, 1999),
+            parse("One Piece (1999) - E126 [Dual] 720p @XANIME_UNIVERSE.mkv")
+        )
+        assertEquals(
+            MediaGuess.Episode("One Piece", null, 126, null, 1999),
+            parse("One.Piece.1999.E126.Dual.720p.mkv")
+        )
+        assertEquals(
+            MediaGuess.Episode("One Piece", 1, 1, null, 2023),
+            parse("One Piece (2023) S01E01 1080p.mkv")
+        )
+    }
+
+    @Test
     fun episodeWithDotSeparatedWords() {
         assertEquals(
             MediaGuess.Episode("One Piece", null, 205, null),

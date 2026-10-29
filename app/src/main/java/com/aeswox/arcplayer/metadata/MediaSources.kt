@@ -16,6 +16,12 @@ internal fun yearOf(date: String?): Int? =
 
 internal fun positiveYear(value: Int): Int? = if (value in 1800..2999) value else null
 
+internal fun guessYear(guess: MediaGuess): Int? = when (guess) {
+    is MediaGuess.Movie -> guess.year
+    is MediaGuess.Episode -> guess.year
+    is MediaGuess.Unnamed -> null
+}
+
 /** The line under a series name on a card. Null when the file is not part of a series. */
 internal fun episodeLabel(guess: MediaGuess): String? = when (guess) {
     is MediaGuess.Episode -> {
@@ -80,23 +86,37 @@ internal class TmdbSource(private val apiKey: String) : MediaSource {
     }
 
     private fun episode(guess: MediaGuess.Episode): MediaOutcome {
-        val response = HttpJson.get(
-            HttpJson.url(
-                "$base/search/tv",
-                "api_key" to apiKey,
-                "language" to "en-US",
-                "query" to guess.series,
-                "include_adult" to "false"
-            )
-        ) ?: return MediaOutcome.Unreachable
-        val rows = response.optJSONArray("results").objects()
+        val params = mutableListOf(
+            "api_key" to apiKey,
+            "language" to "en-US",
+            "query" to guess.series,
+            "include_adult" to "false"
+        )
+        guess.year?.let { params.add("first_air_date_year" to it.toString()) }
+        var response = HttpJson.get(HttpJson.url("$base/search/tv", *params.toTypedArray()))
+        var rows = response?.optJSONArray("results").objects()
+        if (rows.isEmpty() && guess.year != null) {
+            params.removeAll { it.first == "first_air_date_year" }
+            response = HttpJson.get(HttpJson.url("$base/search/tv", *params.toTypedArray()))
+            rows = response?.optJSONArray("results").objects()
+        }
+        if (rows.isEmpty()) return if (response == null) MediaOutcome.Unreachable else MediaOutcome.NoMatch
+
         val candidates = rows.map { row ->
+            val genreIds = (0 until (row.optJSONArray("genre_ids")?.length() ?: 0)).mapNotNull {
+                row.optJSONArray("genre_ids")?.optInt(it)
+            }
+            val isAnim = 16 in genreIds || row.optString("original_language") == "ja"
+            // For anime disambiguation: when an episode is unseasoned or has high episode count,
+            // award animation/Japanese series a tie-break bonus over live-action adaptations
+            val bonus = if (isAnim && (guess.season == null || guess.episode > 15)) 1 else 0
             TitleScore.Candidate(
                 row.optString("name").ifBlank { row.optString("original_name") },
-                yearOf(row.optString("first_air_date"))
+                yearOf(row.optString("first_air_date")),
+                bonus = bonus
             )
         }
-        val chosen = TitleScore.bestIndex(candidates, guess.series, null)
+        val chosen = TitleScore.bestIndex(candidates, guess.series, guess.year)
         if (chosen < 0) return MediaOutcome.NoMatch
         val row = rows[chosen]
         return MediaOutcome.Found(
@@ -226,7 +246,7 @@ internal class AniListSource : MediaSource {
                 positiveYear(row.optInt("seasonYear"))
             )
         }
-        val chosen = TitleScore.bestIndex(candidates, wanted, (guess as? MediaGuess.Movie)?.year)
+        val chosen = TitleScore.bestIndex(candidates, wanted, guessYear(guess))
         if (chosen < 0) return MediaOutcome.NoMatch
         val row = rows[chosen]
         return MediaOutcome.Found(
@@ -279,7 +299,7 @@ internal class WikipediaSource : MediaSource {
             is MediaGuess.Episode -> guess.series
             is MediaGuess.Unnamed -> return MediaOutcome.NoMatch
         }
-        val wantedYear = (guess as? MediaGuess.Movie)?.year
+        val wantedYear = guessYear(guess)
         val kind = if (guess is MediaGuess.Episode) "television series" else "film"
         val response = HttpJson.get(
             HttpJson.url(
@@ -371,7 +391,7 @@ internal class ImdbSource(private val tmdb: TmdbSource? = null) : MediaSource {
                 (if (guess is MediaGuess.Episode) seriesKinds else filmKinds)
         }
         val candidates = works.map { row -> TitleScore.Candidate(row.optString("l"), releaseYear(row)) }
-        val chosen = TitleScore.bestIndex(candidates, wanted, (guess as? MediaGuess.Movie)?.year)
+        val chosen = TitleScore.bestIndex(candidates, wanted, guessYear(guess))
         if (chosen < 0) return MediaOutcome.NoMatch
         val row = works[chosen]
         val poster = imdbPoster(row.optJSONObject("i")?.optString("imageUrl"))

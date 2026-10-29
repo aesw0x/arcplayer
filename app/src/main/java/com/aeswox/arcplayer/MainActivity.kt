@@ -127,6 +127,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -151,6 +153,7 @@ import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -162,6 +165,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
@@ -309,6 +313,9 @@ import com.aeswox.arcplayer.metadata.PlayOrder
 import com.aeswox.arcplayer.metadata.ReleaseInfo
 import com.aeswox.arcplayer.metadata.ShelfSearch
 import com.aeswox.arcplayer.metadata.TmdbDetails
+import com.aeswox.arcplayer.metadata.TmdbSearch
+import com.aeswox.arcplayer.metadata.TmdbSearchResult
+import com.aeswox.arcplayer.metadata.episodeLabel
 import com.aeswox.arcplayer.metadata.TitleCandidate
 import com.aeswox.arcplayer.metadata.TitleDetail
 import com.aeswox.arcplayer.metadata.TitleGroup
@@ -5374,7 +5381,7 @@ private fun CloudTitleInfoPage(
     val playPart = title.group.parts.firstOrNull { it.id == playFile.stableId }
     val playSeason = playPart?.season
         ?: playPart?.episode?.let { AbsoluteSeasons.seasonFor(it, detail?.seasons.orEmpty()) }
-    var season by remember(title) {
+    var season by remember(title, shown.providerId) {
         mutableIntStateOf(
             playSeason?.takeIf { it in shelfSeasons }
                 ?: shelfSeasons.minOrNull()
@@ -5385,11 +5392,14 @@ private fun CloudTitleInfoPage(
     // A part numbered by its place in the whole run only lands on a season once those lengths are
     // known, and they arrive a moment after this page's first frame. So it is corrected when they
     // show up, and given up the moment the viewer picks a season themselves.
-    var seasonChosen by remember(title) { mutableStateOf(false) }
-    LaunchedEffect(title, detail, seasonChosen) {
+    var seasonChosen by remember(title, shown.providerId) { mutableStateOf(false) }
+    LaunchedEffect(title, shown.providerId, detail, seasonChosen) {
         val seasons = detail?.seasons ?: return@LaunchedEffect
-        if (seasonChosen || playSeason == null || playSeason == season) return@LaunchedEffect
-        if (playSeason in shelfSeasons) season = playSeason
+        if (seasonChosen) return@LaunchedEffect
+        val target = playSeason?.takeIf { it in shelfSeasons } ?: shelfSeasons.minOrNull()
+        if (target != null && target != season) {
+            season = target
+        }
     }
     // Only a show has seasons to ask for. Handed a film's id, the season endpoint answers 404, and the
     // answer would be thrown away anyway — the episode list below renders for a series alone.
@@ -5398,6 +5408,7 @@ private fun CloudTitleInfoPage(
     // The episode a copies sheet was opened for. It holds the row's own files rather than a number to
     // look up, because switching season behind the sheet would change what that number means.
     var copiesSheet by remember(title) { mutableStateOf<EpisodeCopiesSheet?>(null) }
+    var showFixMatchSheet by remember(title) { mutableStateOf(false) }
 
     val heroPx = with(LocalDensity.current) { heroHeight.toPx() }
     val featherPx = with(LocalDensity.current) { INFO_HERO_FEATHER_DP.dp.toPx() }
@@ -5570,31 +5581,33 @@ private fun CloudTitleInfoPage(
                                     onRemove = onRemoveDownload
                                 )
                             }
-                            // The one destructive thing this page can do rides beside the action rather
-                            // than under it, so the picture holds both choices the moment the page opens.
-                            //
-                            // Only a work the channel actually carries can be taken off it. A card the phone
-                            // alone fills has nothing on the shelf to remove, and a pill that deletes nothing
-                            // is a lie about what the button does.
-                            if (title.heldOnChannel) Box(
+                            // Options for this title: rematch / fix metadata, or remove from shelf.
+                            Box(
                                 modifier = Modifier
                                     .size(56.dp)
                                     .clip(CircleShape)
                                     .background(OneUiPillSurface)
                             ) {
                                 MorphingMenu(
-                                    items = listOf(
+                                    items = listOfNotNull(
                                         MorphingMenuItem(
-                                            text = "Remove from shelf",
-                                            icon = Icons.Default.Delete,
-                                            isDestructive = true,
-                                            onClick = {
-                                                // No confirmation follows this, so the thud is the only warning
-                                                // that the whole work is leaving the shelf rather than one file.
-                                                AppHaptics.destructive()
-                                                onRemove(title)
-                                            }
-                                        )
+                                            text = "Fix match",
+                                            icon = Icons.Outlined.Search,
+                                            onClick = { showFixMatchSheet = true }
+                                        ),
+                                        if (title.heldOnChannel) {
+                                            MorphingMenuItem(
+                                                text = "Remove from shelf",
+                                                icon = Icons.Default.Delete,
+                                                isDestructive = true,
+                                                onClick = {
+                                                    // No confirmation follows this, so the thud is the only warning
+                                                    // that the whole work is leaving the shelf rather than one file.
+                                                    AppHaptics.destructive()
+                                                    onRemove(title)
+                                                }
+                                            )
+                                        } else null
                                     ),
                                     buttonSize = 56.dp,
                                     tint = OneUiTextPrimary
@@ -5859,6 +5872,389 @@ private fun CloudTitleInfoPage(
                         }
                     }
                 }
+            }
+        }
+
+        if (showFixMatchSheet) {
+            val coroutineScope = rememberCoroutineScope()
+            FixMatchSheet(
+                title = title,
+                shown = shown,
+                apiKey = BuildConfig.TMDB_API_KEY,
+                onDismiss = { showFixMatchSheet = false },
+                onApplyMatch = { match ->
+                    val apiKey = BuildConfig.TMDB_API_KEY
+                    val newCard = MediaCard(
+                        title = match.title,
+                        subtitle = if (match.isSeries) null else match.year?.toString(),
+                        posterUrl = match.posterUrl,
+                        source = "tmdb",
+                        logoUrl = null,
+                        logoKnown = false,
+                        providerId = match.id,
+                        isSeries = match.isSeries
+                    )
+                    title.parts.forEach { part ->
+                        val sub = if (newCard.isSeries) {
+                            val guess = MediaNameParser.parse(part.title)
+                            episodeLabel(guess)
+                        } else newCard.subtitle
+                        prefsStore.rememberMediaCard(part.stableId, newCard.copy(subtitle = sub ?: newCard.subtitle))
+                    }
+                    prefsStore.rememberMediaCard(title.cardKey, newCard)
+                    if (title.representative.stableId != title.cardKey) {
+                        prefsStore.rememberMediaCard(title.representative.stableId, newCard)
+                    }
+
+                    coroutineScope.launch {
+                        val detail = withContext(Dispatchers.IO) {
+                            runCatching { TmdbDetails.title(apiKey, match.id, match.isSeries) }.getOrNull()
+                        }
+                        if (detail != null) {
+                            prefsStore.rememberTitleDetail(match.id, match.isSeries, detail)
+                        }
+                        val logoUrl = withContext(Dispatchers.IO) {
+                            runCatching { TmdbDetails.logo(apiKey, match.id, match.isSeries) }.getOrNull()
+                        }
+                        val withLogo = newCard.copy(logoUrl = logoUrl, logoKnown = true)
+                        prefsStore.rememberMediaCard(title.cardKey, withLogo)
+                        title.parts.forEach { part ->
+                            val existing = prefsStore.mediaCards[part.stableId]
+                            if (existing != null) {
+                                prefsStore.rememberMediaCard(part.stableId, existing.copy(logoUrl = logoUrl, logoKnown = true))
+                            }
+                        }
+
+                        if (match.isSeries && detail != null) {
+                            val targetSeason = playSeason?.takeIf { it in filesBySeason.keys }
+                                ?: filesBySeason.keys.minOrNull()
+                                ?: detail.seasons.firstOrNull { it.number > 0 }?.number
+                                ?: 1
+                            val eps = withContext(Dispatchers.IO) {
+                                runCatching { TmdbDetails.episodes(apiKey, match.id, targetSeason) }.getOrNull()
+                            }
+                            if (eps != null) {
+                                prefsStore.rememberEpisodesOf(match.id, targetSeason, eps)
+                            }
+                        }
+                    }
+                }
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FixMatchSheet(
+    title: ShelfTitle,
+    shown: ShelfTitle,
+    apiKey: String,
+    onDismiss: () -> Unit,
+    onApplyMatch: (TmdbSearchResult) -> Unit
+) {
+    var query by rememberSaveable { mutableStateOf(shown.name) }
+    var results by remember { mutableStateOf<List<TmdbSearchResult>>(emptyList()) }
+    var isSearching by remember { mutableStateOf(false) }
+    var isApplying by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
+
+    LaunchedEffect(query, apiKey) {
+        val trimmed = query.trim()
+        if (trimmed.isBlank() || apiKey.isBlank()) {
+            results = emptyList()
+            isSearching = false
+            return@LaunchedEffect
+        }
+        isSearching = true
+        delay(300)
+        val fetched = withContext(Dispatchers.IO) {
+            runCatching { TmdbSearch.search(apiKey, trimmed) }.getOrDefault(emptyList())
+        }
+        results = fetched.distinctBy { "${it.isSeries}:${it.id}" }
+        isSearching = false
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = OneUiBackground,
+        contentColor = OneUiTextPrimary,
+        scrimColor = Color.Black.copy(alpha = 0.55f)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 360.dp, max = 580.dp)
+                .padding(start = 20.dp, end = 20.dp, bottom = 26.dp)
+        ) {
+            Text(
+                text = "Fix Match",
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                color = OneUiTextPrimary
+            )
+            Text(
+                text = "Search TMDB or auto-detect with updated anime rules",
+                fontSize = 12.sp,
+                color = OneUiTextSecondary,
+                modifier = Modifier.padding(top = 2.dp, bottom = 12.dp)
+            )
+
+            // Auto-detect button
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f))
+                    .clickable(enabled = !isApplying) {
+                        isApplying = true
+                        coroutineScope.launch {
+                            val detectedCard = withContext(Dispatchers.IO) {
+                                runCatching { MediaLibrary.cardFor(title.asker.title, apiKey) }.getOrNull()
+                            }
+                            if (detectedCard?.providerId != null) {
+                                onApplyMatch(
+                                    TmdbSearchResult(
+                                        id = detectedCard.providerId,
+                                        title = detectedCard.title,
+                                        year = detectedCard.subtitle?.toIntOrNull(),
+                                        isSeries = detectedCard.isSeries,
+                                        posterUrl = detectedCard.posterUrl,
+                                        overview = null,
+                                        isAnimation = true
+                                    )
+                                )
+                                onDismiss()
+                            } else {
+                                isApplying = false
+                            }
+                        }
+                    }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Refresh,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Auto-detect with updated rules",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = OneUiTextPrimary
+                    )
+                    Text(
+                        text = "Re-analyzes file name with anime & year detection",
+                        fontSize = 11.sp,
+                        color = OneUiTextSecondary
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                singleLine = true,
+                placeholder = { Text("Search title...", color = OneUiTextSecondary) },
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Outlined.Search,
+                        contentDescription = null,
+                        tint = OneUiTextSecondary
+                    )
+                },
+                trailingIcon = {
+                    if (query.isNotEmpty()) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Clear",
+                            tint = OneUiTextSecondary,
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(CircleShape)
+                                .clickable { query = "" }
+                                .padding(8.dp)
+                        )
+                    }
+                },
+                shape = RoundedCornerShape(16.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                    unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant,
+                    focusedTextColor = OneUiTextPrimary,
+                    unfocusedTextColor = OneUiTextPrimary,
+                    cursorColor = MaterialTheme.colorScheme.primary
+                ),
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            if (isApplying) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(160.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            color = MaterialTheme.colorScheme.primary,
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.size(28.dp)
+                        )
+                        Text(
+                            text = "Applying match...",
+                            fontSize = 13.sp,
+                            color = OneUiTextSecondary
+                        )
+                    }
+                }
+            } else if (isSearching) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(160.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(
+                        color = MaterialTheme.colorScheme.primary,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
+            } else if (results.isEmpty() && query.isNotBlank()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(140.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (apiKey.isBlank()) "TMDB API key not configured" else "No matching titles found",
+                        fontSize = 13.sp,
+                        color = OneUiTextSecondary
+                    )
+                }
+            } else {
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f, fill = false)
+                ) {
+                    items(results, key = { "${it.isSeries}:${it.id}" }) { item ->
+                        val isCurrentMatch = item.id == shown.providerId
+                        FixMatchResultRow(
+                            item = item,
+                            isCurrentMatch = isCurrentMatch,
+                            onClick = {
+                                isApplying = true
+                                onApplyMatch(item)
+                                onDismiss()
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FixMatchResultRow(
+    item: TmdbSearchResult,
+    isCurrentMatch: Boolean = false,
+    onClick: () -> Unit
+) {
+    val interaction = remember { MutableInteractionSource() }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .jelly(interaction, scaleDownTo = 0.98f)
+            .background(OneUiCardSurface)
+            .border(
+                width = if (isCurrentMatch) 1.5.dp else 1.dp,
+                color = if (isCurrentMatch) MaterialTheme.colorScheme.primary else OneUiTextSecondary.copy(alpha = 0.15f),
+                shape = RoundedCornerShape(12.dp)
+            )
+            .clickable(interactionSource = interaction, indication = null, onClick = onClick)
+            .padding(10.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        val art = rememberCachedArt(item.posterUrl, 160)
+        ArtSlot(
+            art = art,
+            contentDescription = item.title,
+            modifier = Modifier
+                .width(44.dp)
+                .height(66.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(OneUiTextSecondary.copy(alpha = 0.14f))
+        )
+        Column(modifier = Modifier.weight(1f)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text(
+                    text = item.title,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = OneUiTextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                if (isCurrentMatch) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.18f))
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = "Current",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
+            val meta = listOfNotNull(
+                if (item.isAnimation) "Anime" else if (item.isSeries) "Series" else "Movie",
+                item.year?.toString()
+            ).joinToString(" · ")
+            Text(
+                text = meta,
+                fontSize = 12.sp,
+                color = if (item.isAnimation) MaterialTheme.colorScheme.primary else OneUiTextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 2.dp)
+            )
+            item.overview?.let { overview ->
+                Text(
+                    text = overview,
+                    fontSize = 11.sp,
+                    color = OneUiTextSecondary.copy(alpha = 0.75f),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 2.dp)
+                )
             }
         }
     }

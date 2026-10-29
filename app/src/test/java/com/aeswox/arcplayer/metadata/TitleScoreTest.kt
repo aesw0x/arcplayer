@@ -51,6 +51,15 @@ class TitleScoreTest {
     }
 
     @Test
+    fun animeBonusBreaksTieForUnseasonedShows() {
+        val rows = listOf(
+            TitleScore.Candidate("ONE PIECE", 2023, bonus = 0),
+            TitleScore.Candidate("One Piece", 1999, bonus = 1)
+        )
+        assertEquals(1, TitleScore.bestIndex(rows, "One Piece", null))
+    }
+
+    @Test
     fun nothingIsAcceptedBelowTheFloor() {
         val rows = listOf(candidate("The Story of Us"), candidate("Spirited Away"))
         assertEquals(-1, TitleScore.bestIndex(rows, "One Piece", 2001))

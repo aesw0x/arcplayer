@@ -34,7 +34,7 @@ object TitleScore {
     private val partWords = setOf("chapter", "part", "vol", "volume")
 
     /** One row of a search response, reduced to what can be compared. */
-    data class Candidate(val title: String, val year: Int?)
+    data class Candidate(val title: String, val year: Int?, val bonus: Int = 0)
 
     /**
      * Lower-case, with everything that is not a letter or a digit removed and an ampersand spent on
@@ -100,7 +100,7 @@ object TitleScore {
             year in (wantedYear - 1)..(wantedYear + 1) -> NEAR_YEAR
             else -> WRONG_YEAR
         }
-        return shared + nudge
+        return shared + nudge + candidate.bonus
     }
 
     /**

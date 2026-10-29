@@ -212,6 +212,31 @@ object TmdbDetails {
         }.sortedBy { it.number }
     }
 
+    /** The wordmark for one entry, or null when TMDB has none. */
+    fun logo(apiKey: String, providerId: Int, isSeries: Boolean): String? {
+        if (apiKey.isBlank() || providerId <= 0) return null
+        val kind = if (isSeries) "tv" else "movie"
+        val response = HttpJson.get(
+            HttpJson.url(
+                "$BASE/$kind/$providerId/images",
+                "api_key" to apiKey,
+                "include_image_language" to "en,null"
+            )
+        ) ?: return null
+        val renditions = response.optJSONArray("logos").objects().mapNotNull { row ->
+            val path = row.optString("file_path").nullIfBlank() ?: return@mapNotNull null
+            TitleLogo.Rendition(
+                filePath = path,
+                language = row.optString("iso_639_1").nullIfBlank(),
+                widthPx = row.optInt("width"),
+                voteAverage = row.optDouble("vote_average", 0.0),
+                voteCount = row.optInt("vote_count")
+            )
+        }
+        val chosen = TitleLogo.best(renditions, preferredLanguage = "en") ?: return null
+        return "https://image.tmdb.org/t/p/w1280${chosen.filePath}"
+    }
+
     private fun movie(response: JSONObject): TitleDetail {
         val crew = response.optJSONObject("credits")?.optJSONArray("crew").objects()
         return TitleDetail(
@@ -274,6 +299,66 @@ object TmdbDetails {
             .mapNotNull { it.optString("name").nullIfBlank() }
             .distinct()
             .take(3)
+}
+
+/** One candidate row returned by TMDB search for user selection / fix match. */
+data class TmdbSearchResult(
+    val id: Int,
+    val title: String,
+    val year: Int?,
+    val isSeries: Boolean,
+    val posterUrl: String?,
+    val overview: String?,
+    val isAnimation: Boolean
+)
+
+/** Direct search against TMDB for movies and TV series. */
+object TmdbSearch {
+
+    private const val BASE = "https://api.themoviedb.org/3"
+
+    fun search(apiKey: String, query: String): List<TmdbSearchResult> {
+        val trimmed = query.trim()
+        if (apiKey.isBlank() || trimmed.isBlank()) return emptyList()
+        val response = HttpJson.get(
+            HttpJson.url(
+                "$BASE/search/multi",
+                "api_key" to apiKey,
+                "language" to "en-US",
+                "query" to trimmed,
+                "include_adult" to "false"
+            )
+        ) ?: return emptyList()
+        val results = response.optJSONArray("results").objects()
+        return results.mapNotNull { row ->
+            val mediaType = row.optString("media_type")
+            if (mediaType != "movie" && mediaType != "tv") return@mapNotNull null
+            val isSeries = mediaType == "tv"
+            val title = if (isSeries) {
+                row.optString("name").ifBlank { row.optString("original_name") }
+            } else {
+                row.optString("title").ifBlank { row.optString("original_title") }
+            }
+            if (title.isBlank()) return@mapNotNull null
+            val dateStr = if (isSeries) row.optString("first_air_date") else row.optString("release_date")
+            val year = yearOf(dateStr)
+            val posterPath = row.optString("poster_path").nullIfBlank()
+            val posterUrl = if (posterPath != null) "https://image.tmdb.org/t/p/w342$posterPath" else null
+            val genreIds = (0 until (row.optJSONArray("genre_ids")?.length() ?: 0)).mapNotNull {
+                row.optJSONArray("genre_ids")?.optInt(it)
+            }
+            val isAnim = 16 in genreIds || row.optString("original_language") == "ja"
+            TmdbSearchResult(
+                id = row.optInt("id"),
+                title = title,
+                year = year,
+                isSeries = isSeries,
+                posterUrl = posterUrl,
+                overview = row.optString("overview").nullIfBlank(),
+                isAnimation = isAnim
+            )
+        }
+    }
 }
 
 /**

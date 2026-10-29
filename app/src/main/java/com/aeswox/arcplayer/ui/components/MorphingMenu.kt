@@ -85,6 +85,7 @@ fun MorphingMenu(
     val menuHeight = remember(items.size, dividerCount) { (items.size * 52 + dividerCount * 17 + 16).dp }
 
     fun dismiss(onFinished: (() -> Unit)? = null) {
+        onFinished?.invoke()
         if (isDismissing) return
         isDismissing = true
         coroutineScope.launch {
@@ -94,7 +95,6 @@ fun MorphingMenu(
             )
             isOpen = false
             isDismissing = false
-            onFinished?.invoke()
         }
     }
 
@@ -201,7 +201,8 @@ fun MorphingMenu(
                                         MorphingMenuItemRow(
                                             item = item,
                                             onItemClick = {
-                                                dismiss { item.onClick() }
+                                                item.onClick()
+                                                dismiss()
                                             }
                                         )
                                         if (item.dividerAfter) {

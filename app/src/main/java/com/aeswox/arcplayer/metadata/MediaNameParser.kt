@@ -24,7 +24,8 @@ sealed interface MediaGuess {
         val series: String,
         val season: Int?,
         val episode: Int,
-        val episodeTitle: String?
+        val episodeTitle: String?,
+        val year: Int? = null
     ) : MediaGuess
 
     /** The name gave up nothing usable; keep it on the card rather than show a blank one. */
@@ -198,11 +199,15 @@ object MediaNameParser {
 
         // Brackets are where a careful uploader puts the facts the release tail would otherwise hide.
         val bracketSeason = seasonAlone.findAll(brackets).mapNotNull { it.groupValues[1].toIntOrNull() }.lastOrNull()
+        val bracketYear = yearNumber.findAll(brackets).mapNotNull { it.value.toIntOrNull() }.lastOrNull { it in OLDEST_YEAR..(thisYear + 1) }
 
         episodeMarker(spaced)?.let { marker ->
             val head = spaced.substring(0, marker.start)
             val seasonInHead = if (marker.season == null) seasonAlone.find(head) else null
             val seriesText = if (seasonInHead != null) head.substring(0, seasonInHead.range.first) else head
+            val headCut = cutAtFirstTag(tokenize(seriesText))
+            val trailingYear = headCut.lastOrNull()?.takeIf { it.matches(fourDigitYear) }?.toIntOrNull()
+                ?.takeIf { it in OLDEST_YEAR..(thisYear + 1) }
             val series = phraseUpTo(seriesText, dropTrailingYear = true)
             if (series.isBlank()) return MediaGuess.Unnamed(fallback(rawName, spaced))
             // A season written after the part number — "Episode 3 (Season 1)" — is the same fact the
@@ -218,7 +223,8 @@ object MediaNameParser {
                 series = series,
                 season = marker.season ?: seasonInHead?.groupValues?.get(1)?.toIntOrNull() ?: bracketSeason,
                 episode = marker.episode,
-                episodeTitle = episodeTitle.takeIf { it.isNotBlank() }
+                episodeTitle = episodeTitle.takeIf { it.isNotBlank() },
+                year = trailingYear ?: bracketYear
             )
         }
 
