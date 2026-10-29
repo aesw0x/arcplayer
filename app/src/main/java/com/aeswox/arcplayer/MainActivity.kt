@@ -3158,16 +3158,16 @@ fun ArcPlayerHomeScreen() {
         val sharedTransitionScope = this
 
         AnimatedContent(
-            targetState = activePlayback,
+            targetState = activePlayback != null,
             transitionSpec = {
                 fadeIn(animationSpec = tween(260, easing = FastOutSlowInEasing)) togetherWith
                     fadeOut(animationSpec = tween(260, easing = FastOutSlowInEasing))
             },
             label = "HeroVideoPlayerTransition"
-        ) { currentPlayback ->
+        ) { isPlayerOpen ->
             val playerAnimatedVisibilityScope = this
 
-            if (currentPlayback == null) {
+            if (!isPlayerOpen) {
                 // Plain wrapper so the floating overlays are siblings of the jellySource
                 // node: a glass consumer inside the recorded subtree smears its own
                 // content on API 34+ and cycles the render tree on API 31-33.
@@ -3704,46 +3704,48 @@ fun ArcPlayerHomeScreen() {
                     }
                 }
             } else {
-                HeroVlcVideoPlayerScreen(
-                    playback = currentPlayback,
-                    prefsStore = prefsStore,
-                    sharedTransitionScope = sharedTransitionScope,
-                    animatedVisibilityScope = playerAnimatedVisibilityScope,
-                    cloudRepository = if (currentPlayback.cloudSources.isEmpty()) null else cloudRepository,
-                    onSelectAdjacentVideo = { nextVideo ->
-                        // A step onto a file that was already here puts down the download the player was
-                        // reading; a step to another channel copy releases the one it is leaving.
-                        holdShelfCopy(
-                            currentPlayback.cloudSources.firstOrNull { it.stableId == nextVideo.id }
-                                ?: nextVideo
-                        )
-                        morphingVideoKey = "${currentPlayback.sharedKeyPrefix}_${nextVideo.id}"
-                        // A step is a fresh question, so the refusals that answered the last one are
-                        // dropped with it: the next part gets its own try at its own copies.
-                        activePlayback = currentPlayback.copy(
-                            video = nextVideo,
-                            switchReason = null,
-                            refusedCopies = emptySet()
-                        )
-                    },
-                    onFallToAnotherCopy = { nextVideo, reason ->
-                        holdShelfCopy(
-                            currentPlayback.cloudSources.firstOrNull { it.stableId == nextVideo.id }
-                                ?: nextVideo
-                        )
-                        // The copy that refused is dropped from the shelf's memory of what was watched
-                        // last, because leaving its stamp the newest one would send Resume and the
-                        // Continue Watching row straight back to the file that just failed.
-                        prefsStore.rememberWatchedAt(nextVideo.id)
-                        morphingVideoKey = "${currentPlayback.sharedKeyPrefix}_${nextVideo.id}"
-                        activePlayback = currentPlayback.copy(
-                            video = nextVideo,
-                            switchReason = reason,
-                            refusedCopies = currentPlayback.refusedCopies + currentPlayback.video.id
-                        )
-                    },
-                    onDismiss = { activePlayback = null }
-                )
+                activePlayback?.let { currentPlayback ->
+                    HeroVlcVideoPlayerScreen(
+                        playback = currentPlayback,
+                        prefsStore = prefsStore,
+                        sharedTransitionScope = sharedTransitionScope,
+                        animatedVisibilityScope = playerAnimatedVisibilityScope,
+                        cloudRepository = if (currentPlayback.cloudSources.isEmpty()) null else cloudRepository,
+                        onSelectAdjacentVideo = { nextVideo ->
+                            // A step onto a file that was already here puts down the download the player was
+                            // reading; a step to another channel copy releases the one it is leaving.
+                            holdShelfCopy(
+                                currentPlayback.cloudSources.firstOrNull { it.stableId == nextVideo.id }
+                                    ?: nextVideo
+                            )
+                            morphingVideoKey = "${currentPlayback.sharedKeyPrefix}_${nextVideo.id}"
+                            // A step is a fresh question, so the refusals that answered the last one are
+                            // dropped with it: the next part gets its own try at its own copies.
+                            activePlayback = currentPlayback.copy(
+                                video = nextVideo,
+                                switchReason = null,
+                                refusedCopies = emptySet()
+                            )
+                        },
+                        onFallToAnotherCopy = { nextVideo, reason ->
+                            holdShelfCopy(
+                                currentPlayback.cloudSources.firstOrNull { it.stableId == nextVideo.id }
+                                    ?: nextVideo
+                            )
+                            // The copy that refused is dropped from the shelf's memory of what was watched
+                            // last, because leaving its stamp the newest one would send Resume and the
+                            // Continue Watching row straight back to the file that just failed.
+                            prefsStore.rememberWatchedAt(nextVideo.id)
+                            morphingVideoKey = "${currentPlayback.sharedKeyPrefix}_${nextVideo.id}"
+                            activePlayback = currentPlayback.copy(
+                                video = nextVideo,
+                                switchReason = reason,
+                                refusedCopies = currentPlayback.refusedCopies + currentPlayback.video.id
+                            )
+                        },
+                        onDismiss = { activePlayback = null }
+                    )
+                }
             }
         }
     }
@@ -8549,19 +8551,19 @@ private fun HeroVlcVideoPlayerScreen(
     var lastScrubTick by remember { mutableFloatStateOf(0f) }
 
     /** Seconds left on the next-up card. Zero means nothing is being offered. */
-    var nextUpSeconds by remember { mutableIntStateOf(0) }
+    var nextUpSeconds by remember(video.id) { mutableIntStateOf(0) }
 
     /** The next-up card up before the end, with no countdown: offered, not imminent. */
-    var nextUpEarly by remember { mutableStateOf(false) }
+    var nextUpEarly by remember(video.id) { mutableStateOf(false) }
 
     /** The part whose offer the viewer turned down; asking again for the same one would be nagging. */
-    var declinedPartId by remember { mutableStateOf<Long?>(null) }
+    var declinedPartId by remember(video.id) { mutableStateOf<Long?>(null) }
 
     /**
      * The line under the spinner while a cloud seek waits for its bytes. Kept apart from the gesture
      * pill: this one is read for the whole length of a wait, not for the moment a gesture ends.
      */
-    var seekStageText by remember { mutableStateOf("") }
+    var seekStageText by remember(video.id) { mutableStateOf("") }
 
     var zoomScale by remember { mutableFloatStateOf(1f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
@@ -8687,7 +8689,7 @@ private fun HeroVlcVideoPlayerScreen(
         ?: titleCard?.posterUrl
     val loadingArt = rememberCachedArt(loadingArtUrl, PosterCache.HERO_WIDTH_PX)
 
-    LaunchedEffect(video.uri) {
+    LaunchedEffect(video.id, video.uri) {
         zoomScale = 1f
         panOffset = Offset.Zero
         gestureHudSticky = false
@@ -9069,6 +9071,22 @@ private fun HeroVlcVideoPlayerScreen(
      */
     LaunchedEffect(video.id) {
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        activity?.window?.let { win ->
+            val controller = WindowInsetsControllerCompat(win, hostView)
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    DisposableEffect(video.id) {
+        onDispose {
+            prefsStore.recordPlaybackProgress(
+                videoId = video.id,
+                positionMs = vlcEngine.resumablePositionMs,
+                durationMs = vlcEngine.durationMs
+            )
+        }
     }
 
     DisposableEffect(hostView, vlcEngine.isPlaying) {
