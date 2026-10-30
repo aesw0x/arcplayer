@@ -26,10 +26,12 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.CancellationSignal
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.os.StatFs
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
@@ -3698,7 +3700,20 @@ fun ArcPlayerHomeScreen() {
                                     coroutineScope.launch { cloudRepository.download(file) }
                                 },
                                 onCancelDownload = { file -> coroutineScope.launch { cloudRepository.cancelDownload(file) } },
-                                onRemoveDownload = { file -> coroutineScope.launch { cloudRepository.removeDownload(file) } }
+                                onRemoveDownload = { file -> coroutineScope.launch { cloudRepository.removeDownload(file) } },
+                                onDownloadBatch = { files ->
+                                    if (DownloadNotifier.needsPermissionAsk(context)) {
+                                        notificationsLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                                    }
+                                    coroutineScope.launch {
+                                        files.forEach { file -> cloudRepository.download(file) }
+                                    }
+                                },
+                                onCancelBatch = { files ->
+                                    coroutineScope.launch {
+                                        files.forEach { file -> cloudRepository.cancelDownload(file) }
+                                    }
+                                }
                             )
                         }
                     }
@@ -5266,7 +5281,9 @@ private fun CloudTitleInfoPage(
     onRemove: (ShelfTitle) -> Unit,
     onDownload: (CloudVideoItem) -> Unit,
     onCancelDownload: (CloudVideoItem) -> Unit,
-    onRemoveDownload: (CloudVideoItem) -> Unit
+    onRemoveDownload: (CloudVideoItem) -> Unit,
+    onDownloadBatch: (List<CloudVideoItem>) -> Unit = { files -> files.forEach { onDownload(it) } },
+    onCancelBatch: (List<CloudVideoItem>) -> Unit = { files -> files.forEach { onCancelDownload(it) } }
 ) {
     // The card arrives with the tap, so it is a snapshot; the store is the live one, and this page
     // starts a lookup of its own. Everything the page says about the work is read through [shown],
@@ -5411,6 +5428,7 @@ private fun CloudTitleInfoPage(
     // look up, because switching season behind the sheet would change what that number means.
     var copiesSheet by remember(title) { mutableStateOf<EpisodeCopiesSheet?>(null) }
     var showFixMatchSheet by remember(title) { mutableStateOf(false) }
+    var showSeriesDownloadSheet by remember(title) { mutableStateOf(false) }
 
     val heroPx = with(LocalDensity.current) { heroHeight.toPx() }
     val featherPx = with(LocalDensity.current) { INFO_HERO_FEATHER_DP.dp.toPx() }
@@ -5573,15 +5591,35 @@ private fun CloudTitleInfoPage(
                                     )
                                 }
                             }
-                            downloadFile?.let { file ->
-                                DownloadCircle(
-                                    file = file,
-                                    entry = downloads[file.stableId],
+                            if (shown.isSeries) {
+                                val seriesVideos = remember(title) { title.parts.filterIsInstance<CloudVideoItem>() }
+                                val activeSeriesDownloads = remember(seriesVideos, downloads) {
+                                    seriesVideos.filter { downloads[it.stableId]?.isComplete == false }
+                                }
+                                val anySeriesArriving = activeSeriesDownloads.isNotEmpty()
+                                val allSeriesCompleted = seriesVideos.isNotEmpty() && seriesVideos.all { downloads[it.stableId]?.isComplete == true }
+                                val seriesProgressKey = activeSeriesDownloads.firstOrNull()?.let { downloads[it.stableId]?.fileId ?: it.fileId } ?: 0
+
+                                DownloadCircleTarget(
+                                    size = 56.dp,
+                                    saved = allSeriesCompleted,
+                                    arriving = anySeriesArriving,
+                                    progressKey = seriesProgressKey,
                                     progress = downloadProgress,
-                                    onDownload = onDownload,
-                                    onCancel = onCancelDownload,
-                                    onRemove = onRemoveDownload
+                                    onClick = { showSeriesDownloadSheet = true },
+                                    onRemove = { onCancelBatch(seriesVideos) }
                                 )
+                            } else {
+                                downloadFile?.let { file ->
+                                    DownloadCircle(
+                                        file = file,
+                                        entry = downloads[file.stableId],
+                                        progress = downloadProgress,
+                                        onDownload = onDownload,
+                                        onCancel = onCancelDownload,
+                                        onRemove = onRemoveDownload
+                                    )
+                                }
                             }
                             // Options for this title: rematch / fix metadata, or remove from shelf.
                             Box(
@@ -5718,6 +5756,8 @@ private fun CloudTitleInfoPage(
                                         episodes = cataloguedEpisodes,
                                         title = title,
                                         filesBySeason = filesBySeason,
+                                        savedIds = savedIds,
+                                        downloads = downloads,
                                         onPlay = { file -> playCopy(file) },
                                         onShowCopies = { episode -> copiesSheet = EpisodeCopiesSheet(season, episode) }
                                     )
@@ -5892,7 +5932,7 @@ private fun CloudTitleInfoPage(
                         posterUrl = match.posterUrl,
                         source = "tmdb",
                         logoUrl = null,
-                        logoKnown = false,
+                        logoKnown = true,  // user manually picked this match — mark known immediately so TitleSearchPass never re-queries it
                         providerId = match.id,
                         isSeries = match.isSeries
                     )
@@ -5940,6 +5980,26 @@ private fun CloudTitleInfoPage(
                             }
                         }
                     }
+                }
+            )
+        }
+
+        if (showSeriesDownloadSheet) {
+            SeriesDownloadSheet(
+                title = title,
+                shown = shown,
+                currentSeason = season,
+                playFile = playFile,
+                filesBySeason = filesBySeason,
+                downloads = downloads,
+                savedIds = savedIds,
+                onDismiss = { showSeriesDownloadSheet = false },
+                onDownloadFiles = { files ->
+                    showSeriesDownloadSheet = false
+                    onDownloadBatch(files)
+                },
+                onCancelFiles = { files ->
+                    onCancelBatch(files)
                 }
             )
         }
@@ -6452,6 +6512,8 @@ private fun InfoEpisodeList(
     episodes: List<EpisodeDetail>?,
     title: ShelfTitle,
     filesBySeason: Map<Int, Map<Int, List<Playable>>>,
+    savedIds: Set<Long> = emptySet(),
+    downloads: Map<Long, DownloadEntry> = emptyMap(),
     onPlay: (Playable) -> Unit,
     onShowCopies: (ShelfEpisode) -> Unit
 ) {
@@ -6499,7 +6561,7 @@ private fun InfoEpisodeList(
 
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         rows.forEach { row ->
-            InfoEpisodeRow(row, onPlay, onShowCopies)
+            InfoEpisodeRow(row, savedIds, downloads, onPlay, onShowCopies)
         }
     }
 }
@@ -6507,11 +6569,15 @@ private fun InfoEpisodeList(
 @Composable
 private fun InfoEpisodeRow(
     row: ShelfEpisode,
+    savedIds: Set<Long> = emptySet(),
+    downloads: Map<Long, DownloadEntry> = emptyMap(),
     onPlay: (Playable) -> Unit,
     onShowCopies: (ShelfEpisode) -> Unit
 ) {
     val file = row.file
     val hasCopies = row.copies.size > 1
+    val isSaved = file != null && file.stableId in savedIds
+    val isArriving = file != null && downloads[file.stableId]?.isComplete == false
     Row(
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -6572,9 +6638,17 @@ private fun InfoEpisodeRow(
                         file != null && row.runtimeMinutes > 0 -> "${row.runtimeMinutes}m · ${file.sizeFormatted}"
                         file != null -> file.sizeFormatted
                         else -> "Not on your shelf"
+                    } + when {
+                        isSaved -> " · Offline"
+                        isArriving -> " · Downloading"
+                        else -> ""
                     },
                     fontSize = 11.sp,
-                    color = OneUiTextSecondary,
+                    color = when {
+                        isSaved -> Color(0xFF4CAF50)
+                        isArriving -> OneUiTextPrimary
+                        else -> OneUiTextSecondary
+                    },
                     modifier = Modifier.weight(1f, fill = false)
                 )
                 // A long press does the same, but nothing on a touch screen says so — and the only other
@@ -6599,14 +6673,33 @@ private fun InfoEpisodeRow(
             }
         }
         if (file != null) {
-            Icon(
-                imageVector = Icons.Default.PlayArrow,
-                contentDescription = null,
-                tint = OneUiTextPrimary,
-                modifier = Modifier
-                    .padding(top = 20.dp)
-                    .size(20.dp)
-            )
+            if (isArriving) {
+                CircularProgressIndicator(
+                    modifier = Modifier
+                        .padding(top = 20.dp)
+                        .size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = OneUiTextPrimary
+                )
+            } else if (isSaved) {
+                Icon(
+                    imageVector = Icons.Default.Check,
+                    contentDescription = "Offline",
+                    tint = Color(0xFF4CAF50),
+                    modifier = Modifier
+                        .padding(top = 20.dp)
+                        .size(18.dp)
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Default.PlayArrow,
+                    contentDescription = null,
+                    tint = OneUiTextPrimary,
+                    modifier = Modifier
+                        .padding(top = 20.dp)
+                        .size(20.dp)
+                )
+            }
         }
     }
 }
@@ -6741,6 +6834,416 @@ private fun InfoCopyRow(
                 .padding(top = 20.dp)
                 .size(20.dp)
         )
+    }
+}
+
+private data class SeriesDownloadOption(
+    val id: String,
+    val title: String,
+    val subtitle: String,
+    val files: List<CloudVideoItem>,
+    val totalSizeBytes: Long,
+    val isAlreadyDone: Boolean = false,
+    val isArriving: Boolean = false
+)
+
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+private fun SeriesDownloadSheet(
+    title: ShelfTitle,
+    shown: ShelfTitle,
+    currentSeason: Int,
+    playFile: Playable,
+    filesBySeason: Map<Int, Map<Int, List<Playable>>>,
+    downloads: Map<Long, DownloadEntry>,
+    savedIds: Set<Long>,
+    onDismiss: () -> Unit,
+    onDownloadFiles: (List<CloudVideoItem>) -> Unit,
+    onCancelFiles: (List<CloudVideoItem>) -> Unit
+) {
+    val freeSpaceBytes = remember {
+        runCatching {
+            val stat = StatFs(Environment.getDataDirectory().path)
+            stat.availableBytes
+        }.getOrDefault(0L)
+    }
+
+    val seriesVideos = remember(title) { title.parts.filterIsInstance<CloudVideoItem>() }
+    val activeDownloads = remember(seriesVideos, downloads) {
+        seriesVideos.filter { downloads[it.stableId]?.isComplete == false }
+    }
+
+    // Best cloud video copy for each episode in each season
+    val allEpisodesInOrder = remember(filesBySeason) {
+        filesBySeason.keys.sorted().flatMap { sNum ->
+            filesBySeason[sNum].orEmpty().keys.sorted().mapNotNull { eNum ->
+                filesBySeason[sNum]?.get(eNum)?.firstOrNull { it is CloudVideoItem } as? CloudVideoItem
+            }
+        }
+    }
+
+    val options = remember(title, currentSeason, playFile, filesBySeason, downloads, savedIds) {
+        val list = mutableListOf<SeriesDownloadOption>()
+
+        // 1. Current Episode
+        val currentPlayCloud = playFile as? CloudVideoItem
+        if (currentPlayCloud != null) {
+            val playPart = title.group.parts.firstOrNull { it.id == currentPlayCloud.stableId }
+            val epS = playPart?.season ?: currentSeason
+            val epE = playPart?.episode
+            val epLabel = if (epE != null) "S${epS}:E${epE}" else "Episode"
+            val isDone = currentPlayCloud.stableId in savedIds
+            val isArriving = downloads[currentPlayCloud.stableId]?.isComplete == false
+
+            val sub = when {
+                isDone -> "Downloaded · ${formatFileSize(currentPlayCloud.sizeBytes)}"
+                isArriving -> "Downloading… · ${formatFileSize(currentPlayCloud.sizeBytes)}"
+                else -> "${formatFileSize(currentPlayCloud.sizeBytes)} · Tap to download"
+            }
+            list.add(
+                SeriesDownloadOption(
+                    id = "current",
+                    title = "Current Episode ($epLabel)",
+                    subtitle = sub,
+                    files = listOf(currentPlayCloud),
+                    totalSizeBytes = currentPlayCloud.sizeBytes,
+                    isAlreadyDone = isDone,
+                    isArriving = isArriving
+                )
+            )
+        }
+
+        // 2. Next 3 Episodes
+        val currentIdx = if (currentPlayCloud != null) {
+            allEpisodesInOrder.indexOfFirst { it.stableId == currentPlayCloud.stableId }
+        } else -1
+        val startIdx = if (currentIdx >= 0) currentIdx else 0
+        val upcomingUnsaved = allEpisodesInOrder.drop(startIdx).filter { it.stableId !in savedIds }
+        val next3 = upcomingUnsaved.take(3)
+        if (next3.isNotEmpty() && (next3.size > 1 || next3.first().stableId != currentPlayCloud?.stableId)) {
+            val totalSize = next3.sumOf { it.sizeBytes }
+            list.add(
+                SeriesDownloadOption(
+                    id = "next3",
+                    title = "Next ${next3.size} Episodes",
+                    subtitle = "${next3.size} episodes · ${formatFileSize(totalSize)}",
+                    files = next3,
+                    totalSizeBytes = totalSize
+                )
+            )
+        }
+
+        // 3. Current Season episodes
+        val currentSeasonEpisodes = filesBySeason[currentSeason].orEmpty().keys.sorted().mapNotNull { eNum ->
+            filesBySeason[currentSeason]?.get(eNum)?.firstOrNull { it is CloudVideoItem } as? CloudVideoItem
+        }
+        val currentSeasonUnsaved = currentSeasonEpisodes.filter { it.stableId !in savedIds }
+
+        // Remaining in Season
+        val playPart = currentPlayCloud?.let { c -> title.group.parts.firstOrNull { it.id == c.stableId } }
+        val isCurrentInThisSeason = playPart?.season == currentSeason || (playPart?.season == null && currentSeason == 1)
+        val currentEpNum = playPart?.episode ?: 0
+
+        val remainingSeason = if (isCurrentInThisSeason && currentEpNum > 0) {
+            currentSeasonEpisodes.filter { ep ->
+                val epPart = title.group.parts.firstOrNull { it.id == ep.stableId }
+                val num = epPart?.episode ?: 0
+                num >= currentEpNum && ep.stableId !in savedIds
+            }
+        } else emptyList()
+
+        if (remainingSeason.isNotEmpty() && remainingSeason.size < currentSeasonUnsaved.size) {
+            val totalSize = remainingSeason.sumOf { it.sizeBytes }
+            list.add(
+                SeriesDownloadOption(
+                    id = "remaining_season",
+                    title = "Remaining in Season $currentSeason",
+                    subtitle = "${remainingSeason.size} episodes · ${formatFileSize(totalSize)}",
+                    files = remainingSeason,
+                    totalSizeBytes = totalSize
+                )
+            )
+        }
+
+        // Whole Season
+        if (currentSeasonEpisodes.isNotEmpty()) {
+            val totalSize = currentSeasonUnsaved.sumOf { it.sizeBytes }
+            val sub = when {
+                currentSeasonUnsaved.isEmpty() -> "All ${currentSeasonEpisodes.size} episodes downloaded"
+                currentSeasonUnsaved.size < currentSeasonEpisodes.size ->
+                    "${currentSeasonUnsaved.size} remaining of ${currentSeasonEpisodes.size} · ${formatFileSize(totalSize)}"
+                else -> "${currentSeasonEpisodes.size} episodes · ${formatFileSize(totalSize)}"
+            }
+            list.add(
+                SeriesDownloadOption(
+                    id = "whole_season",
+                    title = "Whole Season $currentSeason",
+                    subtitle = sub,
+                    files = currentSeasonUnsaved,
+                    totalSizeBytes = totalSize,
+                    isAlreadyDone = currentSeasonUnsaved.isEmpty()
+                )
+            )
+        }
+
+        // 4. All Seasons (Entire Series)
+        val allUnsaved = allEpisodesInOrder.filter { it.stableId !in savedIds }
+        if (allEpisodesInOrder.size > currentSeasonEpisodes.size || filesBySeason.keys.size > 1) {
+            val totalSize = allUnsaved.sumOf { it.sizeBytes }
+            val sub = when {
+                allUnsaved.isEmpty() -> "All ${allEpisodesInOrder.size} episodes downloaded"
+                allUnsaved.size < allEpisodesInOrder.size ->
+                    "${allUnsaved.size} remaining of ${allEpisodesInOrder.size} · ${formatFileSize(totalSize)}"
+                else -> "${allEpisodesInOrder.size} episodes across ${filesBySeason.keys.size} seasons · ${formatFileSize(totalSize)}"
+            }
+            list.add(
+                SeriesDownloadOption(
+                    id = "all_seasons",
+                    title = "All Seasons",
+                    subtitle = sub,
+                    files = allUnsaved,
+                    totalSizeBytes = totalSize,
+                    isAlreadyDone = allUnsaved.isEmpty()
+                )
+            )
+        }
+
+        list
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = OneUiBackground,
+        contentColor = OneUiTextPrimary,
+        scrimColor = Color.Black.copy(alpha = 0.55f)
+    ) {
+        FrostedModalPanel {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .physicsBounceOverscroll()
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, bottom = 32.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Download Series",
+                            fontSize = 12.sp,
+                            color = OneUiTextSecondary,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = shown.name,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = OneUiTextPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (freeSpaceBytes > 0L) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(OneUiTextSecondary.copy(alpha = 0.12f))
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = "${formatFileSize(freeSpaceBytes)} free",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = OneUiTextSecondary
+                            )
+                        }
+                    }
+                }
+
+                if (activeDownloads.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(14.dp))
+                    ActiveDownloadsBanner(
+                        activeCount = activeDownloads.size,
+                        onCancelAll = { onCancelFiles(activeDownloads) }
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    options.forEach { option ->
+                        val notEnoughSpace = freeSpaceBytes > 0L &&
+                            !option.isAlreadyDone &&
+                            option.totalSizeBytes > freeSpaceBytes
+
+                        DownloadOptionCard(
+                            option = option,
+                            notEnoughSpace = notEnoughSpace,
+                            onClick = {
+                                if (!option.isAlreadyDone && !option.isArriving && !notEnoughSpace) {
+                                    AppHaptics.click()
+                                    onDownloadFiles(option.files)
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActiveDownloadsBanner(
+    activeCount: Int,
+    onCancelAll: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(OneUiPillSurface)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.weight(1f)
+        ) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(18.dp),
+                strokeWidth = 2.dp,
+                color = OneUiTextPrimary
+            )
+            Text(
+                text = "Downloading $activeCount episode${if (activeCount == 1) "" else "s"}…",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = OneUiTextPrimary
+            )
+        }
+        Text(
+            text = "Cancel all",
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color(0xFFFF5252),
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .clickable {
+                    AppHaptics.destructive()
+                    onCancelAll()
+                }
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+        )
+    }
+}
+
+@Composable
+private fun DownloadOptionCard(
+    option: SeriesDownloadOption,
+    notEnoughSpace: Boolean,
+    onClick: () -> Unit
+) {
+    val enabled = !option.isAlreadyDone && !option.isArriving && !notEnoughSpace
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(OneUiPillSurface)
+            .then(
+                if (enabled) {
+                    Modifier.jellyClick(interactionSource = null, indication = null, onClick = onClick)
+                } else {
+                    Modifier
+                }
+            )
+            .padding(14.dp)
+            .graphicsLayer {
+                if (!enabled && !option.isAlreadyDone && !option.isArriving) alpha = 0.5f
+            }
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(42.dp)
+                .clip(CircleShape)
+                .background(OneUiBackground.copy(alpha = 0.65f))
+        ) {
+            when {
+                option.isAlreadyDone -> {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = null,
+                        tint = Color(0xFF4CAF50),
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                option.isArriving -> {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = OneUiTextPrimary
+                    )
+                }
+                notEnoughSpace -> {
+                    Text(
+                        text = "!",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFFFB300)
+                    )
+                }
+                else -> {
+                    Icon(
+                        imageVector = HugeIcons.Download,
+                        contentDescription = null,
+                        tint = OneUiTextPrimary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+        }
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = option.title,
+                fontSize = 14.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = OneUiTextPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = if (notEnoughSpace) {
+                    "Not enough storage · ${option.subtitle}"
+                } else {
+                    option.subtitle
+                },
+                fontSize = 12.sp,
+                color = if (notEnoughSpace) Color(0xFFFFB300) else OneUiTextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 2.dp)
+            )
+        }
+
+        if (enabled) {
+            Icon(
+                imageVector = Icons.Default.PlayArrow,
+                contentDescription = null,
+                tint = OneUiTextSecondary,
+                modifier = Modifier.size(16.dp)
+            )
+        }
     }
 }
 

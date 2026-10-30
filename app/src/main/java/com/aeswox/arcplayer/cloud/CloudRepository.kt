@@ -23,7 +23,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.drinkless.tdlib.TdApi
@@ -134,6 +136,7 @@ class CloudRepository(
      * only record of a film the viewer asked to keep: a lost update here is a copy the sweep deletes.
      */
     private val ledgerMutex = Mutex()
+    private val downloadSemaphore = Semaphore(1)
 
     private val _thumbnails = MutableStateFlow<Map<Long, ByteArray>>(emptyMap())
 
@@ -1589,19 +1592,19 @@ class CloudRepository(
                 isComplete = false,
             ))
         }
-        // The request goes out before TDLib has answered for it — `bridge.call` sends as it suspends and
-        // a late reply does not undo it — so a round trip that timed out is a fetch that is running, not
-        // one that failed. The pump finds out which it was, and asks again if the bytes stopped moving.
-        val answered = tryCall(TdApi.DownloadFile(fileId, PRIORITY, 0L, 0L, false))
-        Log.i(
-            TAG,
-            "download start title=${video.title} file=$fileId size=${video.sizeBytes} " +
-                "answered=${answered != null} into=$handle"
-        )
         scope.launch {
-            runCatching { pumpDownload(video) }
-                .orCancelled()
-                .onFailure { Log.w(TAG, "download pump file=$fileId", it) }
+            downloadSemaphore.withPermit {
+                if (!fetchingWhole(fileId)) return@withPermit
+                val answered = tryCall(TdApi.DownloadFile(fileId, PRIORITY, 0L, 0L, false))
+                Log.i(
+                    TAG,
+                    "download start title=${video.title} file=$fileId size=${video.sizeBytes} " +
+                        "answered=${answered != null} into=$handle"
+                )
+                runCatching { pumpDownload(video) }
+                    .orCancelled()
+                    .onFailure { Log.w(TAG, "download pump file=$fileId", it) }
+            }
         }
     }
 
