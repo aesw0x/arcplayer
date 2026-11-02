@@ -379,9 +379,12 @@ object PlayOrder {
      * The copy to play, or null when the group holds nothing.
      *
      * [slots] is one entry per episode — or one for a whole film — in watch order, each holding that
-     * part's files best copy first. An episode that was started but not finished wins; a finished one,
-     * whose position is at or past the end, is passed over for the next part nobody has opened. The
-     * position carried along is the deepest any copy of that part reached, because watching the
+     * part's files best copy first. A part the viewer was last inside wins, so the button opens the
+     * episode they are actually on rather than the lowest number the shelf still owes — which is the
+     * same promise [progress] makes the Continue Watching row, and the two have to agree or the card
+     * and the button name different episodes. A finished part is passed over, and where nothing is
+     * half-watched the first part nobody has opened wins, so a season never touched still starts at one.
+     * The position carried along is the deepest any copy of that part reached, because watching the
      * smaller file is still watching the episode.
      *
      * [lastPlayedMs] is when each file was last handed to the player. A part nobody has opened is
@@ -400,14 +403,27 @@ object PlayOrder {
     ): Play? {
         val opening = slots.firstOrNull { it.isNotEmpty() } ?: return null
         val openingCopy = pickCopy(opening, lastPlayedMs, savedIds) ?: return null
+        var underway: Play? = null
+        var underwayAt = -1L
         for (slot in slots) {
             val chosen = pickCopy(slot, lastPlayedMs, savedIds) ?: continue
             val position = slot.maxOfOrNull { resumeMs[it] ?: 0L } ?: 0L
             val length = slot.maxOfOrNull { lengthsMs[it] ?: 0L } ?: 0L
-            if (position <= 0L) return Play(chosen, 0L)
+            if (position <= 0L) continue
             // A file too little known to have a length is trusted instead: progress is erased the
             // moment a viewer reaches the tail, so a position on its own already means "not finished".
-            if (length <= 0L || position < length - FINISHED_SLACK_MS) return Play(chosen, position)
+            if (length > 0L && position >= length - FINISHED_SLACK_MS) continue
+            val openedAt = slot.maxOfOrNull { lastPlayedMs[it] ?: 0L } ?: 0L
+            if (openedAt > underwayAt) {
+                underway = Play(chosen, position)
+                underwayAt = openedAt
+            }
+        }
+        underway?.let { return it }
+        // Nothing half-watched: the first part nobody has opened, at its best copy.
+        for (slot in slots) {
+            val chosen = pickCopy(slot, lastPlayedMs, savedIds) ?: continue
+            if ((slot.maxOfOrNull { resumeMs[it] ?: 0L } ?: 0L) <= 0L) return Play(chosen, 0L)
         }
         // Everything watched through: start it again on the copy that was last watched.
         return Play(openingCopy, 0L)
@@ -472,13 +488,20 @@ object PlayOrder {
     data class Progress(val partId: Long, val resumeMs: Long, val lengthMs: Long, val remainingMs: Long)
 
     /**
-     * The first part that was started and never finished, or null when nothing is half-watched.
+     * The part the viewer was last inside that they never finished, or null when nothing is half-watched.
      *
      * [nextCopy] answers "what should the Play button open", and it always answers — a shelf watched
      * end to end still has a first episode to reopen. A Continue Watching row needs the narrower
      * question, because a title only belongs there while it has minutes left in it. The copy named is
      * the one that part was last watched on rather than the biggest one, so the row resumes where the
      * viewer actually was.
+     *
+     * Recency beats episode number, which is the whole reason this is not [nextCopy]. A season watched
+     * in order with one early episode abandoned twelve minutes in keeps an unfinished part *behind* the
+     * viewer for the rest of the run, and a card that named the lowest number would spend the rest of
+     * that season offering the episode they walked away from instead of the one on screen tonight. Two
+     * parts last watched at the same moment — which is what a season nobody has opened reads as — fall
+     * back to the earlier one, so a row that cannot know still behaves the way it used to.
      */
     fun progress(
         slots: List<List<Long>>,
@@ -487,6 +510,8 @@ object PlayOrder {
         lastPlayedMs: Map<Long, Long> = emptyMap(),
         savedIds: Set<Long> = emptySet()
     ): Progress? {
+        var owed: Progress? = null
+        var owedAt = -1L
         for (slot in slots) {
             val partId = pickCopy(slot, lastPlayedMs, savedIds) ?: continue
             val position = slot.maxOfOrNull { resumeMs[it] ?: 0L } ?: 0L
@@ -496,9 +521,95 @@ object PlayOrder {
             // A part too little known to have a length still counts as unfinished — progress is erased
             // at the tail — but there is no honest way to say how far through it the viewer is.
             val remaining = if (length > position) length - position else 0L
-            return Progress(partId, position, length, remaining)
+            // *When* belongs to the episode rather than the upload that earned it, exactly as the
+            // position does: a part watched on the smaller copy was still watched at that minute, so
+            // the newest stamp anywhere in the slot is the one that speaks for it.
+            val openedAt = slot.maxOfOrNull { lastPlayedMs[it] ?: 0L } ?: 0L
+            if (openedAt > owedAt) {
+                owed = Progress(partId, position, length, remaining)
+                owedAt = openedAt
+            }
         }
-        return null
+        return owed
+    }
+
+    /** Whether the shelf says an episode was never opened, put down partway, or watched through. */
+    enum class EpisodeWatch { UNWATCHED, STARTED, WATCHED }
+
+    /** One episode's standing, and how much of it the device can actually prove. */
+    data class EpisodeStanding(
+        val number: Int,
+        val watch: EpisodeWatch,
+        val fraction: Float,
+        val held: Boolean
+    )
+
+    /** A whole season's standing, with the count already split by what the shelf can play. */
+    data class SeasonStanding(
+        val episodes: List<EpisodeStanding>,
+        val watched: Int,
+        val held: Int,
+        val missing: Int
+    )
+
+    /**
+     * How far through a season the viewer is, episode by episode.
+     *
+     * The player's own bookkeeping is the only source, which forces two rules. A position is a lie
+     * about the ending: [com.aeswox.arcplayer.playback.ResumeRules] drops it the moment a viewer
+     * reaches the tail, so an episode watched through has no resume entry at all and "no position"
+     * means both *never opened* and *finished*. The tie-breaker is [finishedMs] — a stamp the player
+     * writes only when it ran the play head to the end of the film and meant it, on the evidence
+     * [com.aeswox.arcplayer.playback.NextUp.isHonestEnding] demands. What it deliberately is not is an
+     * opening: the time a part was tapped outlives every way that tap can end without a picture in it,
+     * and a shelf that calls those watched will tell the viewer a part they never saw is one they have
+     * done with. The other rule is that a minute belongs to the part, not to the file that earned it, so
+     * the depth of an episode is the deepest position any of its copies holds, exactly as [progress]
+     * reads it.
+     *
+     * An episode with no copies is counted rather than skipped, because a season the channel only
+     * uploaded half of is the common case and "9 of 24 watched" would be read as a promise about the
+     * missing fifteen. So the watched count keeps its own denominator: only episodes this device can
+     * actually play, with [missing] held out separately to say what is absent.
+     *
+     * Two biases follow from the sources and both err toward understating progress. A part too little
+     * known to have a length, put down anywhere, is started rather than watched, because nothing proves
+     * its tail was reached. And an episode finished on the best copy, with a stale mid-file position left
+     * on a lesser copy of it, reads as started even though its finish is stamped — the position wins over
+     * the stamp, so the count loses one rather than claiming a finish the bar cannot show.
+     */
+    fun standing(
+        episodes: List<Pair<Int, List<Long>>>,
+        resumeMs: Map<Long, Long>,
+        lengthsMs: Map<Long, Long> = emptyMap(),
+        finishedMs: Map<Long, Long> = emptyMap()
+    ): SeasonStanding {
+        val rows = episodes.map { (number, copies) ->
+            val position = copies.maxOfOrNull { resumeMs[it] ?: 0L } ?: 0L
+            val length = copies.maxOfOrNull { lengthsMs[it] ?: 0L } ?: 0L
+            // A part too little known to have a length is unfinished on the strength of holding a
+            // position at all, exactly as [progress] reads it, but there is no bar to draw for it.
+            val started = position > 0L && (length <= 0L || position < length - FINISHED_SLACK_MS)
+            val watch = when {
+                copies.isEmpty() -> EpisodeWatch.UNWATCHED
+                started -> EpisodeWatch.STARTED
+                position > 0L || copies.any { (finishedMs[it] ?: 0L) > 0L } -> EpisodeWatch.WATCHED
+                else -> EpisodeWatch.UNWATCHED
+            }
+            val fraction = when {
+                watch == EpisodeWatch.WATCHED -> 1f
+                started && length > 0L -> (position.toFloat() / length.toFloat()).coerceIn(0f, 1f)
+                else -> 0f
+            }
+            EpisodeStanding(number, watch, fraction, copies.isNotEmpty())
+        }
+        val held = rows.count { it.held }
+        return SeasonStanding(
+            episodes = rows,
+            watched = rows.count { it.watch == EpisodeWatch.WATCHED },
+            held = held,
+            missing = rows.size - held
+        )
     }
 
     /** The run of parts ◀ ▶ walks, and where the file being watched sits inside it. */
@@ -540,7 +651,15 @@ object PlayOrder {
  */
 object AbsoluteSeasons {
 
-    /** The season number, or null when the run does not reach that far or the lengths are unknown. */
+    /**
+     * The season number, or null when the run does not reach that far or the lengths are unknown.
+     *
+     * Only the season is recovered here, never a count from that season's start — which is the tempting
+     * arithmetic and a wrong answer. A show is uploaded by its place in the run because the catalogue
+     * files it that way: One Piece's season 4 is thirty-nine episodes numbered 92 to 130, and asking a
+     * timing service for "season 4, episode 8" of it returns nothing at all, while the number the file
+     * name already carries is exactly what that service has on file.
+     */
     fun seasonFor(number: Int, seasons: List<SeasonCard>): Int? {
         if (number <= 0) return null
         var first = 1

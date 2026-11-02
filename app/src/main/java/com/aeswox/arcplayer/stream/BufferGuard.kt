@@ -1,5 +1,7 @@
 package com.aeswox.arcplayer.stream
 
+import com.aeswox.arcplayer.playback.NextUp
+
 /**
  * Tells a cloud video that has run out of bytes ahead of it apart from one the viewer stopped on
  * purpose, and says when the download has caught up enough to try the player again.
@@ -72,6 +74,75 @@ object BufferGuard {
      * the attempt cap and the wait would otherwise be silent forever.
      */
     const val LINK_GIVE_UP_MS = 90_000L
+
+    /**
+     * How long the player's own "I have run out of file" gets to be a window still filling before it is
+     * said out loud.
+     *
+     * A hole is more often bytes that have not arrived yet than bytes that never will, and the stall pump
+     * aims the window at the position the play head died on within a second of the stall. Six seconds is
+     * a few rounds of that: long enough for a link that is merely slow to clear the claim before the app
+     * makes it, short enough that nobody has to sit out the minute and a half the link's own give-up
+     * waits for before the screen admits the film is not coming.
+     */
+    const val STARVED_SPEECH_MS = 6_000L
+
+    /**
+     * How far past real time one report may carry the play head and still be a moment that was watched.
+     *
+     * Jitter belongs in here rather than in the rate: two reports a tenth of a second apart, which is
+     * what a decoder resync looks like, legitimately differ by more than a strict multiple allows.
+     */
+    const val TICK_JUMP_SLACK_MS = 2_000L
+
+    /**
+     * How far past the position a seek was aimed at one report may sit and still be that seek landing.
+     *
+     * libVLC comes back from a seek at the keyframe before its target, so the report that pays a seek's
+     * debt is at or short of where the head was sent. Anything meaningfully past the aim did not get
+     * there by being sent there — and a cloud file's empty space is precisely the thing that carries a
+     * head past an aim in a single report, which is how a re-open aimed at nine tenths of a part came
+     * back reporting its full length.
+     */
+    const val SEEK_LANDING_SLACK_MS = 2_000L
+
+    /**
+     * Whether a play-head report moved further than the film's own clock could have carried it.
+     *
+     * The head can only be believed as watched when it travelled to a position at about the speed of
+     * the film. A hole is read at however fast the demuxer can run through empty space, and a cloud
+     * file is stretched on disk to the length the shelf promised, so the far end of it is reached in a
+     * few milliseconds. Three things turn on that one fact: the resume point, which otherwise marks a
+     * part with most of it missing as finished; the next-up offer, which otherwise hands the viewer to
+     * the following episode; and this guard's own [isStalled], which reads a head parked at the length
+     * as a film that genuinely ended, and lets a black screen say nothing at all.
+     *
+     * [isLandingFromASeek] excuses a report because the viewer rather than the file is what moved the
+     * head there, and a first report is excused because there is no previous one to measure a jump
+     * against. Neither exemption is open-ended: a seek only excuses the position it was aimed at, which
+     * is [previousPositionMs] in that moment because the target is written onto the head before the
+     * player is handed it, so an exemption bought by a seek cannot also pay for a leap the seek never
+     * asked for.
+     *
+     * [leaptToMs] is where the last refused jump left the head, or [NEVER] when no jump is standing. A
+     * refused position has to stay refused until the head is seen somewhere else, because the file going
+     * quiet at the far end of a hole reports that same position again a second later — and measured
+     * against the report before it, a head parked on one spot travels nothing at all. Believed on the
+     * strength of that, the second report is the one that starts the end-band count, spends the dwell an
+     * honest ending asks for, and turns a missing tail into a finished part.
+     */
+    fun hasOutrunTheFilm(
+        positionMs: Long,
+        previousPositionMs: Long,
+        sinceTickMs: Long,
+        isLandingFromASeek: Boolean,
+        leaptToMs: Long = NEVER
+    ): Boolean {
+        if (leaptToMs != NEVER && positionMs == leaptToMs) return true
+        if (isLandingFromASeek) return positionMs - previousPositionMs > SEEK_LANDING_SLACK_MS
+        if (sinceTickMs <= 0L) return false
+        return positionMs - previousPositionMs > sinceTickMs * NextUp.MAX_END_TRAVEL_RATE + TICK_JUMP_SLACK_MS
+    }
 
     data class Snapshot(
         val nowMs: Long,
@@ -221,4 +292,17 @@ object BufferGuard {
      */
     fun isWaitingOnTheLink(nowMs: Long, stalledSinceMs: Long, settledAhead: Long): Boolean =
         settledAhead < RECOVER_AHEAD_BYTES && ageMs(nowMs, stalledSinceMs) >= LINK_GIVE_UP_MS
+
+    /**
+     * Whether the picture is quiet because the file it is reading has a hole in it.
+     *
+     * Two facts held together, one from the player and one from its play head: the player says it has run
+     * out of film, and the head has not travelled to the length to get there. This is the shape of the
+     * wait that the other two admissions cannot answer. A restart needs six megabytes to have landed in
+     * front of the head, so a file that stopped short of its own length with nothing arriving never spends
+     * an attempt; and the link give-up is ninety seconds of that. Meanwhile the player has already said
+     * something precise, and the screen can say it back.
+     */
+    fun isStarvedAtTheEnd(nowMs: Long, stalledSinceMs: Long, playHeadRanIntoAHole: Boolean): Boolean =
+        playHeadRanIntoAHole && ageMs(nowMs, stalledSinceMs) >= STARVED_SPEECH_MS
 }

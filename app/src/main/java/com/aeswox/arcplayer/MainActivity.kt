@@ -300,6 +300,7 @@ import com.aeswox.arcplayer.cloud.DownloadLedger
 import com.aeswox.arcplayer.cloud.DownloadNotifier
 import com.aeswox.arcplayer.cloud.DownloadNotices
 import com.aeswox.arcplayer.cloud.KeptMedia
+import com.aeswox.arcplayer.cloud.KeepLine
 import com.aeswox.arcplayer.cloud.CloudProgress
 import com.aeswox.arcplayer.cloud.SHELF_CHANNEL_TITLE
 import com.aeswox.arcplayer.cloud.formatCloudBytes
@@ -314,9 +315,11 @@ import com.aeswox.arcplayer.metadata.PosterCache
 import com.aeswox.arcplayer.metadata.PlayOrder
 import com.aeswox.arcplayer.metadata.ReleaseInfo
 import com.aeswox.arcplayer.metadata.ShelfSearch
+import com.aeswox.arcplayer.metadata.SkipTimingLibrary
 import com.aeswox.arcplayer.metadata.TmdbDetails
 import com.aeswox.arcplayer.metadata.TmdbSearch
 import com.aeswox.arcplayer.metadata.TmdbSearchResult
+import com.aeswox.arcplayer.metadata.TimingRequest
 import com.aeswox.arcplayer.metadata.episodeLabel
 import com.aeswox.arcplayer.metadata.TitleCandidate
 import com.aeswox.arcplayer.metadata.TitleDetail
@@ -325,12 +328,19 @@ import com.aeswox.arcplayer.metadata.TitleGroups
 import com.aeswox.arcplayer.metadata.TitleKind
 import com.aeswox.arcplayer.metadata.formatRuntime
 import com.aeswox.arcplayer.metadata.nullIfBlank
+import com.aeswox.arcplayer.metadata.toJson
+import com.aeswox.arcplayer.metadata.timingRequestFor
+import com.aeswox.arcplayer.metadata.toTimingAnswer
 import com.aeswox.arcplayer.metadata.titleDetailKey
 import com.aeswox.arcplayer.playback.FrameRateMatch
 import com.aeswox.arcplayer.playback.NextUp
 import com.aeswox.arcplayer.playback.ResumeOutcome
 import com.aeswox.arcplayer.playback.ResumeRules
 import com.aeswox.arcplayer.playback.SeekHold
+import com.aeswox.arcplayer.playback.SkipIntro
+import com.aeswox.arcplayer.playback.StoryIsOver
+import com.aeswox.arcplayer.playback.TimingAnswer
+import com.aeswox.arcplayer.playback.TimingTrust
 import com.aeswox.arcplayer.playback.TrackChoice
 import com.aeswox.arcplayer.stream.ByteRate
 import com.aeswox.arcplayer.stream.BufferGuard
@@ -553,6 +563,20 @@ class ArcPreferencesStore(context: Context) {
      */
     val seasonEpisodes = mutableStateMapOf<String, List<EpisodeDetail>>()
 
+    /**
+     * Where each part's opening and credits are filed, keyed by the part rather than by a cloud file id.
+     *
+     * A copy of one episode is the same work however it was ripped, and a mark belongs to the work. The
+     * claim is kept rather than the verdict on it, because whether a mark can be believed depends on the
+     * length of the file on screen and two copies do not always agree about that — so
+     * [com.aeswox.arcplayer.playback.TimingTrust] runs where the mark is used, against the length the
+     * player reported.
+     *
+     * Observed, because the question is asked when a part starts playing and an answer that arrives half a
+     * minute later is still in time for the opening it describes.
+     */
+    val episodeTimings = mutableStateMapOf<String, TimingAnswer>()
+
     fun episodesOf(showId: Int?, season: Int): List<EpisodeDetail>? =
         showId?.let { seasonEpisodes[titleDetailKey(it, true) + "/$season"] }
 
@@ -641,6 +665,19 @@ class ArcPreferencesStore(context: Context) {
     val watchedAt = mutableStateMapOf<Long, Long>()
 
     /**
+     * Which files this player ran to their own end, and when.
+     *
+     * The verdict a season's progress is drawn from, and deliberately not the same fact as
+     * [watchedAt]. An open stamp is written the moment a part is tapped, so it survives every way that
+     * tap can end without a picture — a link that never sends the bytes, a container this phone will not
+     * take, an episode the viewer sat on for two seconds — and a shelf that reads those as watched tells
+     * the viewer a part they never saw is one they have done with. This is written once per film, by the
+     * player, on the evidence [NextUp.isHonestEnding] asks for: a frame on screen and a play head that
+     * travelled the last seconds rather than leaping over a hole.
+     */
+    val finishedAt = mutableStateMapOf<Long, Long>()
+
+    /**
      * How long each file runs, keyed by the id it was played under, as the player reported it.
      *
      * A file forwarded into the shelf as a document carries no duration in Telegram's schema — which is
@@ -694,6 +731,14 @@ class ArcPreferencesStore(context: Context) {
                     resumePositions[id] = pos
                 }
             }
+
+            val finishedJson = JSONObject(prefs.getString("film_finished_at", "{}") ?: "{}")
+            finishedJson.keys().forEach { key ->
+                val id = key.toLongOrNull()
+                val at = finishedJson.optLong(key, 0L)
+                if (id != null && at > 0L) finishedAt[id] = at
+            }
+            adoptOldFinishes()
 
             val lengthJson = JSONObject(prefs.getString("known_lengths", "{}") ?: "{}")
             lengthJson.keys().forEach { key ->
@@ -755,6 +800,12 @@ class ArcPreferencesStore(context: Context) {
                 val obj = detailJson.optJSONObject(key) ?: return@forEach
                 TitleDetail.fromJson(obj)?.let { titleDetails[key] = it }
             }
+
+            val timingJson = JSONObject(prefs.getString("episode_timings", "{}") ?: "{}")
+            timingJson.keys().forEach { key ->
+                val obj = timingJson.optJSONObject(key) ?: return@forEach
+                obj.toTimingAnswer()?.let { episodeTimings[key] = it }
+            }
         }
     }
 
@@ -813,6 +864,32 @@ class ArcPreferencesStore(context: Context) {
     }
 
     /**
+     * What a timing service claims about one part, or null when it has never been asked.
+     *
+     * The claim and not the verdict, because the length a mark has to be believed against is the one the
+     * player reports for the file it opened — which a season pass has no way of knowing, and which is not
+     * always the same between two copies of one episode.
+     */
+    fun timingFor(request: TimingRequest?): TimingAnswer? = request?.let { episodeTimings[it.key] }
+
+    /**
+     * Remembers what a timing service claimed about one part.
+     *
+     * Written straight through, including an answer with nothing in it, because a part nobody has marked
+     * is a real answer and the next watch of it should not spend a request finding that out again.
+     */
+    fun rememberEpisodeTiming(request: TimingRequest, answer: TimingAnswer) {
+        episodeTimings[request.key] = answer
+        persistEpisodeTimings()
+    }
+
+    private fun persistEpisodeTimings() {
+        val obj = JSONObject()
+        episodeTimings.forEach { (key, answer) -> obj.put(key, answer.toJson()) }
+        prefs.edit().putString("episode_timings", obj.toString()).apply()
+    }
+
+    /**
      * Remembers which Telegram chat the library lives in.
      *
      * Written once, when the shelf is made. Read as a hint and never a fact: a chat id belongs to the
@@ -851,6 +928,71 @@ class ArcPreferencesStore(context: Context) {
         val obj = JSONObject()
         watchedAt.forEach { (id, at) -> obj.put(id.toString(), at) }
         prefs.edit().putString("cloud_watched_at", obj.toString()).apply()
+    }
+
+    /**
+     * Say that this player ran the given file to its own end.
+     *
+     * Called from the one moment that is known — the player's end report, believed only once a frame has
+     * been painted and the play head has travelled the last seconds rather than leapt over a hole — and
+     * written there rather than inferred later, because inference is what this replaced: the shelf used to
+     * call a part watched on the strength of a tap, so every episode the link refused arrived in the season
+     * count as one the viewer had finished.
+     */
+    fun rememberFinishedAt(videoId: Long) {
+        if ((finishedAt[videoId] ?: 0L) > 0L) return
+        finishedAt[videoId] = System.currentTimeMillis()
+        persistFinishedAt()
+    }
+
+    /**
+     * Say that this part was watched through because the viewer left it from inside its credits.
+     *
+     * The stamp on its own would be walked over. [PlayOrder.standing] reads a resume position as a part
+     * still underway and lets it outrank the tick, and [PlayOrder.progress] keeps offering one to Continue
+     * Watching — and unlike a film that ran out, where the tail deletes the position by itself, a viewer
+     * who closes during a roll is a minute or two short of that tail. So the position is taken out by hand
+     * beside the stamp, which is the only shape a finish has ever had on this device.
+     */
+    fun rememberWatchedThroughTheCredits(videoId: Long) {
+        rememberFinishedAt(videoId)
+        if (resumePositions.remove(videoId) != null) persistResumePositions()
+    }
+
+    /**
+     * Freeze what this device used to believe about finishes, once.
+     *
+     * Every season watched before the stamp existed leaves the same trace the old rule read: an open
+     * beside no resume position, because the tail deletes the position. Turning that rule off would put
+     * those episodes back to unwatched, which is a second lie replacing the first, so the old verdicts are
+     * copied forward and then never consulted again.
+     *
+     * It carries the stale ones across too. A part that was opened and never delivered looked identical
+     * from the outside, and nothing written since can tell the two apart — so the four episodes a broken
+     * chain walked through stay ticked until the viewer watches them properly, and only failures from this
+     * build onward are the honest no the screen has been saying.
+     */
+    private fun adoptOldFinishes() {
+        if (prefs.getBoolean("finished_stamps_adopted", false)) return
+        watchedAt.forEach { (id, at) ->
+            if ((resumePositions[id] ?: 0L) == 0L) finishedAt[id] = at
+        }
+        // One edit, because a flag written before the stamps would lose the adoption if the process died in
+        // between, and one written after would re-run it and put back anything cleared in the gap.
+        prefs.edit()
+            .putString("film_finished_at", finishedJson())
+            .putBoolean("finished_stamps_adopted", true)
+            .apply()
+    }
+
+    private fun finishedJson(): String {
+        val obj = JSONObject()
+        finishedAt.forEach { (id, at) -> obj.put(id.toString(), at) }
+        return obj.toString()
+    }
+
+    private fun persistFinishedAt() {
+        prefs.edit().putString("film_finished_at", finishedJson()).apply()
     }
 
     fun updateSortOrder(order: VideoSortOrder) {
@@ -1047,9 +1189,11 @@ class ArcPreferencesStore(context: Context) {
     fun clearWatchHistory() {
         watchHistoryIds = emptyList()
         resumePositions.clear()
+        finishedAt.clear()
         prefs.edit()
             .remove("watch_history")
             .remove("resume_positions")
+            .remove("film_finished_at")
             .apply()
     }
 }
@@ -1845,6 +1989,34 @@ class ArcVlcPlayerEngine(
      */
     private var lastPlayedPositionMs = 0L
 
+    /**
+     * Where the last report the app refused left the play head, or [BufferGuard.NEVER] when nothing is
+     * standing refused.
+     *
+     * A refusal has to outlive the one report it was about. The head sits at the far end of a hole and
+     * says the same position again a second later, and a second report measured against the first
+     * travels nothing at all — which is precisely the evidence an honest ending is asking for. Carrying
+     * the refused position forward is what stops a hole from buying itself a dwell, and the app aiming
+     * the head somewhere is what retires it: a seek that then reports where it was sent is the player
+     * answering, not the file running out.
+     */
+    private var rejectedLeapToMs = BufferGuard.NEVER
+
+    /**
+     * How many reports in a row have landed inside the last seconds of the file now loaded.
+     *
+     * The count is the travel an end report cannot show on its own, and a report outside the band
+     * restarts it from nothing: the question is whether this play head crossed those last seconds, and
+     * one that sat there earlier in the film and then rewound has crossed nothing.
+     */
+    private var nearEndTickCount = 0
+
+    /** When the current run of reports inside the band began, or [BufferGuard.NEVER] before there is one. */
+    private var nearEndFirstAtMs = BufferGuard.NEVER
+
+    /** Where the play head stood when that run began, which is what its own length is measured from. */
+    private var nearEndFirstPositionMs = 0L
+
     var isPlaying by mutableStateOf(false)
         private set
 
@@ -1932,13 +2104,44 @@ class ArcVlcPlayerEngine(
     /**
      * The player's own claim that it ran out of file, which is not the same as the file having ended.
      *
-     * A hole in a cloud file reads exactly the same way, so this is only a signal to go and look:
-     * [resumablePositionMs] is what says whether the viewer genuinely got to the end. Anything that
-     * moves the play head again clears it, which is why a rewind or a stall recovery needs no separate
+     * A hole in a cloud file reads exactly the same way, so the claim is only believed once the reports
+     * behind it say the play head travelled to the end rather than arriving there in one leap — see
+     * [NextUp.isHonestEnding], and [endWasAHole] for the answer when it does not. Anything that moves
+     * the play head again clears this, which is why a rewind or a stall recovery needs no separate
      * bookkeeping to make a "next up" offer go away.
      */
     var isAtEnd by mutableStateOf(false)
         private set
+
+    /**
+     * The player said it ran out of file and the play head had not travelled to the end to get there.
+     *
+     * Deliberately not [isAtEnd]: this part is not over, it is missing, and the difference decides
+     * whether the app hands the viewer over to the next episode or keeps asking Telegram for the bytes
+     * of this one. The stall watchdog is usually the one that fixes it — this is the name for the
+     * moment it cannot, and the reason the screen can say so instead of staying black.
+     */
+    var endWasAHole by mutableStateOf(false)
+        private set
+
+    /**
+     * Whether the file being read is whole on this device rather than the part of it that has arrived.
+     *
+     * Only a streamed cloud copy can have a hole in it, so only one has to prove that its ending took
+     * real time. A film the viewer kept, or one that was always on this phone, is what it says it is.
+     */
+    var isWholeFileOnDisk by mutableStateOf(false)
+        private set
+
+    /** What the end report was standing on, as the rule that judges it wants it. */
+    private fun endingFact(): NextUp.Ending = NextUp.Ending(
+        painted = hasPaintedForLoadedVideo,
+        nearEndTickCount = nearEndTickCount,
+        dwellMs = if (nearEndFirstAtMs == BufferGuard.NEVER) 0L
+            else SystemClock.elapsedRealtime() - nearEndFirstAtMs,
+        travelledMs = (currentPositionMs - nearEndFirstPositionMs).coerceAtLeast(0L),
+        isWholeFileOnDisk = isWholeFileOnDisk
+    )
 
     /**
      * Put the scrubber back on the frame that is actually on screen.
@@ -2012,6 +2215,40 @@ class ArcVlcPlayerEngine(
     private var currentVideo: VideoItem? = null
 
     /**
+     * Whether the play head this engine reports belongs to [id].
+     *
+     * [loadAndPlay] is what makes the two agree, and the screen runs ahead of it: a cloud part is named
+     * by a tap and only fetched afterwards. So until this answers true the position on this engine is
+     * the last one reached in the file that was on screen before — which is how an episode's own credits
+     * can be read as already passed by the second the viewer arrives on it.
+     */
+    fun isHolding(id: Long): Boolean = loadedVideoId == id
+
+    /**
+     * Whether the seconds this engine reports were actually spent inside [id].
+     *
+     * Stronger than [isHolding], and the gap between them is a handover: the next part is named, this
+     * engine is aimed at the position the last one stopped on, and only then are its bytes asked for — so
+     * a part that has never painted a frame can be holding the head while reporting the credits the part
+     * before it reached. A verdict must not read that as its own, since a wrong one retires an episode
+     * nobody watched. A resume point is trusted anyway, because the next open reads it as an aim rather
+     * than a fact — but that is the weaker excuse, not a harmless one: measured on the emulator, a whole
+     * handover's minutes filed under the incoming part made its next open seek past its first two minutes.
+     */
+    fun headBelongsTo(id: Long): Boolean = isHolding(id) && hasPaintedForLoadedVideo
+
+    /**
+     * The part this engine's play head belongs to, or null before it has been handed a file.
+     *
+     * [isHolding] asks whether an id owns the head; this names the owner. The end report needs the second
+     * shape, because a handover moves the name ahead of the bytes: the screen is already calling the next
+     * episode its own while the player is still running out on the one it was watching, and a finish filed
+     * against the name rather than the owner retires an episode nobody reached the end of.
+     */
+    val headOwnerVideoId: Long?
+        get() = loadedVideoId
+
+    /**
      * The caption forwarded into the channel for whatever is playing, once Telegram has delivered it.
      *
      * Held here rather than passed once at the screen, because a stall re-opens the media on the
@@ -2065,8 +2302,19 @@ class ArcVlcPlayerEngine(
 
                 MediaPlayer.Event.EndReached -> {
                     isPlaying = false
-                    currentPositionMs = durationMs
-                    isAtEnd = true
+                    // Believed only when the play head actually got there. A streamed cloud file is
+                    // stretched on disk to the length the shelf promised, so its missing middle is read
+                    // as the last frame of the media and the head arrives at the end in the same breath
+                    // it left the last real picture — and on the strength of that report alone this app
+                    // once walked a viewer through four episodes in under half a minute, the bar slammed
+                    // to the end of each. The stall watchdog is what a hole needs instead, and a head
+                    // parked at the length is exactly the reading that hides it from that watchdog.
+                    if (NextUp.isHonestEnding(endingFact())) {
+                        currentPositionMs = durationMs
+                        isAtEnd = true
+                    } else {
+                        endWasAHole = true
+                    }
                 }
 
                 MediaPlayer.Event.Vout -> {
@@ -2101,7 +2349,14 @@ class ArcVlcPlayerEngine(
         }
     }
 
-    fun loadAndPlay(video: VideoItem, startPositionMs: Long = 0L) {
+    /**
+     * Hand the player a file and start it moving.
+     *
+     * [wholeFileOnDisk] defaults to whatever this player already believes, because two of the three
+     * ways in are re-opens of the same file — a stall recovery and a subtitle-style restart — and a
+     * re-open of a streamed copy has not made it any more whole than the open was.
+     */
+    fun loadAndPlay(video: VideoItem, startPositionMs: Long = 0L, wholeFileOnDisk: Boolean = isWholeFileOnDisk) {
         currentVideo = video
         isFirstFrameRendered = false
         bufferedSeek?.cancel()
@@ -2115,6 +2370,17 @@ class ArcVlcPlayerEngine(
         playOwedSinceMs = BufferGuard.NEVER
         currentPositionMs = startPositionMs.coerceAtLeast(0L)
         lastPlayedPositionMs = currentPositionMs
+        isWholeFileOnDisk = wholeFileOnDisk
+        // Both of these are a claim about the file that is only being replaced, and the band counters
+        // are the evidence behind the second one: a re-open has not travelled anywhere yet.
+        isAtEnd = false
+        endWasAHole = false
+        nearEndTickCount = 0
+        nearEndFirstAtMs = BufferGuard.NEVER
+        nearEndFirstPositionMs = 0L
+        // A re-open aims the head itself, so the position the last open refused is no longer evidence
+        // against this one: whether this open travels or leaps is decided from here.
+        rejectedLeapToMs = BufferGuard.NEVER
         durationMs = video.durationMs.coerceAtLeast(1L)
         pendingResumeSeekMs = startPositionMs.coerceAtLeast(0L)
         if (video.id != loadedVideoId) {
@@ -2262,8 +2528,13 @@ class ArcVlcPlayerEngine(
 
     fun seekTo(targetMs: Long) {
         // A play head sent somewhere new is no longer at the end, and saying so here is what lets a
-        // rewind during the next-up countdown take the card back off.
+        // rewind during the next-up countdown take the card back off. The same gesture answers a hole
+        // report as well: the viewer moving the head is the app being told to go look for bytes again.
         isAtEnd = false
+        endWasAHole = false
+        // The head is about to be somewhere the app sent it, which is the one position a refused leap
+        // must not be held against: this seek's landing report is exactly the arrival being aimed for.
+        rejectedLeapToMs = BufferGuard.NEVER
         // A file sent as a document has no length until the container opens, and clamping a resume
         // seek against the placeholder would drop it at the very start.
         val clamped = if (durationMs > 1L) targetMs.coerceIn(0L, durationMs) else targetMs.coerceAtLeast(0L)
@@ -2323,6 +2594,9 @@ class ArcVlcPlayerEngine(
      * seek started; moving nothing for it is what keeps the scrubber on the target it was sent to.
      */
     private fun onTimeChanged(timeMs: Long) {
+        // Read before anything below pays it off: the report that lands a seek is the one the debt is
+        // there to excuse.
+        val landingFromASeek = isCatchingUpToItsPosition
         seekHold?.let { hold ->
             val now = SystemClock.elapsedRealtime()
             // The tick that lands a seek does not retire the hold: libVLC still has reports from the
@@ -2342,8 +2616,45 @@ class ArcVlcPlayerEngine(
         // or a stall recovery that finds bytes after a hole all report ticks well short of the
         // length, and each one is the ending not having been an ending.
         if (isAtEnd && timeMs < durationMs - NextUp.HONEST_END_TOLERANCE_MS) isAtEnd = false
+        // The same relief for a hole that was read as an end: the head moving somewhere new is the
+        // player being alive again, which is the one thing that claim was missing.
+        if (endWasAHole && timeMs != currentPositionMs) endWasAHole = false
+        // A report only earns the resume point when the head travelled to it at about the speed of the
+        // film. Empty space inside a stretched cloud file is read many times faster than that, and a
+        // tick from the far side of it would otherwise be filed as the moment the viewer got to — the
+        // part marked finished, the bar told to sit at its end, and the watchdog handed a head at the
+        // length, which is the one reading that lets a starving file say nothing at all. Measured
+        // against the report before this one rather than the resume point, so a seek the viewer made
+        // themselves — which writes its target first — is never mistaken for the file running out.
+        val sinceTickMs = if (lastTickAtMs == BufferGuard.NEVER) 0L
+            else SystemClock.elapsedRealtime() - lastTickAtMs
+        val watchedThisReport = isWholeFileOnDisk ||
+            !BufferGuard.hasOutrunTheFilm(
+                timeMs,
+                currentPositionMs,
+                sinceTickMs,
+                landingFromASeek,
+                rejectedLeapToMs
+            )
+        // A refusal is only cleared by the head being seen somewhere that is not the position it refused,
+        // so a hole parked at the length stays refused however long it keeps reporting it.
+        rejectedLeapToMs = if (watchedThisReport) BufferGuard.NEVER else timeMs
+        if (watchedThisReport) {
+            lastPlayedPositionMs = timeMs
+            // And the same report is the only kind that counts as crossing the last seconds: a leap
+            // into the end band says where the file ran out, not that the play head travelled there.
+            if (NextUp.isInsideEndBand(timeMs, durationMs)) {
+                if (nearEndTickCount == 0) {
+                    nearEndFirstAtMs = SystemClock.elapsedRealtime()
+                    nearEndFirstPositionMs = timeMs
+                }
+                nearEndTickCount++
+            } else {
+                nearEndTickCount = 0
+                nearEndFirstAtMs = BufferGuard.NEVER
+            }
+        }
         currentPositionMs = timeMs
-        lastPlayedPositionMs = timeMs
         lastTickAtMs = SystemClock.elapsedRealtime()
         notifyStreamPosition(timeMs)
     }
@@ -2534,6 +2845,40 @@ class ArcVlcPlayerEngine(
         val target = FrameRateMatch.targetRefreshHz(fps, current, modes) ?: return
         android.util.Log.i("ArcFrameRate", "$fps fps content against $current Hz, modes $modes -> $target Hz")
         runCatching { view.setRequestedFrameRate(target) }
+    }
+
+    /**
+     * Put down the film this engine is reading, before the next one has anything to show.
+     *
+     * Until now the only thing that stopped a part was [loadAndPlay], which cannot run until Telegram has
+     * named the next file's path — so a step onto a cold copy left the viewer still watching the one they
+     * just walked away from, under the incoming episode's name, with no buffering screen over it because
+     * the player still believed it had painted. Stopping here is also what makes the delayed release of
+     * that film's bytes safe: [forgetCopy] lands while nothing has the file open rather than mid-read.
+     *
+     * [stoppedOnPurpose] is the flag that says this quiet was asked for, which is what keeps the stall
+     * watchdog from re-opening the outgoing film as a stalled one and the Next-up countdown from treating
+     * its end report as an ending the viewer is still in. [isPlaying] goes with it because a transport row
+     * the viewer reveals during the wait reads "press to pause" over a player that has nothing running,
+     * and the progress stamper only writes while it believes itself to be playing. [currentPositionMs]
+     * goes with it because the scrubber is the one control that would otherwise still be standing on the
+     * walked-away part's play head under the incoming episode's label; the position that film really
+     * reached lives in [resumablePositionMs], which this does not touch.
+     */
+    fun standDown() {
+        stoppedOnPurpose = true
+        pausedForSeek = false
+        isPlaying = false
+        isBuffering = false
+        isSeekWaiting = false
+        bufferedSeek?.cancel()
+        seekHold = null
+        pendingResumeSeekMs = 0L
+        isFirstFrameRendered = false
+        currentPositionMs = 0L
+        runCatching {
+            mediaPlayer.stop()
+        }
     }
 
     fun pause() {
@@ -2827,6 +3172,9 @@ fun ArcPlayerHomeScreen() {
      * rather than blocking a frame to be certain.
      */
     val cloudDownloads by cloudRepository.downloads.collectAsState()
+    // Which keep has the link and which are standing behind it. The ledger says what was asked; only the
+    // line can say what is arriving, and a season pressed all at once needs both words on screen.
+    val keepLine by cloudRepository.keepLine.collectAsState()
 
     /** The last cloud film handed to the player, so putting it down is something we can notice. */
     var lastCloudPlayback by remember { mutableStateOf<CloudVideoItem?>(null) }
@@ -2850,10 +3198,16 @@ fun ArcPlayerHomeScreen() {
      * not landed yet is called back the moment that same film is in front of the viewer again — it was
      * never put down — while a release for a *different* film is left to run, which is what stepping
      * straight from one title to the next has to do.
+     *
+     * The fetch goes first, without the wait. Nothing that follows is reading this film, and a transfer
+     * left running at picture priority is served before the one the next part is waiting on — see
+     * [CloudRepository.breakOffFetch]. Stopping it costs nothing the deletion would not have cost anyway,
+     * because the bytes that already landed stay where they are.
      */
     fun forgetCloudCopySoon(watched: CloudVideoItem) {
         cloudReleases[watched.fileId]?.cancel()
         cloudReleases[watched.fileId] = coroutineScope.launch {
+            cloudRepository.breakOffFetch(watched)
             delay(PLAYER_RELEASE_SETTLE_MS)
             cloudRepository.forgetCopy(watched)
             cloudReleases.remove(watched.fileId)
@@ -3548,6 +3902,7 @@ fun ArcPlayerHomeScreen() {
                                     DownloadsContent(
                                         shelf = shelfState.value,
                                         downloads = cloudDownloads,
+                                        keepLine = keepLine,
                                         progress = cloudRepository.progress,
                                         prefsStore = prefsStore,
                                         gridState = downloadsGridState,
@@ -3687,6 +4042,7 @@ fun ArcPlayerHomeScreen() {
                                 statusText = cloudStatus,
                                 isResolving = cloudResolving,
                                 downloads = cloudDownloads,
+                                keepLine = keepLine,
                                 downloadProgress = cloudRepository.progress,
                                 topInset = statusBarTopPadding,
                                 bottomInset = navBarBottomPadding,
@@ -3734,6 +4090,12 @@ fun ArcPlayerHomeScreen() {
                                     ?: nextVideo
                             )
                             morphingVideoKey = "${currentPlayback.sharedKeyPrefix}_${nextVideo.id}"
+                            // A step is an opening, and an opening is what the recency stamp counts, so
+                            // the part the viewer just walked onto has to earn one: Resume and the
+                            // Continue Watching row name the part with the newest stamp, and without this
+                            // a three-episode sitting stepped through in the player kept sending them
+                            // back to the first one, which is the only part they ever tapped.
+                            prefsStore.rememberWatchedAt(nextVideo.id)
                             // A step is a fresh question, so the refusals that answered the last one are
                             // dropped with it: the next part gets its own try at its own copies.
                             activePlayback = currentPlayback.copy(
@@ -5120,6 +5482,7 @@ private const val INFO_HERO_FEATHER_DP = 64
 private fun DownloadCircle(
     file: CloudVideoItem,
     entry: DownloadEntry?,
+    keepLine: List<Long>,
     progress: StateFlow<Map<Int, CloudProgress>>,
     onDownload: (CloudVideoItem) -> Unit,
     onCancel: (CloudVideoItem) -> Unit,
@@ -5127,10 +5490,12 @@ private fun DownloadCircle(
 ) {
     val saved = entry?.isComplete == true
     val arriving = entry != null && !saved
+    val queued = arriving && KeepLine.place(keepLine, entry!!.stableId) == KeepLine.Place.QUEUED
     DownloadCircleTarget(
         size = 56.dp,
         saved = saved,
-        arriving = arriving,
+        arriving = arriving && !queued,
+        queued = queued,
         // The id the fetch was started under, which is the one the pump publishes against. The shelf's own
         // id is the fallback: an entry and its file are the same copy, and a re-listed document can name
         // the pair differently than the row that asked for it.
@@ -5147,6 +5512,12 @@ private fun DownloadCircle(
  * The size is a parameter rather than a second control because the same promise is drawn in more than one
  * place — the info page's action row at 56 dp and a Downloads row at 38 — and a film's download state that
  * looks different depending on where you happened to look it up reads as three different states.
+ *
+ * `queued` is the disc's fourth reading, and it exists because one film is kept at a time: a season pressed
+ * whole has five episodes that are promised but not moving, and a ring that promises bytes for all six would
+ * be lying. It borrows the hollow circle the episode rows use for the same fact, so the wait reads the same
+ * from wherever it is looked at, and it stays pressable — standing a film down is still something a viewer
+ * may want to undo.
  */
 @Composable
 private fun DownloadCircleTarget(
@@ -5156,7 +5527,8 @@ private fun DownloadCircleTarget(
     progressKey: Int,
     progress: StateFlow<Map<Int, CloudProgress>>,
     onClick: () -> Unit,
-    onRemove: () -> Unit
+    onRemove: () -> Unit,
+    queued: Boolean = false
 ) {
     val published by progress.collectAsState()
     val fraction = published[progressKey]?.fraction ?: 0f
@@ -5194,7 +5566,7 @@ private fun DownloadCircleTarget(
                 modifier = Modifier
                     .size(size)
                     .then(
-                        if (arriving) {
+                        if (arriving || queued) {
                             Modifier.drawBehind {
                                 val ring = stroke.toPx()
                                 val radius = this.size.minDimension / 2f - ring
@@ -5203,27 +5575,42 @@ private fun DownloadCircleTarget(
                                     (this.size.width - ringSize.width) / 2f,
                                     (this.size.height - ringSize.height) / 2f
                                 )
-                                // The track is drawn whole under the part that has landed, so a fetch that
-                                // has not reported a single byte yet still reads as working.
-                                drawArc(
-                                    color = OneUiTextPrimary.copy(alpha = 0.16f),
-                                    startAngle = 0f,
-                                    sweepAngle = 360f,
-                                    useCenter = false,
-                                    topLeft = ringTopLeft,
-                                    size = ringSize,
-                                    style = Stroke(width = ring)
-                                )
-                                if (fraction > 0f) {
+                                if (queued) {
+                                    // A closed circle at full strength rather than the faint track the
+                                    // moving film draws under its bytes: nothing is coming, so there is
+                                    // no part of the ring to fill in.
                                     drawArc(
-                                        color = OneUiTextPrimary,
-                                        startAngle = -90f,
-                                        sweepAngle = 360f * fraction,
+                                        color = OneUiTextSecondary.copy(alpha = 0.7f),
+                                        startAngle = 0f,
+                                        sweepAngle = 360f,
                                         useCenter = false,
                                         topLeft = ringTopLeft,
                                         size = ringSize,
-                                        style = Stroke(width = ring, cap = StrokeCap.Round)
+                                        style = Stroke(width = ring)
                                     )
+                                } else {
+                                    // The track is drawn whole under the part that has landed, so a fetch that
+                                    // has not reported a single byte yet still reads as working.
+                                    drawArc(
+                                        color = OneUiTextPrimary.copy(alpha = 0.16f),
+                                        startAngle = 0f,
+                                        sweepAngle = 360f,
+                                        useCenter = false,
+                                        topLeft = ringTopLeft,
+                                        size = ringSize,
+                                        style = Stroke(width = ring)
+                                    )
+                                    if (fraction > 0f) {
+                                        drawArc(
+                                            color = OneUiTextPrimary,
+                                            startAngle = -90f,
+                                            sweepAngle = 360f * fraction,
+                                            useCenter = false,
+                                            topLeft = ringTopLeft,
+                                            size = ringSize,
+                                            style = Stroke(width = ring, cap = StrokeCap.Round)
+                                        )
+                                    }
                                 }
                             }
                         } else {
@@ -5233,7 +5620,7 @@ private fun DownloadCircleTarget(
                     .jellyClick(
                         interactionSource = null,
                         indication = null,
-                        onClickLabel = if (arriving) "Cancel download" else null
+                        onClickLabel = if (arriving || queued) "Cancel download" else null
                     ) {
                         AppHaptics.click()
                         onClick()
@@ -5242,7 +5629,11 @@ private fun DownloadCircleTarget(
             ) {
                 Icon(
                     imageVector = HugeIcons.Download,
-                    contentDescription = if (arriving) "Downloading, tap to cancel" else "Keep offline",
+                    contentDescription = when {
+                        queued -> "Queued, tap to cancel"
+                        arriving -> "Downloading, tap to cancel"
+                        else -> "Keep offline"
+                    },
                     tint = OneUiTextPrimary,
                     // The glyph the disc's other two readings get: the tick this becomes and the overflow
                     // circle beside it. A download that lands would otherwise be seen to shrink, and a
@@ -5273,6 +5664,7 @@ private fun CloudTitleInfoPage(
     statusText: String?,
     isResolving: Boolean,
     downloads: Map<Long, DownloadEntry>,
+    keepLine: List<Long> = emptyList(),
     downloadProgress: StateFlow<Map<Int, CloudProgress>>,
     topInset: Dp,
     bottomInset: Dp,
@@ -5335,6 +5727,11 @@ private fun CloudTitleInfoPage(
     // Twenty minutes spent on one copy are twenty minutes into the part, so every copy of it shows and
     // opens at the same place. The player only ever reads the file it was handed.
     val resumeByCopy = PlayOrder.positionByCopy(title.copySlots, resumeByPart)
+    // Which copies the player ran to their own end, kept per file rather than per part. Read here rather
+    // than inside the episode list because an episode watched through leaves no resume position: the tail
+    // erases it, so this stamp is all that separates "finished" from "never clicked". It is deliberately
+    // not the open stamp — a part the link refused was still opened.
+    val finishedByCopy = prefsStore.finishedAt
     // The copies this device has been made to hold on to, byte for byte. One read of the ledger for the
     // whole page: it decides which copy Play opens, which rows say "Offline", and which circle wears a
     // tick instead of an arrow.
@@ -5423,6 +5820,30 @@ private fun CloudTitleInfoPage(
     // Only a show has seasons to ask for. Handed a film's id, the season endpoint answers 404, and the
     // answer would be thrown away anyway — the episode list below renders for a series alone.
     val cataloguedEpisodes = SeasonEpisodeFetch(shown.providerId.takeIf { shown.isSeries }, season, prefsStore)
+
+    /**
+     * Ask where this season's openings and credit rolls are, while the viewer is still choosing an episode.
+     *
+     * Asked beside the episode list because that is the moment the app knows which parts the shelf really
+     * holds, and only those are worth a request: a catalogue files more episodes than a chat does, and
+     * asking for a part nobody uploaded is a request about nothing. The season on screen rather than the
+     * whole show because a pass is one request per part and neither timing service has a route that takes
+     * more than one at a time.
+     *
+     * The season is already settled by the time these rows are drawn — [filesBySeason] placed the
+     * run-numbered files into it once the catalogue's lengths arrived — so the numbers here are asked as
+     * they are filed, which is how the rows wear them too.
+     */
+    LaunchedEffect(shown.providerId, season, filesBySeason) {
+        val providerId = shown.providerId?.takeIf { shown.isSeries } ?: return@LaunchedEffect
+        val requests = filesBySeason[season].orEmpty().keys.sorted()
+            .map { episode -> TimingRequest(providerId, season, episode) }
+            .filter { prefsStore.timingFor(it) == null }
+        if (requests.isEmpty()) return@LaunchedEffect
+        SkipTimingLibrary.ask(requests) { request, answer ->
+            prefsStore.rememberEpisodeTiming(request, answer)
+        }
+    }
 
     // The episode a copies sheet was opened for. It holds the row's own files rather than a number to
     // look up, because switching season behind the sheet would change what that number means.
@@ -5597,13 +6018,22 @@ private fun CloudTitleInfoPage(
                                     seriesVideos.filter { downloads[it.stableId]?.isComplete == false }
                                 }
                                 val anySeriesArriving = activeSeriesDownloads.isNotEmpty()
+                                // One film moves at a time, so the ring above the season only promises bytes
+                                // while one of them is actually coming. A season pressed whole has the rest
+                                // standing behind it, and that is the hollow ring rather than an empty one.
+                                val runningSeries = activeSeriesDownloads.firstOrNull {
+                                    KeepLine.place(keepLine, it.stableId) == KeepLine.Place.RUNNING
+                                }
+                                val allSeriesQueued = anySeriesArriving && runningSeries == null
                                 val allSeriesCompleted = seriesVideos.isNotEmpty() && seriesVideos.all { downloads[it.stableId]?.isComplete == true }
-                                val seriesProgressKey = activeSeriesDownloads.firstOrNull()?.let { downloads[it.stableId]?.fileId ?: it.fileId } ?: 0
+                                val seriesProgressKey = (runningSeries ?: activeSeriesDownloads.firstOrNull())
+                                    ?.let { downloads[it.stableId]?.fileId ?: it.fileId } ?: 0
 
                                 DownloadCircleTarget(
                                     size = 56.dp,
                                     saved = allSeriesCompleted,
-                                    arriving = anySeriesArriving,
+                                    arriving = anySeriesArriving && !allSeriesQueued,
+                                    queued = allSeriesQueued,
                                     progressKey = seriesProgressKey,
                                     progress = downloadProgress,
                                     onClick = { showSeriesDownloadSheet = true },
@@ -5614,6 +6044,7 @@ private fun CloudTitleInfoPage(
                                     DownloadCircle(
                                         file = file,
                                         entry = downloads[file.stableId],
+                                        keepLine = keepLine,
                                         progress = downloadProgress,
                                         onDownload = onDownload,
                                         onCancel = onCancelDownload,
@@ -5756,8 +6187,12 @@ private fun CloudTitleInfoPage(
                                         episodes = cataloguedEpisodes,
                                         title = title,
                                         filesBySeason = filesBySeason,
+                                        resumeByCopy = resumeByCopy,
+                                        finishedByCopy = finishedByCopy,
+                                        nextCopyId = playChoice?.partId,
                                         savedIds = savedIds,
                                         downloads = downloads,
+                                        keepLine = keepLine,
                                         onPlay = { file -> playCopy(file) },
                                         onShowCopies = { episode -> copiesSheet = EpisodeCopiesSheet(season, episode) }
                                     )
@@ -5991,7 +6426,9 @@ private fun CloudTitleInfoPage(
                 currentSeason = season,
                 playFile = playFile,
                 filesBySeason = filesBySeason,
+                cataloguedEpisodes = cataloguedEpisodes,
                 downloads = downloads,
+                keepLine = keepLine,
                 savedIds = savedIds,
                 onDismiss = { showSeriesDownloadSheet = false },
                 onDownloadFiles = { files ->
@@ -6512,8 +6949,12 @@ private fun InfoEpisodeList(
     episodes: List<EpisodeDetail>?,
     title: ShelfTitle,
     filesBySeason: Map<Int, Map<Int, List<Playable>>>,
+    resumeByCopy: Map<Long, Long>,
+    finishedByCopy: Map<Long, Long>,
+    nextCopyId: Long?,
     savedIds: Set<Long> = emptySet(),
     downloads: Map<Long, DownloadEntry> = emptyMap(),
+    keepLine: List<Long> = emptyList(),
     onPlay: (Playable) -> Unit,
     onShowCopies: (ShelfEpisode) -> Unit
 ) {
@@ -6559,9 +7000,115 @@ private fun InfoEpisodeList(
         return
     }
 
+    // The shelf's own bookkeeping, read episode by episode: a finish stamp and a resume position are the
+    // only two facts the player leaves behind, and a finish erases one of them. Standing aside, what the
+    // row shows is what those two say together.
+    val standing = PlayOrder.standing(
+        episodes = rows.map { row -> row.number to row.copies.map { it.stableId } },
+        resumeMs = resumeByCopy,
+        lengthsMs = title.lengths,
+        finishedMs = finishedByCopy
+    )
+
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        rows.forEach { row ->
-            InfoEpisodeRow(row, savedIds, downloads, onPlay, onShowCopies)
+        InfoSeasonStanding(standing)
+        rows.zip(standing.episodes).forEach { (row, episodeStanding) ->
+            InfoEpisodeRow(
+                row = row,
+                standing = episodeStanding,
+                isNext = nextCopyId != null && row.copies.any { it.stableId == nextCopyId },
+                savedIds = savedIds,
+                downloads = downloads,
+                keepLine = keepLine,
+                onPlay = onPlay,
+                onShowCopies = onShowCopies
+            )
+        }
+    }
+}
+
+/**
+ * How far through the season the device can prove, in one line and one strip of ticks.
+ *
+ * The strip is the useful half: twenty rows of stills make a viewer compare pictures to find where they
+ * stopped, while a row of marks says it at a glance. Each tick is one episode, in order, so a season the
+ * channel only uploaded half of leaves gaps at the end rather than a shorter run — which is why the
+ * hollow marks are drawn instead of dropped, and why the count says "of 14" out of what this device can
+ * actually play rather than of everything the catalogue lists.
+ */
+@Composable
+private fun InfoSeasonStanding(standing: PlayOrder.SeasonStanding) {
+    if (standing.held == 0) return
+    Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        Text(
+            text = buildString {
+                append("${standing.watched} of ${standing.held} watched")
+                if (standing.missing > 0) append(" · ${standing.missing} not on your shelf")
+            },
+            fontSize = 11.sp,
+            color = OneUiTextSecondary
+        )
+        // One mark per episode is the readable form, and a long anime season is the case where it is not
+        // the affordable one: a hundred boxes inside a page that already renders slowly buys marks two
+        // pixels wide. Past that size the same fact goes onto one continuous bar.
+        if (standing.episodes.size > 60) {
+            val fraction = if (standing.held > 0) standing.watched.toFloat() / standing.held.toFloat() else 0f
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(4.dp)
+                    .background(OneUiTextSecondary.copy(alpha = 0.22f), RoundedCornerShape(2.dp))
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .fillMaxWidth(fraction)
+                        .background(OneUiAccent, RoundedCornerShape(2.dp))
+                )
+            }
+            return
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth().height(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            standing.episodes.forEach { episode ->
+                when {
+                    // An episode this device cannot play still gets a mark, so the strip's length is the
+                    // season's length and a gap in the middle stays visible as a gap.
+                    !episode.held -> Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .border(1.dp, OneUiTextSecondary.copy(alpha = 0.28f), RoundedCornerShape(2.dp))
+                    )
+                    episode.watch == PlayOrder.EpisodeWatch.STARTED -> Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .background(OneUiTextSecondary.copy(alpha = 0.22f), RoundedCornerShape(2.dp))
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                // An episode the shelf never measured is still half-watched, and a mark
+                                // with nothing in it would read as untouched. A stub says "somewhere in here".
+                                .fillMaxWidth(if (episode.fraction > 0f) episode.fraction else 0.2f)
+                                .background(OneUiAccent.copy(alpha = 0.75f), RoundedCornerShape(2.dp))
+                        )
+                    }
+                    else -> Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .background(
+                                if (episode.watch == PlayOrder.EpisodeWatch.WATCHED) OneUiAccent
+                                else OneUiTextSecondary.copy(alpha = 0.22f),
+                                RoundedCornerShape(2.dp)
+                            )
+                    )
+                }
+            }
         }
     }
 }
@@ -6569,15 +7116,28 @@ private fun InfoEpisodeList(
 @Composable
 private fun InfoEpisodeRow(
     row: ShelfEpisode,
+    standing: PlayOrder.EpisodeStanding,
+    isNext: Boolean = false,
     savedIds: Set<Long> = emptySet(),
     downloads: Map<Long, DownloadEntry> = emptyMap(),
+    keepLine: List<Long> = emptyList(),
     onPlay: (Playable) -> Unit,
     onShowCopies: (ShelfEpisode) -> Unit
 ) {
     val file = row.file
     val hasCopies = row.copies.size > 1
     val isSaved = file != null && file.stableId in savedIds
-    val isArriving = file != null && downloads[file.stableId]?.isComplete == false
+    // Two waits used to wear the same word. The ledger says a keep is pending, which is true both of the
+    // film whose bytes are landing and of the five standing behind it, and a season that read "Downloading"
+    // six times is what made the queue look like it wasn't one. The line is what tells them apart.
+    val keepPlace = if (file != null && downloads[file.stableId]?.isComplete == false) {
+        KeepLine.place(keepLine, file.stableId)
+    } else {
+        KeepLine.Place.NONE
+    }
+    val isArriving = keepPlace == KeepLine.Place.RUNNING
+    val isQueued = keepPlace == KeepLine.Place.QUEUED
+    val ahead = if (file != null) KeepLine.ahead(keepLine, file.stableId) else 0
     Row(
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -6599,15 +7159,60 @@ private fun InfoEpisodeRow(
                 )
         }
     ) {
-        ArtSlot(
-            art = rememberCachedArt(row.stillUrl, 340),
-            contentDescription = row.name,
+        // The still carries the progress the way the home cards do — a hairline of accent along its bottom
+        // edge — because a viewer scanning for where they stopped reads pictures before they read words.
+        // A watched episode wears the full line; one put down halfway wears part of it; one never opened
+        // wears nothing, which is the only state that needs no explanation.
+        Box(
             modifier = Modifier
                 .width(132.dp)
                 .aspectRatio(16f / 9f)
                 .clip(RoundedCornerShape(10.dp))
-                .background(OneUiTextSecondary.copy(alpha = 0.14f))
-        )
+        ) {
+            ArtSlot(
+                art = rememberCachedArt(row.stillUrl, 340),
+                contentDescription = row.name,
+                modifier = Modifier.fillMaxSize().background(OneUiTextSecondary.copy(alpha = 0.14f))
+            )
+            if (standing.fraction > 0.01f) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .fillMaxWidth()
+                        .height(3.dp)
+                        .background(Color.White.copy(alpha = 0.28f))
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth(standing.fraction)
+                            .background(OneUiAccent)
+                    )
+                }
+            }
+            // Which episodes are already on this phone is the one question a viewer scrolling a season to
+            // fill storage has, and the answer used to sit at the end of an eleven-point grey line under the
+            // name — a line that is not read at all once there are twenty of them. The picture is what the
+            // eye is on, so the mark goes on the picture.
+            if (isSaved) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(6.dp)
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(Color.Black.copy(alpha = 0.62f))
+                        .padding(horizontal = 4.dp, vertical = 3.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = HugeIcons.Download,
+                        contentDescription = "Downloaded",
+                        tint = Color(0xFF4CAF50),
+                        modifier = Modifier.size(13.dp)
+                    )
+                }
+            }
+        }
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = row.name,
@@ -6641,6 +7246,7 @@ private fun InfoEpisodeRow(
                     } + when {
                         isSaved -> " · Offline"
                         isArriving -> " · Downloading"
+                        isQueued -> if (ahead > 1) " · Queued · $ahead to go" else " · Queued"
                         else -> ""
                     },
                     fontSize = 11.sp,
@@ -6651,6 +7257,24 @@ private fun InfoEpisodeRow(
                     },
                     modifier = Modifier.weight(1f, fill = false)
                 )
+                // Which row the Play button at the top of the page will open is invisible from the list, and
+                // after four episodes the picture alone no longer says where the season is. The chip is the
+                // button's answer written onto the row it points at, so the two cannot be read apart.
+                if (isNext) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(OneUiAccent.copy(alpha = 0.18f))
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = "Next",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = OneUiAccent
+                        )
+                    }
+                }
                 // A long press does the same, but nothing on a touch screen says so — and the only other
                 // clue that a second copy exists is a size line that quietly names the biggest one.
                 if (hasCopies) {
@@ -6680,6 +7304,15 @@ private fun InfoEpisodeRow(
                         .size(18.dp),
                     strokeWidth = 2.dp,
                     color = OneUiTextPrimary
+                )
+            } else if (isQueued) {
+                // A ring rather than a spinner, because a spinner promises bytes and nothing is arriving
+                // yet. It is the same circle with nothing moving in it, which is what a turn in line is.
+                Box(
+                    modifier = Modifier
+                        .padding(top = 20.dp)
+                        .size(16.dp)
+                        .border(1.5.dp, OneUiTextSecondary.copy(alpha = 0.7f), CircleShape)
                 )
             } else if (isSaved) {
                 Icon(
@@ -6844,8 +7477,31 @@ private data class SeriesDownloadOption(
     val files: List<CloudVideoItem>,
     val totalSizeBytes: Long,
     val isAlreadyDone: Boolean = false,
-    val isArriving: Boolean = false
+    val isArriving: Boolean = false,
+    /** Asked for and waiting its turn behind the film that has the link. */
+    val isQueued: Boolean = false
 )
+
+/**
+ * One episode offered by the hand-picked list, with the two things this device can prove about its file.
+ *
+ * [name] is the catalogue's, and only the season on screen has one — the page asks TMDB for one season at
+ * a time, so a row from another season wears its number alone rather than inventing a title.
+ */
+private data class PickableEpisode(
+    val season: Int,
+    val number: Int,
+    val file: CloudVideoItem,
+    val name: String,
+    val isDownloaded: Boolean,
+    /** The one keep whose bytes are coming, which is only ever one of them. */
+    val isArriving: Boolean,
+    /** Asked for and waiting behind [isArriving], so a picked season can say how far off it is. */
+    val isQueued: Boolean
+) {
+    /** Whether there is anything left to ask for. A copy already on the phone, or already on its way, is not a choice. */
+    val canPick: Boolean get() = !isDownloaded && !isArriving && !isQueued
+}
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
@@ -6855,7 +7511,9 @@ private fun SeriesDownloadSheet(
     currentSeason: Int,
     playFile: Playable,
     filesBySeason: Map<Int, Map<Int, List<Playable>>>,
+    cataloguedEpisodes: List<EpisodeDetail>?,
     downloads: Map<Long, DownloadEntry>,
+    keepLine: List<Long>,
     savedIds: Set<Long>,
     onDismiss: () -> Unit,
     onDownloadFiles: (List<CloudVideoItem>) -> Unit,
@@ -6868,10 +7526,42 @@ private fun SeriesDownloadSheet(
         }.getOrDefault(0L)
     }
 
+    // The episode list is a second view of this same sheet rather than a sheet over it: a panel stacked on
+    // a panel cannot be dismissed with one gesture, and the viewer has to be able to get back to the four
+    // easy answers after looking at the long one.
+    var picking by remember { mutableStateOf(false) }
+    var picked by remember { mutableStateOf(emptySet<Long>()) }
+
+    val pickable = remember(filesBySeason, downloads, keepLine, savedIds, cataloguedEpisodes) {
+        filesBySeason.keys.sorted().flatMap { seasonNumber ->
+            filesBySeason[seasonNumber].orEmpty().keys.sorted().mapNotNull { number ->
+                val file = filesBySeason[seasonNumber]?.get(number)
+                    ?.firstOrNull { it is CloudVideoItem } as? CloudVideoItem ?: return@mapNotNull null
+                val pending = downloads[file.stableId]?.isComplete == false
+                PickableEpisode(
+                    season = seasonNumber,
+                    number = number,
+                    file = file,
+                    name = cataloguedEpisodes
+                        ?.firstOrNull { it.season == seasonNumber && it.number == number }?.title.orEmpty(),
+                    isDownloaded = file.stableId in savedIds,
+                    isArriving = pending && KeepLine.place(keepLine, file.stableId) == KeepLine.Place.RUNNING,
+                    isQueued = pending && KeepLine.place(keepLine, file.stableId) == KeepLine.Place.QUEUED
+                )
+            }
+        }
+    }
+
     val seriesVideos = remember(title) { title.parts.filterIsInstance<CloudVideoItem>() }
-    val activeDownloads = remember(seriesVideos, downloads) {
+    // Everything still owed, and the one part of it that has the link. "Cancel all" has to mean the whole
+    // debt rather than the film currently arriving, so the list and the count are kept apart.
+    val pendingDownloads = remember(seriesVideos, downloads) {
         seriesVideos.filter { downloads[it.stableId]?.isComplete == false }
     }
+    val runningDownloads = remember(pendingDownloads, keepLine) {
+        pendingDownloads.count { KeepLine.place(keepLine, it.stableId) == KeepLine.Place.RUNNING }
+    }
+    val waitingDownloads = pendingDownloads.size - runningDownloads
 
     // Best cloud video copy for each episode in each season
     val allEpisodesInOrder = remember(filesBySeason) {
@@ -6882,7 +7572,7 @@ private fun SeriesDownloadSheet(
         }
     }
 
-    val options = remember(title, currentSeason, playFile, filesBySeason, downloads, savedIds) {
+    val options = remember(title, currentSeason, playFile, filesBySeason, downloads, keepLine, savedIds) {
         val list = mutableListOf<SeriesDownloadOption>()
 
         // 1. Current Episode
@@ -6893,11 +7583,18 @@ private fun SeriesDownloadSheet(
             val epE = playPart?.episode
             val epLabel = if (epE != null) "S${epS}:E${epE}" else "Episode"
             val isDone = currentPlayCloud.stableId in savedIds
-            val isArriving = downloads[currentPlayCloud.stableId]?.isComplete == false
+            val keepPlace = if (downloads[currentPlayCloud.stableId]?.isComplete == false) {
+                KeepLine.place(keepLine, currentPlayCloud.stableId)
+            } else {
+                KeepLine.Place.NONE
+            }
+            val isArriving = keepPlace == KeepLine.Place.RUNNING
+            val isQueued = keepPlace == KeepLine.Place.QUEUED
 
             val sub = when {
                 isDone -> "Downloaded · ${formatFileSize(currentPlayCloud.sizeBytes)}"
                 isArriving -> "Downloading… · ${formatFileSize(currentPlayCloud.sizeBytes)}"
+                isQueued -> "Queued · ${formatFileSize(currentPlayCloud.sizeBytes)}"
                 else -> "${formatFileSize(currentPlayCloud.sizeBytes)} · Tap to download"
             }
             list.add(
@@ -6908,7 +7605,8 @@ private fun SeriesDownloadSheet(
                     files = listOf(currentPlayCloud),
                     totalSizeBytes = currentPlayCloud.sizeBytes,
                     isAlreadyDone = isDone,
-                    isArriving = isArriving
+                    isArriving = isArriving,
+                    isQueued = isQueued
                 )
             )
         }
@@ -7008,6 +7706,20 @@ private fun SeriesDownloadSheet(
             )
         }
 
+        // 5. The manual pile. Every option above is a guess about which episodes the viewer means, and a
+        //    season of forty uploads is exactly where a guess starts costing somebody their storage.
+        if (allEpisodesInOrder.count { it.stableId !in savedIds } > 1) {
+            list.add(
+                SeriesDownloadOption(
+                    id = "choose",
+                    title = "Choose Episodes",
+                    subtitle = "Pick exactly which ones to keep offline",
+                    files = emptyList(),
+                    totalSizeBytes = 0L
+                )
+            )
+        }
+
         list
     }
 
@@ -7024,7 +7736,9 @@ private fun SeriesDownloadSheet(
                     .fillMaxWidth()
                     .physicsBounceOverscroll()
                     .heightIn(max = 520.dp)
-                    .verticalScroll(rememberScrollState())
+                    // Only the short list scrolls as a whole. The picker brings its own scrollable list so
+                    // the running total and the button stay under the thumb while a season goes past them.
+                    .then(if (picking) Modifier else Modifier.verticalScroll(rememberScrollState()))
                     .padding(start = 20.dp, end = 20.dp, bottom = 32.dp)
             ) {
                 Row(
@@ -7065,32 +7779,58 @@ private fun SeriesDownloadSheet(
                     }
                 }
 
-                if (activeDownloads.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(14.dp))
-                    ActiveDownloadsBanner(
-                        activeCount = activeDownloads.size,
-                        onCancelAll = { onCancelFiles(activeDownloads) }
+                if (picking) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    SeriesEpisodePicker(
+                        episodes = pickable,
+                        freeSpaceBytes = freeSpaceBytes,
+                        picked = picked,
+                        onToggle = { id ->
+                            picked = if (id in picked) picked - id else picked + id
+                        },
+                        onSelectAll = {
+                            picked = pickable.filter { it.canPick }.map { it.file.stableId }.toSet()
+                        },
+                        onClear = { picked = emptySet() },
+                        onBack = { picking = false },
+                        onConfirm = onDownloadFiles
                     )
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    options.forEach { option ->
-                        val notEnoughSpace = freeSpaceBytes > 0L &&
-                            !option.isAlreadyDone &&
-                            option.totalSizeBytes > freeSpaceBytes
-
-                        DownloadOptionCard(
-                            option = option,
-                            notEnoughSpace = notEnoughSpace,
-                            onClick = {
-                                if (!option.isAlreadyDone && !option.isArriving && !notEnoughSpace) {
-                                    AppHaptics.click()
-                                    onDownloadFiles(option.files)
-                                }
-                            }
+                } else {
+                    if (pendingDownloads.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(14.dp))
+                        ActiveDownloadsBanner(
+                            runningCount = runningDownloads,
+                            waitingCount = waitingDownloads,
+                            onCancelAll = { onCancelFiles(pendingDownloads) }
                         )
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        options.forEach { option ->
+                            val notEnoughSpace = freeSpaceBytes > 0L &&
+                                !option.isAlreadyDone &&
+                                option.totalSizeBytes > freeSpaceBytes
+
+                            DownloadOptionCard(
+                                option = option,
+                                notEnoughSpace = notEnoughSpace,
+                                onClick = {
+                                    // The one row in the list that is a question rather than an answer: it
+                                    // has no files of its own, so it opens the season instead of queueing it.
+                                    if (option.id == "choose") {
+                                        AppHaptics.click()
+                                        picking = true
+                                    } else if (!option.isAlreadyDone && !option.isArriving &&
+                                        !option.isQueued && !notEnoughSpace
+                                    ) {
+                                        AppHaptics.click()
+                                        onDownloadFiles(option.files)
+                                    }
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -7098,11 +7838,224 @@ private fun SeriesDownloadSheet(
     }
 }
 
+/**
+ * The hand-picked pile: every episode the shelf holds, with a box beside the ones worth keeping.
+ *
+ * The four cards this list replaces are all a guess about which episodes the viewer means — the one on
+ * screen, the next three, the rest of the season, all of it — and a season of forty uploads is where a
+ * guess starts costing somebody their storage. Rows keep the shelf's own order and a season gets a line
+ * where it begins, because the number a viewer picks by is the one on the poster.
+ *
+ * Two states are shown rather than offered: a copy already on this phone, and a copy already on its way.
+ * Both mean the ask is over, and pressing a third time would queue a second promise against bytes that
+ * are already landing.
+ */
+@Composable
+private fun SeriesEpisodePicker(
+    episodes: List<PickableEpisode>,
+    freeSpaceBytes: Long,
+    picked: Set<Long>,
+    onToggle: (Long) -> Unit,
+    onSelectAll: () -> Unit,
+    onClear: () -> Unit,
+    onBack: () -> Unit,
+    onConfirm: (List<CloudVideoItem>) -> Unit
+) {
+    val open = episodes.filter { it.canPick }
+    val chosen = episodes.filter { it.file.stableId in picked }
+    val totalBytes = chosen.sumOf { it.file.sizeBytes }
+    val notEnoughSpace = freeSpaceBytes > 0L && totalBytes > freeSpaceBytes
+    val everything = open.isNotEmpty() && chosen.size == open.size
+    val canGo = chosen.isNotEmpty() && !notEnoughSpace
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            CloudPill(text = "Back", onClick = onBack)
+            Spacer(modifier = Modifier.weight(1f))
+            if (open.isNotEmpty()) {
+                CloudPill(
+                    text = if (everything) "Clear" else "Select all",
+                    onClick = { if (everything) onClear() else onSelectAll() }
+                )
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "${chosen.size} of ${open.size} still to keep",
+                fontSize = 12.sp,
+                color = OneUiTextSecondary,
+                fontWeight = FontWeight.Medium
+            )
+            if (chosen.isNotEmpty()) {
+                Text(
+                    text = "   ·   ${formatFileSize(totalBytes)}",
+                    fontSize = 12.sp,
+                    color = OneUiTextSecondary
+                )
+            }
+        }
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 300.dp)
+                .physicsBounceOverscroll()
+                .verticalScroll(rememberScrollState())
+        ) {
+            episodes.forEachIndexed { index, episode ->
+                if (index == 0 || episodes[index - 1].season != episode.season) {
+                    Text(
+                        text = "Season ${episode.season}",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = OneUiTextSecondary,
+                        modifier = Modifier.padding(top = if (index == 0) 0.dp else 12.dp, bottom = 4.dp)
+                    )
+                }
+                SeriesEpisodePickRow(
+                    episode = episode,
+                    isChecked = episode.file.stableId in picked,
+                    onToggle = onToggle
+                )
+            }
+        }
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(if (canGo) OneUiTextPrimary else OneUiPillSurface)
+                .then(
+                    if (canGo) {
+                        Modifier.jellyClick(interactionSource = null, indication = null, onClick = {
+                            AppHaptics.click()
+                            onConfirm(chosen.map { it.file })
+                        })
+                    } else {
+                        Modifier
+                    }
+                )
+                .padding(vertical = 14.dp)
+        ) {
+            Text(
+                text = when {
+                    chosen.isEmpty() -> "Pick at least one episode"
+                    notEnoughSpace -> "Not enough storage · ${formatFileSize(totalBytes)} needed"
+                    else -> "Download ${chosen.size} episode${if (chosen.size == 1) "" else "s"}"
+                },
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = if (canGo) OneUiBackground else OneUiTextSecondary
+            )
+        }
+    }
+}
+
+/** One row of that list: the number the viewer picks by, what the file will cost, and its box. */
+@Composable
+private fun SeriesEpisodePickRow(
+    episode: PickableEpisode,
+    isChecked: Boolean,
+    onToggle: (Long) -> Unit
+) {
+    val id = episode.file.stableId
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .then(
+                if (episode.canPick) {
+                    Modifier.jellyClick(interactionSource = null, indication = null, onClick = {
+                        AppHaptics.toggle(!isChecked)
+                        onToggle(id)
+                    })
+                } else {
+                    Modifier
+                }
+            )
+            .padding(vertical = 9.dp, horizontal = 2.dp)
+    ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(24.dp)) {
+            when {
+                episode.isDownloaded -> Icon(
+                    imageVector = Icons.Default.Check,
+                    contentDescription = null,
+                    tint = Color(0xFF4CAF50),
+                    modifier = Modifier.size(18.dp)
+                )
+
+                episode.isArriving -> CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = OneUiTextPrimary
+                )
+
+                episode.isQueued -> Box(
+                    modifier = Modifier
+                        .size(15.dp)
+                        .border(1.5.dp, OneUiTextSecondary.copy(alpha = 0.7f), CircleShape)
+                )
+
+                else -> Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(21.dp)
+                        .clip(RoundedCornerShape(7.dp))
+                        .background(if (isChecked) OneUiTextPrimary else Color.Transparent)
+                        .border(
+                            width = 1.5.dp,
+                            color = if (isChecked) OneUiTextPrimary else OneUiTextSecondary.copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(7.dp)
+                        )
+                ) {
+                    if (isChecked) {
+                        Icon(
+                            imageVector = Icons.Default.Check,
+                            contentDescription = null,
+                            tint = OneUiBackground,
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
+            }
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = if (episode.name.isBlank()) "Episode ${episode.number}"
+                       else "E${episode.number}   ${episode.name}",
+                fontSize = 13.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = if (episode.canPick) OneUiTextPrimary else OneUiTextSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            val footer = listOfNotNull(
+                episode.file.sizeFormatted,
+                formatDuration(episode.file.durationMs).takeIf { episode.file.durationMs > 0L },
+                when {
+                    episode.isDownloaded -> "Downloaded"
+                    episode.isArriving -> "Downloading…"
+                    episode.isQueued -> "Queued"
+                    else -> null
+                }
+            ).joinToString("   ·   ")
+            Text(text = footer, fontSize = 11.sp, color = OneUiTextSecondary, maxLines = 1)
+        }
+    }
+}
+
 @Composable
 private fun ActiveDownloadsBanner(
-    activeCount: Int,
+    runningCount: Int,
+    waitingCount: Int,
     onCancelAll: () -> Unit
 ) {
+    val anythingMoving = runningCount > 0
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -7117,13 +8070,29 @@ private fun ActiveDownloadsBanner(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             modifier = Modifier.weight(1f)
         ) {
-            CircularProgressIndicator(
-                modifier = Modifier.size(18.dp),
-                strokeWidth = 2.dp,
-                color = OneUiTextPrimary
-            )
+            if (anythingMoving) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = OneUiTextPrimary
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(16.dp)
+                        .border(1.5.dp, OneUiTextSecondary.copy(alpha = 0.7f), CircleShape)
+                )
+            }
+            // One sentence for two different waits. The count of everything owed used to sit here alone,
+            // which told a viewer who pressed a season that six films were arriving together — and the one
+            // thing they wanted to know, which is whether they can start watching yet, is the number that
+            // is moving.
             Text(
-                text = "Downloading $activeCount episode${if (activeCount == 1) "" else "s"}…",
+                text = when {
+                    anythingMoving && waitingCount > 0 -> "Downloading one · $waitingCount queued"
+                    anythingMoving -> "Downloading…"
+                    else -> "$waitingCount queued"
+                },
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Medium,
                 color = OneUiTextPrimary
@@ -7151,7 +8120,7 @@ private fun DownloadOptionCard(
     notEnoughSpace: Boolean,
     onClick: () -> Unit
 ) {
-    val enabled = !option.isAlreadyDone && !option.isArriving && !notEnoughSpace
+    val enabled = !option.isAlreadyDone && !option.isArriving && !option.isQueued && !notEnoughSpace
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -7168,7 +8137,7 @@ private fun DownloadOptionCard(
             )
             .padding(14.dp)
             .graphicsLayer {
-                if (!enabled && !option.isAlreadyDone && !option.isArriving) alpha = 0.5f
+                if (!enabled && !option.isAlreadyDone && !option.isArriving && !option.isQueued) alpha = 0.5f
             }
     ) {
         Box(
@@ -7192,6 +8161,13 @@ private fun DownloadOptionCard(
                         modifier = Modifier.size(18.dp),
                         strokeWidth = 2.dp,
                         color = OneUiTextPrimary
+                    )
+                }
+                option.isQueued -> {
+                    Box(
+                        modifier = Modifier
+                            .size(16.dp)
+                            .border(1.5.dp, OneUiTextSecondary.copy(alpha = 0.7f), CircleShape)
                     )
                 }
                 notEnoughSpace -> {
@@ -7490,6 +8466,10 @@ private class KeptFilm(
     /** Bytes on the device, against the length the shelf promised — the same pair the shade draws. */
     val landed: Long,
     val fraction: Float,
+    /** Standing in line behind the film that has the link, rather than holding it. */
+    val queued: Boolean,
+    /** How many keeps are owed a turn first — zero for the one that is moving. */
+    val ahead: Int,
 ) {
     val arriving: Boolean get() = !entry.isComplete
     val percent: Int get() = (fraction * 100f).roundToInt()
@@ -7525,6 +8505,7 @@ private fun keptFilms(
     shelf: CollectionShelf,
     entries: Map<Long, DownloadEntry>,
     progress: Map<Int, CloudProgress>,
+    keepLine: List<Long>,
 ): List<KeptFilm> {
     val byCopy = HashMap<Long, ShelfTitle>()
     for (title in shelf.resolved) {
@@ -7534,6 +8515,7 @@ private fun keptFilms(
         val title = byCopy[entry.stableId]
         val fileTitle = title?.parts?.firstOrNull { it.stableId == entry.stableId }?.title
         val landed = DownloadNotices.landedBytes(entry.sizeBytes, progress[entry.fileId])
+        val place = KeepLine.place(keepLine, entry.stableId)
         KeptFilm(
             entry = entry,
             title = title,
@@ -7544,21 +8526,29 @@ private fun keptFilms(
             // reporting bytes for it, and after a restart nothing is.
             landed = if (entry.isComplete) entry.sizeBytes else landed,
             fraction = DownloadNotices.progressOf(entry.sizeBytes, landed),
+            queued = !entry.isComplete && place == KeepLine.Place.QUEUED,
+            ahead = KeepLine.ahead(keepLine, entry.stableId),
         )
     }
 }
 
 /**
- * The Downloads page: every film this install is keeping, with the fetches still moving at the top.
+ * The Downloads page: every film this install is keeping, the one fetch moving at the top of them.
  *
  * Built as a page of the browser rather than as another hand-rolled overlay, which is what gives it the
  * collapsing header, the glass back pill and the slide the rest of the app uses between screens without
  * this file writing a single line of transition code.
+ *
+ * The three sections are the queue made visible: one film has the link, the rest of what was pressed stands
+ * behind it in the order it was asked for, and everything already landed sits below both. Showing the wait
+ * as its own group is the honest version of what used to be one "Arriving" list — six promises that all
+ * claimed bytes while five of them were not getting any.
  */
 @Composable
 private fun DownloadsContent(
     shelf: CollectionShelf,
     downloads: Map<Long, DownloadEntry>,
+    keepLine: List<Long>,
     progress: StateFlow<Map<Int, CloudProgress>>,
     prefsStore: ArcPreferencesStore,
     gridState: LazyGridState,
@@ -7570,11 +8560,20 @@ private fun DownloadsContent(
     onRemoveDownload: (CloudVideoItem) -> Unit
 ) {
     val published by progress.collectAsState()
-    val films = remember(shelf, downloads, published) { keptFilms(shelf, downloads, published) }
-    val arriving = films.filter { it.arriving }
+    val films = remember(shelf, downloads, published, keepLine) {
+        keptFilms(shelf, downloads, published, keepLine)
+    }
+    val arriving = films.filter { it.arriving && !it.queued }
+    val waiting = films.filter { it.queued }
     val kept = films.filterNot { it.arriving }
     val keptBytes = kept.sumOf { it.entry.sizeBytes }
     val folder = KeptMedia.FOLDER.trimEnd('/')
+    fun counted(size: Int, word: String) = "$size ${if (size == 1) word else word + "s"}"
+    val tally = buildList {
+        if (arriving.isNotEmpty()) add("${counted(arriving.size, "film")} arriving")
+        if (waiting.isNotEmpty()) add("${counted(waiting.size, "film")} queued")
+        if (kept.isNotEmpty()) add("${counted(kept.size, "film")} kept")
+    }.joinToString(" · ")
 
     LazyVerticalGrid(
         state = gridState,
@@ -7594,15 +8593,7 @@ private fun DownloadsContent(
         item(key = "downloads_summary") {
             Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
-                    text = when {
-                        arriving.isNotEmpty() && kept.isNotEmpty() ->
-                            "${arriving.size} ${if (arriving.size == 1) "film" else "films"} arriving · ${kept.size} kept"
-                        arriving.isNotEmpty() ->
-                            "Keeping ${arriving.size} ${if (arriving.size == 1) "film" else "films"}"
-                        kept.isNotEmpty() ->
-                            "${kept.size} ${if (kept.size == 1) "film" else "films"} kept on this device"
-                        else -> "Nothing is kept on this device"
-                    },
+                    text = tally.ifEmpty { "Nothing is kept on this device" },
                     fontSize = 15.sp,
                     color = OneUiTextSecondary
                 )
@@ -7621,6 +8612,15 @@ private fun DownloadsContent(
         if (arriving.isNotEmpty()) {
             item(key = "downloads_section_arriving") { DownloadsSectionLabel("Arriving") }
             itemsIndexed(arriving, key = { _, film -> "download_${film.entry.stableId}" }) { index, film ->
+                StaggeredListItem(index, "download:${film.entry.stableId}") {
+                    DownloadFilmRow(film, prefsStore, progress, onOpenTitle, onCancelDownload, onRemoveDownload)
+                }
+            }
+        }
+
+        if (waiting.isNotEmpty()) {
+            item(key = "downloads_section_waiting") { DownloadsSectionLabel("Queued") }
+            itemsIndexed(waiting, key = { _, film -> "download_${film.entry.stableId}" }) { index, film ->
                 StaggeredListItem(index, "download:${film.entry.stableId}") {
                     DownloadFilmRow(film, prefsStore, progress, onOpenTitle, onCancelDownload, onRemoveDownload)
                 }
@@ -7768,6 +8768,19 @@ private fun DownloadFilmRow(
                         fontSize = 12.sp,
                         color = OneUiTextSecondary
                     )
+                    film.queued -> {
+                        // The wait is named instead of measured: no bytes are owed to this row yet, so a
+                        // percentage would be a number about somebody else's download.
+                        Text(
+                            text = buildString {
+                                append("Queued")
+                                if (film.ahead > 1) append(" · ${film.ahead} to go")
+                                if (entry.sizeBytes > 0L) append(" · ${formatFileSize(entry.sizeBytes)}")
+                            },
+                            fontSize = 12.sp,
+                            color = OneUiTextSecondary
+                        )
+                    }
                     entry.sizeBytes > 0L -> {
                         Text(
                             text = "${film.percent}% · ${formatFileSize(film.landed)} of " +
@@ -7791,7 +8804,8 @@ private fun DownloadFilmRow(
             DownloadCircleTarget(
                 size = 38.dp,
                 saved = !film.arriving,
-                arriving = film.arriving,
+                arriving = film.arriving && !film.queued,
+                queued = film.queued,
                 progressKey = entry.fileId,
                 progress = progress,
                 onClick = { onCancelDownload(film.target) },
@@ -9040,6 +10054,26 @@ private fun HeroVlcVideoPlayerScreen(
     var sizeToastStamp by remember { mutableIntStateOf(0) }
     var gestureHudText by remember { mutableStateOf<String?>(null) }
     var gestureHudSticky by remember { mutableStateOf(false) }
+
+    /**
+     * Whether the sentence on screen is one the viewer can do something about, and so carries a way to
+     * ask again.
+     *
+     * Only the two deliveries that failed get it: a zoom reading or a copy-switch toast needs no button
+     * under it, and holding one there would be the app inviting a tap that changes nothing.
+     */
+    var hudOffersRetry by remember { mutableStateOf(false) }
+
+    /**
+     * Whether the rest of this part has been proved missing rather than merely late.
+     *
+     * The stall watchdog's own verdict, held out where the next-up offer can read it. It exists because
+     * refusing to believe a leaping play head is the right call for the resume point and the wrong one
+     * for the way out: the head is held at the last frame that really played, so a part that died nine
+     * tenths of the way in never reaches an offer driven by position alone, and the screen would be
+     * saying the rest never arrived while giving the viewer nothing to do about it.
+     */
+    var theTailNeverArrived by remember { mutableStateOf(false) }
     var gestureGaugeFraction by remember { mutableStateOf<Float?>(null) }
     var isBoostGauge by remember { mutableStateOf(false) }
     var scrubFraction by remember { mutableStateOf<Float?>(null) }
@@ -9112,6 +10146,16 @@ private fun HeroVlcVideoPlayerScreen(
     var openGaveUp by remember(video.id) { mutableStateOf(false) }
 
     /**
+     * How many times the viewer has asked for this part again.
+     *
+     * It is a key of the open and of the stall watchdog rather than a counter anybody reads: a delivery
+     * that failed once is asked for a second time by running the same two blocks from the top, and the
+     * watchdog has to come up with a fresh ladder of attempts, because one that has spent its three and
+     * been re-asked has earned three more.
+     */
+    var openAttempt by remember(video.id) { mutableIntStateOf(0) }
+
+    /**
      * Which copies of this part the player has already been refused by, and why the file now opening
      * was asked for — both carried on the playback, because this composable is rebuilt by the switch.
      */
@@ -9134,6 +10178,20 @@ private fun HeroVlcVideoPlayerScreen(
         )?.let { id -> playback.playlist.firstOrNull { it.id == id } } ?: return false
         onFallToAnotherCopy(next, reason)
         return true
+    }
+
+    /**
+     * Ask again for the part that would not come.
+     *
+     * The app cannot name what Telegram refused, because every call it makes is capped and a timeout
+     * comes back as the same nothing as an error code — so a refusal is answered by asking again rather
+     * than by reading it out. Asking again is the open run from the top: the path is resolved afresh,
+     * which stretches the sparse file and aims the window at the minute the play head died on. Nothing
+     * else moves — no position is written down, no copy is marked refused — so a second refusal is said
+     * in the same words and the viewer has not lost the minute they were watching.
+     */
+    fun retryDelivery() {
+        openAttempt++
     }
 
     // Tap to first picture: fetching the range, then letting the player open what landed.
@@ -9192,10 +10250,22 @@ private fun HeroVlcVideoPlayerScreen(
         ?: titleCard?.posterUrl
     val loadingArt = rememberCachedArt(loadingArtUrl, PosterCache.HERO_WIDTH_PX)
 
-    LaunchedEffect(video.id, video.uri) {
+    LaunchedEffect(video.id, video.uri, openAttempt) {
         zoomScale = 1f
         panOffset = Offset.Zero
+        // The part the player is reading now stops being read the moment another one is asked for. A
+        // step is the viewer saying they are done with this film, and everything below can take a long
+        // time — a cold copy is up to two head waits — none of which used to be a reason for its credits
+        // to keep playing under the next episode's name.
+        vlcEngine.standDown()
+        // A fresh open owns the screen again, whatever the last one of these was left holding: the pill
+        // it explained, the retry that went with it, and the verdict that there was nothing to play.
+        // [openAttempt] comes through here too, which is what takes the failure sentence off screen when
+        // the viewer asks for the same part a second time.
         gestureHudSticky = false
+        gestureHudText = null
+        hudOffersRetry = false
+        openGaveUp = false
         // The watched minute belongs to the part rather than to the file that earned it, so a copy the
         // viewer has never opened here picks up where one of its siblings stopped.
         val sharedPosition =
@@ -9237,6 +10307,10 @@ private fun HeroVlcVideoPlayerScreen(
                 Uri.EMPTY
             }
             else -> {
+                // Held across both waits, not just the first. The screen that says "this film is coming"
+                // turns on this, and the slow question is the second one — the head fetch, up to two
+                // budgets of it — so clearing the ask as soon as Telegram had named the message left a
+                // cold step with nothing on screen for the whole of it.
                 isAskingTelegram = true
                 val asked = cloudSource
                 val live = asked?.let {
@@ -9244,13 +10318,13 @@ private fun HeroVlcVideoPlayerScreen(
                         .onFailure { android.util.Log.w("ArcPlayer", "resolveLive threw", it) }
                         .getOrNull() ?: it
                 }
-                isAskingTelegram = false
                 if (live != null && live != asked) cloudSource = live
                 val path = live?.let {
                     runCatching { cloudRepository.localPathFor(it) }
                         .onFailure { android.util.Log.w("ArcPlayer", "localPathFor threw", it) }
                         .getOrNull()
                 }
+                isAskingTelegram = false
                 android.util.Log.i("ArcPlayer", "resolve file=${asked?.fileId} path=${path ?: "none"}")
                 path?.let { Uri.fromFile(File(it)) } ?: Uri.EMPTY
             }
@@ -9264,11 +10338,17 @@ private fun HeroVlcVideoPlayerScreen(
             openGaveUp = true
             gestureHudSticky = true
             gestureHudText = "Telegram did not deliver this file."
+            hudOffersRetry = true
             return@LaunchedEffect
         }
         val media = video.copy(uri = streamUri)
         openedMedia = media
-        vlcEngine.loadAndPlay(media, startPositionMs = savedResumePos)
+        // Which of the two kinds of file this is. Two of the branches above hand back something this
+        // device already owns in full — a film from the phone's own library, a copy the viewer kept —
+        // and only the last is a sparse file Telegram is still filling. A whole one cannot have a hole
+        // in it, so its ending needs no evidence behind it and its play head is believed outright.
+        val streamWasWholeOnDisk = video.uri != Uri.EMPTY || keptHandle != null
+        vlcEngine.loadAndPlay(media, startPositionMs = savedResumePos, wholeFileOnDisk = streamWasWholeOnDisk)
         if (savedResumePos > ResumeRules.MIN_RESUME_POSITION_MS) {
             gestureHudText = "Resumed from ${formatDuration(savedResumePos)}"
         }
@@ -9291,6 +10371,9 @@ private fun HeroVlcVideoPlayerScreen(
             openGaveUp = true
             gestureHudSticky = true
             gestureHudText = "This file would not open on this phone."
+            // Asking again of a player that has already read this container and refused it would only
+            // spend another round trip on the same answer, so this sentence has no button under it.
+            hudOffersRetry = false
         }
     }
 
@@ -9345,6 +10428,13 @@ private fun HeroVlcVideoPlayerScreen(
                 source.durationMs.takeIf { it > 0L } ?: vlcEngine.durationMs.takeIf { it > 1_000L } ?: 0L
             }
             vlcEngine.onStreamPosition = listener@{ positionMs ->
+                // The window follows the head, so it follows the part that owns the head. A step re-binds
+                // this listener to the incoming file a moment before the engine puts the outgoing one down,
+                // and that one tick — the old play head scaled by the new film's length — aims the incoming
+                // window deep inside a file whose head nobody has asked for yet, breaking off the very
+                // fetch the open is waiting on. Measured as a cold step: the first budget expired, the
+                // record was dropped as stale, and the second one had to fetch the head again.
+                if (vlcEngine.headOwnerVideoId != video.id) return@listener
                 val durationMs = playLength()
                 if (durationMs == 0L) return@listener
                 readBytes.value = repository.cachedByteOffset(source, positionMs, durationMs)
@@ -9378,8 +10468,12 @@ private fun HeroVlcVideoPlayerScreen(
      * the picture stops, the ticks stop, and nothing is left asking Telegram for the bytes that would
      * restart it. That is why a film that ran out of link used to sit frozen forever rather than
      * buffering. This loop is the way out, and it runs whether or not the player is reporting.
+     *
+     * [openAttempt] is one of its keys because the attempt count lives in the loop: a viewer who asks
+     * for the part again has to be given the attempts afresh, or the retry re-opens the film and then
+     * reads the same spent ladder straight back into the sentence already on screen.
      */
-    LaunchedEffect(cloudSource, cloudRepository, vlcEngine) {
+    LaunchedEffect(cloudSource, cloudRepository, vlcEngine, openAttempt) {
         val source = cloudSource ?: return@LaunchedEffect
         val repository = cloudRepository ?: return@LaunchedEffect
         // [BufferGuard.NEVER] is Long.MIN_VALUE, so subtracting it wraps past zero and prints an age
@@ -9431,6 +10525,7 @@ private fun HeroVlcVideoPlayerScreen(
             if (!stalled) {
                 stalledSinceMs = BufferGuard.NEVER
                 vlcEngine.isBuffering = false
+                theTailNeverArrived = false
                 // The line this loop put up describes a wait, so it goes when the wait does. Left up,
                 // it outlives the stall and sits over a film that is playing, with nothing on screen
                 // able to clear it short of opening another one.
@@ -9438,6 +10533,7 @@ private fun HeroVlcVideoPlayerScreen(
                     admittedSlowly = false
                     gestureHudSticky = false
                     gestureHudText = null
+                    hudOffersRetry = false
                 }
             } else {
                 vlcEngine.isBuffering = true
@@ -9488,12 +10584,30 @@ private fun HeroVlcVideoPlayerScreen(
                         vlcEngine.loadAndPlay(media, startPositionMs = targetMs)
                     }
                 }
-                if ((restarts >= BufferGuard.MAX_RESTARTS ||
+                val starved = BufferGuard.isStarvedAtTheEnd(
+                    nowMs = now,
+                    stalledSinceMs = stalledSinceMs,
+                    playHeadRanIntoAHole = vlcEngine.endWasAHole
+                )
+                // The way out goes where the sentence does, and only where it does: a part still filling
+                // its hole has a pump that may yet bring it, and offering to leave then would be the app
+                // giving up before the link has.
+                theTailNeverArrived = starved
+                if ((restarts >= BufferGuard.MAX_RESTARTS || starved ||
                         BufferGuard.isWaitingOnTheLink(now, stalledSinceMs, settled)) && !admittedSlowly
                 ) {
                     admittedSlowly = true
                     gestureHudSticky = true
-                    gestureHudText = "Telegram is slow to deliver that part."
+                    // Two different waits, and the second one has an answer the first has not. Nothing
+                    // landing is Telegram's link being slow; a play head that ran out of file inside a
+                    // length it was told is a part that was uploaded with a hole in it, and saying which
+                    // is what makes the button underneath it worth pressing.
+                    gestureHudText = if (starved) {
+                        "Telegram never sent the rest of this part."
+                    } else {
+                        "Telegram is slow to deliver that part."
+                    }
+                    hudOffersRetry = true
                 }
             }
             delay(1_000L)
@@ -9555,12 +10669,37 @@ private fun HeroVlcVideoPlayerScreen(
     LaunchedEffect(vlcEngine.isPlaying, video.id) {
         mainActivity?.isVideoActivelyPlaying = vlcEngine.isPlaying
         while (vlcEngine.isPlaying) {
-            prefsStore.recordPlaybackProgress(
-                videoId = video.id,
-                positionMs = vlcEngine.resumablePositionMs,
-                durationMs = vlcEngine.durationMs
-            )
+            // Filed against the part the head belongs to rather than the one on screen, because a
+            // handover runs the outgoing film for seconds under the incoming part's name and those are
+            // not the incoming part's minutes. Measured on the emulator: ten seconds of S1 E3's play
+            // head — its own length still in the report — written as S1 E4's resume position, and the
+            // next open of E4 seeking straight past its first minute on the strength of it.
+            vlcEngine.headOwnerVideoId?.let { headOwner ->
+                prefsStore.recordPlaybackProgress(
+                    videoId = headOwner,
+                    positionMs = vlcEngine.resumablePositionMs,
+                    durationMs = vlcEngine.durationMs
+                )
+            }
             delay(1500L)
+        }
+    }
+
+    /**
+     * Record that a part was watched to its end, on the player's word and nobody else's.
+     *
+     * [ArcVlcPlayerEngine.isAtEnd] is only ever set once [NextUp.isHonestEnding] has believed the end
+     * report, so this is the one moment the app knows the difference between a film that finished and one
+     * that was never delivered — and the season's progress now reads that knowledge instead of an open.
+     *
+     * The stamp goes to [ArcVlcPlayerEngine.headOwnerVideoId] rather than to the part on screen, keyed off
+     * the end report alone: a Next-up tap names the incoming episode seconds before its bytes are asked
+     * for, and the outgoing film, still running, reaches its own end inside that gap. Measured on the
+     * emulator as a stamp for S1 E6 five seconds before Telegram had even answered for it.
+     */
+    LaunchedEffect(vlcEngine.isAtEnd) {
+        if (vlcEngine.isAtEnd) {
+            vlcEngine.headOwnerVideoId?.let { videoId -> prefsStore.rememberFinishedAt(videoId) }
         }
     }
 
@@ -9582,13 +10721,93 @@ private fun HeroVlcVideoPlayerScreen(
         }
     }
 
+    val timingDetail = prefsStore.titleDetail(
+        titleCard?.providerId,
+        isSeries = titleCard?.isSeries == true
+    )
+    val timingSeasons = timingDetail?.seasons.orEmpty()
+
+    /**
+     * This part's marks, judged against the copy actually on screen, and the second a tap would jump to.
+     *
+     * Judged here rather than when they were fetched because the length is what does the judging and the
+     * length belongs to this file: a season-wide pass has no length to judge with, and a 720p print and a
+     * cut-down broadcast print of one episode put their credits at different seconds. What is stored is the
+     * claim, so every copy gets read against its own.
+     *
+     * Read straight from the store rather than remembered, because an answer arriving while the film is
+     * already running is the common case: the question is only asked when the part opens. The leave below
+     * asks again instead of sharing this reading, because a disposal closure is frozen at the frame its own
+     * part opened, which is before the answer arrived, while the newest composition has moved on to naming
+     * the episode that comes next. A file name is the one thing that survives both.
+     */
+    /**
+     * The length this part's marks are judged against, which is not always the length the player reports.
+     *
+     * [TimingTrust] needs a length because a mark is a position, and a position means nothing without a
+     * run to be a fraction of. What it does not need is the length of *this play*: the rules it answers
+     * are percentages and a tail, and the number the player is about to read out is one the app may
+     * already hold. That difference is the whole gap between the pill arriving and never arriving,
+     * because a Telegram copy answers with the placeholder 1 until its container is delivered — measured
+     * on the emulator as nineteen seconds of one on a part whose opening was fifteen seconds long, which
+     * is the entire window the pill is offered in. The marks were stored, correct, and refused every time.
+     *
+     * The three rungs are the same fact known to three different depths. The player's report is about
+     * this play; the length remembered from this file is about this copy, read off it the last time it
+     * ran; the catalogue's runtime is about this episode and is the only one available on the first
+     * watch of a part nobody has opened. A wrong rung is a cheap mistake to make, because every rule a
+     * length serves is a bound rather than a target — a catalogue that says sixty minutes for a
+     * ninety-minute finale refuses its credits mark rather than inventing one — and the moment the
+     * player reports, the judgement is made over again against the truth.
+     */
+    val partRequest = timingRequestFor(titleCard?.providerId, parsedTitle, timingSeasons)
+    val cataloguedEpisodeMinutes = partRequest?.season?.let { season ->
+        prefsStore.episodesOf(titleCard?.providerId, season)
+            ?.firstOrNull { it.number == partRequest.episode }?.runtimeMinutes
+    } ?: timingDetail?.runtimeMinutes ?: 0
+    val marksJudgedAgainstMs = when {
+        vlcEngine.durationMs >= ResumeRules.MIN_TRACKABLE_DURATION_MS -> vlcEngine.durationMs
+        else -> maxOf(
+            prefsStore.knownLengths[video.id] ?: 0L,
+            cataloguedEpisodeMinutes * 60_000L
+        )
+    }
+    val partTimings = prefsStore.timingFor(partRequest)
+        ?.let { TimingTrust.believe(it, marksJudgedAgainstMs) }
+    val skipIntroToMs = partTimings?.introEndMs
+    val isSkipIntroOffered = skipIntroToMs != null &&
+        SkipIntro.isOffered(partTimings, vlcEngine.resumablePositionMs)
+
     DisposableEffect(video.id) {
         onDispose {
-            prefsStore.recordPlaybackProgress(
-                videoId = video.id,
-                positionMs = vlcEngine.resumablePositionMs,
-                durationMs = vlcEngine.durationMs
-            )
+            // The same rule as the loop above, and the leave is where it bites hardest: closing the
+            // player mid-handover would otherwise retire the outgoing part's last position and hand it
+            // to the part whose name was on screen. The credits verdict below stays keyed to this part's
+            // own name because [headBelongsTo] already refuses to answer for a head it has not painted.
+            vlcEngine.headOwnerVideoId?.let { headOwner ->
+                prefsStore.recordPlaybackProgress(
+                    videoId = headOwner,
+                    positionMs = vlcEngine.resumablePositionMs,
+                    durationMs = vlcEngine.durationMs
+                )
+            }
+            // Walked away from during the roll is a finished part. The player's own end report is the
+            // other way to earn the tick and this does not replace it: a part nobody has marked, or one
+            // whose marks [TimingTrust] refused, still has to run to its own end like it always did.
+            //
+            // [ArcVlcPlayerEngine.headBelongsTo] is read rather than assumed, because a handover moves the
+            // name ahead of the bytes and only a part that has painted can say where inside itself it
+            // stopped. The marks are looked up by this part's own name, from the store, at the moment of
+            // the leave — measured on the emulator, where E5's tap out found E6's credits start.
+            val ownName = MediaNameParser.parse(video.title)
+            val timings = prefsStore
+                .timingFor(timingRequestFor(titleCard?.providerId, ownName, timingSeasons))
+                ?.let { TimingTrust.believe(it, vlcEngine.durationMs) }
+            if (timings != null && vlcEngine.headBelongsTo(video.id) &&
+                StoryIsOver.isOver(timings, vlcEngine.resumablePositionMs)
+            ) {
+                prefsStore.rememberWatchedThroughTheCredits(video.id)
+            }
         }
     }
 
@@ -9611,11 +10830,12 @@ private fun HeroVlcVideoPlayerScreen(
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
-            prefsStore.recordPlaybackProgress(
-                videoId = video.id,
-                positionMs = vlcEngine.resumablePositionMs,
-                durationMs = vlcEngine.durationMs
-            )
+            // No minute is filed from here. This effect's keys are the screen and the engine, and both
+            // outlive every episode on the mount, so the closure belongs to the first part this player
+            // ever opened — the leave above is the one that travels with the name and the head.
+            // Measured on the emulator: a two-episode sitting wrote the second one's play head and
+            // length under the first one's id, and the episode that had just earned its tick was read
+            // back as half-watched.
             lifecycleOwner.lifecycle.removeObserver(observer)
             activity?.window?.let { win ->
                 val lp = win.attributes
@@ -9700,6 +10920,36 @@ private fun HeroVlcVideoPlayerScreen(
     val isInPipMode = mainActivity?.isInPipState == true
 
     /**
+     * Ask where this part's opening and credits are, and where the next one's will be.
+     *
+     * Asked with the part rather than warmed up before it: neither timing service has a batch route, so a
+     * shelf-wide pass is one request for every part of every show the viewer has ever stored, and a mark
+     * is only useful in the seconds around it. The neighbour comes along because the card naming it is
+     * drawn in the last seconds of this part, and marks that arrive after the viewer has moved on are a
+     * second too late for the opening they describe — which is also what makes the next episode's own open
+     * cost nothing, since its answer is already stored by the time it is asked for.
+     *
+     * A title matched through AniList has no TMDB id stored, and the service is keyed by that id, so those
+     * parts go without timings the same way they go without a wordmark.
+     *
+     * The season lengths are read because a long show is uploaded by its place in the whole run and names
+     * no season, while every service filing a mark files it under one. They arrive a moment after this
+     * page's first frame, so they are a key: an episode that could not be placed on the opening frame is
+     * asked about as soon as the catalogue says how long its show is, rather than going unmarked forever.
+     */
+    LaunchedEffect(video.id, titleCard?.providerId, timingSeasons) {
+        val requests = listOfNotNull(
+            timingRequestFor(titleCard?.providerId, parsedTitle, timingSeasons),
+            nextVideo?.title?.let { timingRequestFor(titleCard?.providerId, MediaNameParser.parse(it), timingSeasons) }
+        ).distinctBy { it.key }
+            .filter { prefsStore.timingFor(it) == null }
+        if (requests.isEmpty()) return@LaunchedEffect
+        SkipTimingLibrary.ask(requests) { request, answer ->
+            prefsStore.rememberEpisodeTiming(request, answer)
+        }
+    }
+
+    /**
      * Offers the next episode when this one is watched out, and hands it over unless the viewer says
      * otherwise.
      *
@@ -9719,7 +10969,8 @@ private fun HeroVlcVideoPlayerScreen(
                 durationMs = vlcEngine.durationMs,
                 waitingForBytes = vlcEngine.isBuffering || vlcEngine.isSeekWaiting,
                 knowsItsParts = playback.copySlots.isNotEmpty(),
-                hasNextPart = hasNext
+                hasNextPart = hasNext,
+                headBelongsToThisPart = vlcEngine.isHolding(video.id)
             )
         )
         if (!vlcEngine.isAtEnd || !isOffered) return@LaunchedEffect
@@ -9748,10 +10999,29 @@ private fun HeroVlcVideoPlayerScreen(
      * for an end report from a part like that means waiting forever, so from [NextUp.EARLY_OFFER_MS]
      * out the card is simply up and the viewer decides.
      *
+     * The second route in is the one that does not read a position at all. A part whose tail Telegram
+     * never finished sending is held at the last frame that really played — that is what keeps the
+     * resume point honest — and a head held at nine tenths of a part never reaches the band above. The
+     * watchdog has already said out loud that the rest is not coming, so the way out appears with the
+     * sentence rather than leaving the viewer to sit on a frozen frame and a scrubber that leads
+     * nowhere.
+     *
+     * The third thing that moves this window is the credits, and it only ever opens it wider. Somebody
+     * watching a roll has stopped needing this part a minute before the last twenty seconds of it, so the
+     * card belongs on screen when the story ends rather than when the file does. Twenty seconds stays as
+     * the floor — that is why [NextUp.withinEarlyWindow] takes whichever of the two comes first instead
+     * of choosing between them: a mark the app refuses to believe changes nothing, and timings are an
+     * improvement on the offer the phone has been living with rather than a replacement for it.
+     *
      * No countdown here. This is an offer, not a handover — the handover stays with the effect above,
      * which only runs once the player has honestly reported the end.
+     *
+     * The marks are a key because they are a value computed once per recomposition rather than a thing
+     * this loop can re-read: an answer that arrives a second after the part opens is the ordinary case,
+     * and a loop that captured the timings at the moment it started would keep offering the card at
+     * twenty seconds from the end for the whole of an episode whose credits it has just learned about.
      */
-    LaunchedEffect(video.id, declinedPartId, nextVideo?.id) {
+    LaunchedEffect(video.id, declinedPartId, nextVideo?.id, partTimings) {
         nextUpEarly = false
         if (nextVideo == null || declinedPartId == video.id) return@LaunchedEffect
         while (true) {
@@ -9763,7 +11033,10 @@ private fun HeroVlcVideoPlayerScreen(
                     // reported as buffering, and that is precisely when the way out has to stay up.
                     waitingForBytes = vlcEngine.isSeekWaiting,
                     knowsItsParts = playback.copySlots.isNotEmpty(),
-                    hasNextPart = hasNext
+                    hasNextPart = hasNext,
+                    headBelongsToThisPart = vlcEngine.isHolding(video.id),
+                    theTailNeverArrived = theTailNeverArrived,
+                    outroStartMs = partTimings?.outroStartMs
                 )
             )
             delay(1_000L)
@@ -10403,6 +11676,26 @@ private fun HeroVlcVideoPlayerScreen(
                             )
                         }
                     }
+                    // The way out of a wait the app cannot end on its own. Held to the same pill as the
+                    // sentence rather than floated as its own toast: the explanation and the one action
+                    // that can change it are one thought, and a viewer who has to hunt for the button
+                    // while a black screen is still on screen has already given up on the part.
+                    if (hudOffersRetry) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Surface(
+                            onClick = { retryDelivery() },
+                            shape = RoundedCornerShape(10.dp),
+                            color = Color.White.copy(alpha = 0.10f),
+                            contentColor = OneUiAccent
+                        ) {
+                            Text(
+                                text = "Try again",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -10997,6 +12290,42 @@ private fun HeroVlcVideoPlayerScreen(
                         )
                     }
                 }
+            }
+        }
+
+        /**
+         * Offers the way past an opening, and only to the viewer who taps it.
+         *
+         * A sibling of the chrome rather than a part of it: the controls stand down three seconds after the
+         * last touch and a title sequence runs for the better part of a minute and a half, so a button
+         * filed inside them would be hidden for nearly all of the time it is worth pressing. It takes the
+         * same bottom-right slot the next-up card stands in, and the two never have to be positioned
+         * against each other because an opening is long behind the head by the time a part is near its end.
+         *
+         * Nothing here jumps by itself. A mark is somebody else's memory of where the story starts, and a
+         * cold open that turns out to be part of the story is exactly the case an automatic skip ruins.
+         */
+        AnimatedVisibility(
+            visible = isSkipIntroOffered && !isInPipMode && !isControlsLocked,
+            enter = fadeIn(tween(160)) + slideInVertically(tween(200)) { it / 2 },
+            exit = fadeOut(tween(140)),
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(start = controlsLeft, end = controlsRight, bottom = nextUpBottom)
+        ) {
+            Surface(
+                onClick = { skipIntroToMs?.let(vlcEngine::seekTo) },
+                shape = RoundedCornerShape(18.dp),
+                color = Color.Black.copy(alpha = 0.78f),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.16f))
+            ) {
+                Text(
+                    text = "Skip intro",
+                    fontSize = 12.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp)
+                )
             }
         }
 

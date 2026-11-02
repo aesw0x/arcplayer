@@ -126,8 +126,9 @@ class BufferGuardTest {
 
     @Test
     fun aFalseEndOfFilmStillCountsAsAStall() {
-        // The player read a hole, decided the movie was over and stopped. The scrubber is at the
-        // full length by then, so the last frame genuinely shown is what says otherwise.
+        // The player read a hole, decided the movie was over and stopped. The head's own last honest
+        // minute is what says the ending is a lie, and the gap between it and the length is the whole
+        // of the evidence.
         assertTrue(
             BufferGuard.isStalled(
                 running(nowMs = 200_000L, lastTickMs = 100_000L, playing = false, watchedMs = 900_000L)
@@ -419,5 +420,131 @@ class BufferGuardTest {
                 nowMs = 200_000L, stalledSinceMs = 100_000L, settledAhead = 20 * mb
             )
         )
+    }
+
+    @Test
+    fun aPlayerThatRanOutOfFileSaysSoBeforeTheLinkGivesUp() {
+        // The starved file is the wait neither of the other admissions reaches: a restart needs six
+        // megabytes landed in front of the head, so a hole spends no attempts, and the link give-up is
+        // ninety seconds of that. Meanwhile the player has already reported running out of film.
+        assertFalse(
+            BufferGuard.isStarvedAtTheEnd(
+                nowMs = 100_000L + BufferGuard.STARVED_SPEECH_MS - 1, stalledSinceMs = 100_000L,
+                playHeadRanIntoAHole = true
+            )
+        )
+        assertTrue(
+            BufferGuard.isStarvedAtTheEnd(
+                nowMs = 100_000L + BufferGuard.STARVED_SPEECH_MS, stalledSinceMs = 100_000L,
+                playHeadRanIntoAHole = true
+            )
+        )
+    }
+
+    @Test
+    fun aQuietPlayerIsNotYetAShortFile() {
+        // A stall with no hole report is a link question, and the answer to it is the sentence about
+        // Telegram being slow. Claiming the file is short on the strength of a stopped play head alone
+        // would accuse a film whose bytes are on their way.
+        assertFalse(
+            BufferGuard.isStarvedAtTheEnd(
+                nowMs = 200_000L, stalledSinceMs = 100_000L, playHeadRanIntoAHole = false
+            )
+        )
+    }
+
+    private fun report(
+        positionMs: Long,
+        previousPositionMs: Long = 60_000L,
+        sinceTickMs: Long = 1_000L,
+        isLandingFromASeek: Boolean = false,
+        leaptToMs: Long = BufferGuard.NEVER
+    ) = BufferGuard.hasOutrunTheFilm(positionMs, previousPositionMs, sinceTickMs, isLandingFromASeek, leaptToMs)
+
+    @Test
+    fun aHeadThatMovedAtTheSpeedOfTheFilmIsBelieved() {
+        assertFalse(report(61_000L))
+        // The cap and its slack, exactly: three seconds of film in one of wall time, plus the jitter a
+        // decoder resync is allowed.
+        assertFalse(report(65_000L))
+        assertTrue(report(65_001L))
+    }
+
+    @Test
+    fun aHeadThatRacedThroughEmptySpaceIsNot() {
+        // The hole, and this is the whole of why a black screen used to read as a finished episode: the
+        // demuxer skips the bytes that never arrived and reports where it got to. The head is at the
+        // end of the film forty minutes after the last report the viewer can be believed for.
+        assertTrue(report(45 * 60_000L, sinceTickMs = 1_000L))
+        // Even a gap this short is a leap, because the slack belongs to the wall clock and not to the
+        // distance.
+        assertTrue(report(64_001L, sinceTickMs = 1L))
+    }
+
+    @Test
+    fun aMoveTheViewerAskedForIsNotTheFileRunningOut() {
+        // The aim and the arrival at the same moment: while a seek is owed its play head, the position
+        // written on the head IS the position it was sent to, so a report there is the viewer's own move.
+        assertFalse(report(40 * 60_000L, previousPositionMs = 40 * 60_000L, isLandingFromASeek = true))
+        // A hair short of it is the ordinary answer — libVLC comes back at the keyframe before its
+        // target — and a hair past it is still the same landing, measured rather than exact.
+        assertFalse(report(39 * 60_000L + 59_000L, previousPositionMs = 40 * 60_000L, isLandingFromASeek = true))
+        assertFalse(
+            report(
+                40 * 60_000L + BufferGuard.SEEK_LANDING_SLACK_MS,
+                previousPositionMs = 40 * 60_000L,
+                isLandingFromASeek = true
+            )
+        )
+    }
+
+    @Test
+    fun aSeekOnlyExcusesThePositionItWasAimedAt() {
+        // The exemption belongs to the seek, not to whatever the file reports next. Sent to nine tenths
+        // of a part and coming back with the head at its full length is the demuxer having run out of
+        // file, and the re-open that aimed there never asked for the last tenth.
+        val length = 45 * 60_000L
+        assertTrue(report(length, previousPositionMs = 40 * 60_000L, isLandingFromASeek = true))
+        assertTrue(
+            report(
+                40 * 60_000L + BufferGuard.SEEK_LANDING_SLACK_MS + 1L,
+                previousPositionMs = 40 * 60_000L,
+                isLandingFromASeek = true
+            )
+        )
+    }
+
+    @Test
+    fun aRefusedLeapStaysRefusedWhileTheHeadSitsOnIt() {
+        // The second report is the one that used to buy the ending. Measured against the report before
+        // it, a head parked at the length travels nothing in a second of wall time, and zero travel is
+        // the very evidence the dwell rule asks for — so a position the app has already refused is
+        // refused again, however quiet the file has gone.
+        val length = 45 * 60_000L
+        assertTrue(report(length, previousPositionMs = length, leaptToMs = length))
+        assertTrue(report(length, previousPositionMs = length, sinceTickMs = 30_000L, leaptToMs = length))
+        assertTrue(report(length, previousPositionMs = length, isLandingFromASeek = true, leaptToMs = length))
+    }
+
+    @Test
+    fun aHeadThatLeftTheRefusedPositionIsJudgedOnItsOwnTravel() {
+        val length = 45 * 60_000L
+        // Bytes arrived and the film went on: the head is somewhere the refusal was not, so the ordinary
+        // rate rule decides, and it believes a second of film in a second of wall time.
+        assertFalse(report(40 * 60_000L + 1_000L, previousPositionMs = 40 * 60_000L, leaptToMs = length))
+        // A rewind out of the hole is not a leap either.
+        assertFalse(report(61_000L, leaptToMs = length))
+    }
+
+    @Test
+    fun aReportWithNothingBeforeItHasNoDistanceToJudge() {
+        // The player's first word about a file says where it started, which on a resume is the saved
+        // position and nothing to do with a hole.
+        assertFalse(report(40 * 60_000L, sinceTickMs = 0L))
+    }
+
+    @Test
+    fun aHeadThatWentBackwardsRanNothing() {
+        assertFalse(report(30_000L))
     }
 }

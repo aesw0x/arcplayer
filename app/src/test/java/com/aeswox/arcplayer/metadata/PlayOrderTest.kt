@@ -1,6 +1,7 @@
 package com.aeswox.arcplayer.metadata
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -103,6 +104,33 @@ class PlayOrderTest {
         )
 
         assertEquals(PlayOrder.Play(22L, 0L), picked)
+    }
+
+    @Test
+    fun theEpisodeOnScreenBeatsAnEarlierOneNobodyEverOpened() {
+        // Episode 1 was watched through, episode 2 was never touched, and episode 3 is the one that got
+        // opened and then kept. Play follows the viewer rather than walking back to the gap, because that
+        // is the only way this button and the Continue Watching row say the same sentence.
+        val picked = play(
+            slots = listOf(listOf(11L), listOf(21L), listOf(31L)),
+            resume = mapOf(11L to ONE_HOUR, 31L to TEN_MINUTES),
+            lengths = mapOf(11L to ONE_HOUR, 21L to ONE_HOUR, 31L to ONE_HOUR),
+            lastPlayed = mapOf(11L to LAST_WEEK, 31L to LAST_NIGHT)
+        )
+
+        assertEquals(PlayOrder.Play(31L, TEN_MINUTES), picked)
+    }
+
+    @Test
+    fun twoHalfWatchedPartsAreSettledByWhichWasInsideMostRecently() {
+        val picked = play(
+            slots = listOf(listOf(11L), listOf(21L)),
+            resume = mapOf(11L to TWENTY_MINUTES, 21L to FIVE_MINUTES),
+            lengths = mapOf(11L to ONE_HOUR, 21L to ONE_HOUR),
+            lastPlayed = mapOf(11L to LAST_WEEK, 21L to LAST_NIGHT)
+        )
+
+        assertEquals(PlayOrder.Play(21L, FIVE_MINUTES), picked)
     }
 
     @Test
@@ -280,6 +308,47 @@ class PlayOrderTest {
             lengthsMs = mapOf(11L to ONE_HOUR, 21L to ONE_HOUR, 31L to ONE_HOUR)
         )
         assertEquals(PlayOrder.Progress(21L, FIVE_MINUTES, ONE_HOUR, 55 * MINUTE), gone)
+    }
+
+    @Test
+    fun thePartLastWatchedTonightOutranksAnOlderOneStillOpen() {
+        // Episode 3 was put down twenty minutes in and never came back to, and episode 5 is what is
+        // actually on screen this week. The row follows the viewer: a card that read the season from the
+        // top would spend every night from here offering the episode they walked away from.
+        val gone = PlayOrder.progress(
+            slots = listOf(listOf(11L), listOf(21L), listOf(31L)),
+            resumeMs = mapOf(11L to TWENTY_MINUTES, 31L to FIVE_MINUTES),
+            lengthsMs = mapOf(11L to ONE_HOUR, 21L to ONE_HOUR, 31L to ONE_HOUR),
+            lastPlayedMs = mapOf(11L to LAST_WEEK, 21L to LAST_WEEK, 31L to LAST_NIGHT)
+        )
+        assertEquals(PlayOrder.Progress(31L, FIVE_MINUTES, ONE_HOUR, 55 * MINUTE), gone)
+    }
+
+    @Test
+    fun twoOpenPartsWithNoOpenBehindThemFallBackToTheEarlierOne() {
+        // Nothing says which of these came first, and the honest answer is the one the row gave before
+        // it knew about recency at all: offer the earlier episode rather than guess.
+        val gone = PlayOrder.progress(
+            slots = listOf(listOf(11L), listOf(21L)),
+            resumeMs = mapOf(11L to TEN_MINUTES, 21L to FIVE_MINUTES),
+            lengthsMs = mapOf(11L to ONE_HOUR, 21L to ONE_HOUR)
+        )
+        assertEquals(PlayOrder.Progress(11L, TEN_MINUTES, ONE_HOUR, 50 * MINUTE), gone)
+    }
+
+    @Test
+    fun aPartIsJudgedByTheNewestStampAnywhereInsideIt() {
+        // The 1080p is the copy this device holds, so it is the copy the row names. The minute that makes
+        // this part the most recent watch was earned on the smaller upload the viewer actually used, and
+        // reading the stamp off the named copy alone would rank the episode behind last week's.
+        val gone = PlayOrder.progress(
+            slots = listOf(listOf(11L), listOf(22L, 21L)),
+            resumeMs = mapOf(11L to TEN_MINUTES, 21L to FIVE_MINUTES),
+            lengthsMs = mapOf(11L to ONE_HOUR, 21L to ONE_HOUR, 22L to ONE_HOUR),
+            lastPlayedMs = mapOf(11L to LAST_NIGHT, 21L to LAST_NIGHT + MINUTE),
+            savedIds = setOf(22L)
+        )
+        assertEquals(PlayOrder.Progress(22L, FIVE_MINUTES, ONE_HOUR, 55 * MINUTE), gone)
     }
 
     @Test
@@ -478,6 +547,128 @@ class PlayOrderTest {
         assertEquals(PlayOrder.Progress(11L, TEN_MINUTES, ONE_HOUR, 50 * MINUTE), gone)
     }
 
+    @Test
+    fun aSeasonNobodyHasTouchedShowsNoProgressAnywhere() {
+        val season = PlayOrder.standing(
+            episodes = listOf(1 to listOf(11L), 2 to listOf(21L)),
+            resumeMs = emptyMap()
+        )
+
+        assertEquals(
+            listOf(
+                PlayOrder.EpisodeStanding(1, PlayOrder.EpisodeWatch.UNWATCHED, 0f, true),
+                PlayOrder.EpisodeStanding(2, PlayOrder.EpisodeWatch.UNWATCHED, 0f, true)
+            ),
+            season.episodes
+        )
+        assertEquals(0, season.watched)
+        assertEquals(2, season.held)
+        assertEquals(0, season.missing)
+    }
+
+    @Test
+    fun anEpisodePutDownHalfwayIsStartedAndCarriesItsFraction() {
+        val season = PlayOrder.standing(
+            episodes = listOf(1 to listOf(11L), 2 to listOf(21L)),
+            resumeMs = mapOf(11L to TEN_MINUTES, 21L to 30 * MINUTE),
+            lengthsMs = mapOf(11L to ONE_HOUR, 21L to ONE_HOUR)
+        )
+
+        assertEquals(PlayOrder.EpisodeWatch.STARTED, season.episodes[1].watch)
+        assertEquals(0.5f, season.episodes[1].fraction, 0.001f)
+    }
+
+    @Test
+    fun anEpisodeWatchedThroughIsProvedByItsFinishStampBecauseNoPositionSurvivesTheTail() {
+        val season = PlayOrder.standing(
+            episodes = listOf(1 to listOf(11L), 2 to listOf(21L)),
+            resumeMs = mapOf(21L to TEN_MINUTES),
+            lengthsMs = mapOf(11L to ONE_HOUR, 21L to ONE_HOUR),
+            finishedMs = mapOf(11L to LAST_NIGHT)
+        )
+
+        // Episode 1 ran to its last minute, and the player deleted the position that proved it. Only
+        // the stamp its own ending left separates it from episode 3 nobody has clicked.
+        assertEquals(PlayOrder.EpisodeStanding(1, PlayOrder.EpisodeWatch.WATCHED, 1f, true), season.episodes[0])
+        assertEquals(1, season.watched)
+    }
+
+    @Test
+    fun aPositionAtTheTailIsAFinishRatherThanAHalfWayMark() {
+        val season = PlayOrder.standing(
+            episodes = listOf(1 to listOf(11L)),
+            resumeMs = mapOf(11L to 59 * MINUTE),
+            lengthsMs = mapOf(11L to ONE_HOUR)
+        )
+
+        // Fifty-nine minutes of a sixty is the window the player erases progress inside, so a position
+        // that close to the end is a viewer who left rather than one who is watching.
+        assertEquals(PlayOrder.EpisodeWatch.WATCHED, season.episodes[0].watch)
+        assertEquals(1f, season.episodes[0].fraction, 0.001f)
+    }
+
+    @Test
+    fun anEpisodeWithNoKnownLengthIsStartedButShowsNoFraction() {
+        val season = PlayOrder.standing(
+            episodes = listOf(1 to listOf(11L)),
+            resumeMs = mapOf(11L to TEN_MINUTES),
+            lengthsMs = emptyMap()
+        )
+
+        // A file the shelf never measured still has minutes in it — progress is only erased at the
+        // tail — but a bar cannot be drawn against a length nobody knows.
+        assertEquals(PlayOrder.EpisodeWatch.STARTED, season.episodes[0].watch)
+        assertEquals(0f, season.episodes[0].fraction, 0.001f)
+    }
+
+    @Test
+    fun theDeepestCopyOfAnEpisodeIsTheOneItsBarReads() {
+        val season = PlayOrder.standing(
+            episodes = listOf(1 to listOf(12L, 11L)),
+            resumeMs = mapOf(12L to 20 * MINUTE, 11L to 50 * MINUTE),
+            lengthsMs = mapOf(12L to ONE_HOUR, 11L to ONE_HOUR)
+        )
+
+        // Twenty minutes in the 4K and fifty in the 720p are fifty minutes into the episode, so the bar
+        // sits at the deepest minute any copy earned rather than the one this row happens to open.
+        assertEquals(0.833f, season.episodes[0].fraction, 0.002f)
+    }
+
+    @Test
+    fun aStalePositionLeftBesideAFinishedCopyUnderstatesRatherThanOverstates() {
+        val season = PlayOrder.standing(
+            episodes = listOf(1 to listOf(12L, 11L)),
+            resumeMs = mapOf(11L to TEN_MINUTES),
+            lengthsMs = mapOf(12L to ONE_HOUR, 11L to ONE_HOUR),
+            finishedMs = mapOf(12L to LAST_NIGHT)
+        )
+
+        // The episode was finished on the copy that has no position now, and ten minutes are still
+        // stored on the lesser one, stamp and all. Reading the finish would leave a bar at a tenth of its
+        // length under a "watched" tick, so the count loses one instead.
+        assertEquals(PlayOrder.EpisodeWatch.STARTED, season.episodes[0].watch)
+        assertEquals(0, season.watched)
+    }
+
+    @Test
+    fun episodesTheChannelNeverUploadedAreCountedApartRatherThanInsideTheRun() {
+        val season = PlayOrder.standing(
+            episodes = listOf(
+                1 to listOf(11L), 2 to listOf(21L), 3 to emptyList(), 4 to emptyList(), 5 to listOf(51L)
+            ),
+            resumeMs = mapOf(11L to 59 * MINUTE, 21L to 59 * MINUTE),
+            lengthsMs = mapOf(11L to ONE_HOUR, 21L to ONE_HOUR, 51L to ONE_HOUR)
+        )
+
+        // Two watched, one still to come, two that do not exist on this device. "2 of 5" would promise
+        // the absent pair; the denominator is only what can be played.
+        assertEquals(2, season.watched)
+        assertEquals(3, season.held)
+        assertEquals(2, season.missing)
+        assertEquals(PlayOrder.EpisodeWatch.UNWATCHED, season.episodes[2].watch)
+        assertEquals(false, season.episodes[2].held)
+    }
+
     private companion object {
         const val MINUTE = 60_000L
         const val FIVE_MINUTES = 5 * MINUTE
@@ -485,7 +676,8 @@ class PlayOrderTest {
         const val TWENTY_MINUTES = 20 * MINUTE
         const val ONE_HOUR = 60 * MINUTE
 
-        // Wall-clock stamps for "when this copy was last opened"; only their order is read.
+        // Wall-clock stamps for the two "when" maps: an open is read by its order, a finish only for the
+        // fact that the player wrote one at all.
         const val LAST_WEEK = 1_760_000_000_000L
         const val LAST_NIGHT = 1_761_000_000_000L
     }
