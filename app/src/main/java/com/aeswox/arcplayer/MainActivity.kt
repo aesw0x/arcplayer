@@ -121,6 +121,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.mandatorySystemGestures
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.offset
@@ -10892,6 +10893,22 @@ private fun HeroVlcVideoPlayerScreen(
     val layoutDirection = LocalLayoutDirection.current
     val controlsLeft = maxOf(controlsMargin, with(density) { WindowInsets.safeDrawing.getLeft(this, layoutDirection).toDp() })
     val controlsRight = maxOf(controlsMargin, with(density) { WindowInsets.safeDrawing.getRight(this, layoutDirection).toDp() })
+    // The strips Android keeps for itself: back on the left and right, home along the bottom, the shade
+    // grab at the top. Every system swipe starts inside one of them, so a drag that starts outside all
+    // four cannot be any of them. The floors cover the immersive case, where a hidden bar reports no
+    // inset even though its gesture is still live.
+    val shadeBandPx = with(density) {
+        maxOf(36.dp.toPx(), WindowInsets.mandatorySystemGestures.getTop(this).toFloat())
+    }
+    val homeBandPx = with(density) {
+        maxOf(20.dp.toPx(), WindowInsets.mandatorySystemGestures.getBottom(this).toFloat())
+    }
+    val backBandLeftPx = with(density) {
+        maxOf(24.dp.toPx(), WindowInsets.mandatorySystemGestures.getLeft(this, layoutDirection).toFloat())
+    }
+    val backBandRightPx = with(density) {
+        maxOf(24.dp.toPx(), WindowInsets.mandatorySystemGestures.getRight(this, layoutDirection).toFloat())
+    }
     val compactToolbar = configuration.screenWidthDp.dp - controlsLeft - controlsRight < 440.dp
     var bottomControlsHeight by remember { mutableIntStateOf(0) }
     var topControlsHeight by remember { mutableIntStateOf(0) }
@@ -11220,7 +11237,14 @@ private fun HeroVlcVideoPlayerScreen(
                     }
                 }
             }
-            .pointerInput(isControlsLocked, trackSheet) {
+            .pointerInput(
+                isControlsLocked,
+                trackSheet,
+                shadeBandPx,
+                homeBandPx,
+                backBandLeftPx,
+                backBandRightPx
+            ) {
                 if (isControlsLocked || trackSheet != TrackSheet.NONE) return@pointerInput
                 val touchSlop = viewConfiguration.touchSlop
 
@@ -11230,6 +11254,13 @@ private fun HeroVlcVideoPlayerScreen(
                     val startY = down.position.y
                     val screenW = size.width.toFloat().coerceAtLeast(1f)
                     val screenH = size.height.toFloat().coerceAtLeast(1f)
+
+                    // Standing down before the touch slop decides anything is what hands the system's
+                    // own swipes back. Nothing is consumed, so the recognisers up the stack still see
+                    // the whole stream.
+                    if (startX < backBandLeftPx || startX > screenW - backBandRightPx ||
+                        startY < shadeBandPx || startY > screenH - homeBandPx
+                    ) return@awaitEachGesture
 
                     var mode = ActiveGestureMode.NONE
                     var totalDx = 0f
@@ -11289,7 +11320,10 @@ private fun HeroVlcVideoPlayerScreen(
                             when (mode) {
                                 ActiveGestureMode.BRIGHTNESS -> {
                                     change.consume()
-                                    val deltaBright = -dy / (screenH * 0.65f)
+                                    // The screen's short edge in landscape is the whole travel budget, so the
+                                    // finger cannot outrun the scale and clamp against the ceiling before the
+                                    // viewer meant to reach it. The top stays 100% — there is nothing above it.
+                                    val deltaBright = -dy / screenH
                                     currentBrightness = (currentBrightness + deltaBright).coerceIn(0.02f, 1.0f)
                                     activity?.window?.let { win ->
                                         val lp = win.attributes
@@ -11304,7 +11338,10 @@ private fun HeroVlcVideoPlayerScreen(
 
                                 ActiveGestureMode.VOLUME -> {
                                     change.consume()
-                                    val deltaVolPct = (-dy / (screenH * 0.65f)) * 150f
+                                    // 100 points per full-height sweep in both bands: silence to the system's
+                                    // ceiling is one drag, and the software boost above it costs a second, so
+                                    // a stroke that overshoots 100% cannot arrive at 200% in the same motion.
+                                    val deltaVolPct = (-dy / screenH) * 100f
                                     currentVolumePercent = (currentVolumePercent + deltaVolPct).coerceIn(0f, 200f)
                                     val pctInt = currentVolumePercent.roundToInt()
 
