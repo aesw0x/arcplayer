@@ -238,6 +238,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -296,6 +297,7 @@ import com.aeswox.arcplayer.cloud.CloudRepository
 import com.aeswox.arcplayer.cloud.CloudSession
 import com.aeswox.arcplayer.cloud.CloudVideoItem
 import com.aeswox.arcplayer.cloud.CloudWindowPlanner
+import com.aeswox.arcplayer.cloud.PausedWindow
 import com.aeswox.arcplayer.cloud.DownloadEntry
 import com.aeswox.arcplayer.cloud.DownloadLedger
 import com.aeswox.arcplayer.cloud.DownloadNotifier
@@ -335,6 +337,7 @@ import com.aeswox.arcplayer.metadata.toTimingAnswer
 import com.aeswox.arcplayer.metadata.titleDetailKey
 import com.aeswox.arcplayer.playback.FrameRateMatch
 import com.aeswox.arcplayer.playback.NextUp
+import com.aeswox.arcplayer.playback.ResumeBlob
 import com.aeswox.arcplayer.playback.ResumeOutcome
 import com.aeswox.arcplayer.playback.ResumeRules
 import com.aeswox.arcplayer.playback.SeekHold
@@ -345,6 +348,10 @@ import com.aeswox.arcplayer.playback.TimingTrust
 import com.aeswox.arcplayer.playback.TrackChoice
 import com.aeswox.arcplayer.stream.ByteRate
 import com.aeswox.arcplayer.stream.BufferGuard
+import com.aeswox.arcplayer.tvserver.TvAddress
+import com.aeswox.arcplayer.tvserver.TvPairing
+import com.aeswox.arcplayer.tvserver.TvServerConfigStore
+import com.aeswox.arcplayer.tvserver.TvServerService
 import dev.chrisbanes.haze.HazeState
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -528,7 +535,8 @@ enum class VideoSortOrder(val label: String) {
 
 @Stable
 class ArcPreferencesStore(context: Context) {
-    private val prefs = context.applicationContext.getSharedPreferences("arc_player_prefs", Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val prefs = appContext.getSharedPreferences("arc_player_prefs", Context.MODE_PRIVATE)
 
     val resumePositions = mutableStateMapOf<Long, Long>()
     var watchHistoryIds by mutableStateOf<List<Long>>(emptyList())
@@ -724,14 +732,7 @@ class ArcPreferencesStore(context: Context) {
                 if (id != null && at > 0L) watchedAt[id] = at
             }
 
-            val posJson = JSONObject(prefs.getString("resume_positions", "{}") ?: "{}")
-            posJson.keys().forEach { key ->
-                val id = key.toLongOrNull()
-                val pos = posJson.optLong(key, 0L)
-                if (id != null && pos > 0L) {
-                    resumePositions[id] = pos
-                }
-            }
+            ResumeBlob.read(appContext).forEach { (id, pos) -> resumePositions[id] = pos }
 
             val finishedJson = JSONObject(prefs.getString("film_finished_at", "{}") ?: "{}")
             finishedJson.keys().forEach { key ->
@@ -957,7 +958,7 @@ class ArcPreferencesStore(context: Context) {
      */
     fun rememberWatchedThroughTheCredits(videoId: Long) {
         rememberFinishedAt(videoId)
-        if (resumePositions.remove(videoId) != null) persistResumePositions()
+        if (resumePositions.remove(videoId) != null) ResumeBlob.remove(appContext, videoId)
     }
 
     /**
@@ -1078,24 +1079,19 @@ class ArcPreferencesStore(context: Context) {
         }
 
         val stored = resumePositions[videoId]
-        val changed = when (ResumeRules.decide(positionMs, durationMs)) {
+        when (ResumeRules.decide(positionMs, durationMs)) {
             ResumeOutcome.STORE -> if (stored != positionMs) {
                 resumePositions[videoId] = positionMs
-                true
-            } else {
-                false
+                ResumeBlob.put(appContext, videoId, positionMs)
             }
 
             ResumeOutcome.DROP -> if (stored != null) {
                 resumePositions.remove(videoId)
-                true
-            } else {
-                false
+                ResumeBlob.remove(appContext, videoId)
             }
 
-            ResumeOutcome.KEEP -> false
+            ResumeOutcome.KEEP -> Unit
         }
-        if (changed) persistResumePositions()
     }
 
     /**
@@ -1109,15 +1105,24 @@ class ArcPreferencesStore(context: Context) {
         if (positionMs <= 0L) return
         if ((resumePositions[videoId] ?: 0L) >= positionMs) return
         resumePositions[videoId] = positionMs
-        persistResumePositions()
+        ResumeBlob.put(appContext, videoId, positionMs)
     }
 
-    private fun persistResumePositions() {
-        val obj = JSONObject()
-        resumePositions.forEach { (id, pos) ->
-            obj.put(id.toString(), pos)
+    /**
+     * Take back whatever a television wrote while this screen was away.
+     *
+     * The map above is a mirror of the stored blob rather than its owner, and a mirror only keeps up while
+     * somebody looks at it: a living room that watched half a film and posted its place has changed the
+     * blob underneath, and without this the phone would go on offering the minute it remembered that
+     * morning. ON_RESUME is the honest moment — a viewer coming back to the app is exactly when a stale
+     * bookmark would be tapped.
+     */
+    fun refreshResumePositions() {
+        val onDisk = ResumeBlob.read(appContext)
+        onDisk.forEach { (id, positionMs) ->
+            if (resumePositions[id] != positionMs) resumePositions[id] = positionMs
         }
-        prefs.edit().putString("resume_positions", obj.toString()).apply()
+        resumePositions.keys.filter { it !in onDisk }.forEach { resumePositions.remove(it) }
     }
 
     /**
@@ -1191,9 +1196,11 @@ class ArcPreferencesStore(context: Context) {
         watchHistoryIds = emptyList()
         resumePositions.clear()
         finishedAt.clear()
+        // Cleared through the blob's own owner rather than from this map, because a television can have
+        // written places for films this screen never loaded — wiping the mirror would leave those behind.
+        ResumeBlob.clear(appContext)
         prefs.edit()
             .remove("watch_history")
-            .remove("resume_positions")
             .remove("film_finished_at")
             .apply()
     }
@@ -2097,6 +2104,18 @@ class ArcVlcPlayerEngine(
         private set
 
     /**
+     * Whether that quiet is specifically the pause button.
+     *
+     * [stoppedOnPurpose] cannot answer this and has to stay broad: a background stop, a drag that
+     * walked away from the film and a step onto the next part are all deliberate silences the watchdog
+     * must not re-open. But the download window walking forward while a film sits stopped is only ever
+     * worth its bytes to someone who meant to come back, and every one of those other silences is a
+     * viewer who has gone.
+     */
+    var pausedByViewer by mutableStateOf(false)
+        private set
+
+    /**
      * Quiet because the bytes are not there rather than because the viewer asked. The HUD shows the
      * same wait for this as it does for a seek, and the watchdog presses play again once they arrive.
      */
@@ -2365,6 +2384,7 @@ class ArcVlcPlayerEngine(
         isSeekWaiting = false
         pausedForSeek = false
         stoppedOnPurpose = false
+        pausedByViewer = false
         isBuffering = false
         videoLayoutKnown = false
         lastTickAtMs = BufferGuard.NEVER
@@ -2512,6 +2532,7 @@ class ArcVlcPlayerEngine(
         if (mediaPlayer.isPlaying) {
             pausedForSeek = false
             stoppedOnPurpose = true
+            pausedByViewer = true
             mediaPlayer.pause()
         } else {
             if (currentPositionMs >= durationMs - 200L && durationMs > 0L) {
@@ -2523,6 +2544,7 @@ class ArcVlcPlayerEngine(
             }
             pausedForSeek = false
             stoppedOnPurpose = false
+            pausedByViewer = false
             mediaPlayer.play()
         }
     }
@@ -2868,6 +2890,7 @@ class ArcVlcPlayerEngine(
      */
     fun standDown() {
         stoppedOnPurpose = true
+        pausedByViewer = false
         pausedForSeek = false
         isPlaying = false
         isBuffering = false
@@ -2887,6 +2910,9 @@ class ArcVlcPlayerEngine(
             // A fetch landing after this must not press play again behind the viewer's back.
             pausedForSeek = false
             stoppedOnPurpose = true
+            // This is the app's pause rather than the viewer's — leaving, backgrounding, a step — so it
+            // buys no lookahead. Nobody has said they are coming back to these bytes.
+            pausedByViewer = false
             mediaPlayer.pause()
         }
     }
@@ -3454,6 +3480,9 @@ fun ArcPlayerHomeScreen() {
         val lifecycleObserver = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 refreshMediaLibrary(false)
+                // A paired television posts the place it watched to while this screen is in a pocket, and
+                // nothing else here would ever notice: the map the grid reads was loaded once at launch.
+                prefsStore.refreshResumePositions()
             }
         }
         lifecycleOwner.lifecycle.addObserver(lifecycleObserver)
@@ -8841,6 +8870,9 @@ private fun SettingsContent(
     // again — which is also the moment the viewer has most likely just come back from changing one.
     var exemptFromSleep by remember { mutableStateOf(isExemptFromSleep(context)) }
     var notificationsAllowed by remember { mutableStateOf(DownloadNotifier.canNotify(context)) }
+    // The TV door is this app's own answer rather than the system's, so unlike the two above it is not
+    // re-read on resume: nothing moves it except the switch below.
+    var tvServer by remember { mutableStateOf(TvServerConfigStore.load(context)) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         exemptFromSleep = isExemptFromSleep(context)
         notificationsAllowed = DownloadNotifier.canNotify(context)
@@ -8992,6 +9024,143 @@ private fun SettingsContent(
                         }
                         TextButton(onClick = { openAppSettings(context) }) {
                             Text("Open", color = OneUiAccent)
+                        }
+                    }
+                }
+            }
+        }
+
+        item(key = "menu_tv_access") {
+            val waitingPairings by TvPairing.pending.collectAsState()
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = OneUiCardSurface,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Text(
+                        text = "TV access",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = OneUiTextPrimary
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Serve films to a TV", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                "A TV on the same Wi-Fi browses and plays what this phone is holding. " +
+                                    "Only films fully downloaded are offered.",
+                                fontSize = 12.sp,
+                                color = OneUiTextSecondary
+                            )
+                        }
+                        Switch(
+                            checked = tvServer.enabled,
+                            onCheckedChange = { want ->
+                                tvServer = tvServer.copy(enabled = want)
+                                // Stored before the service is told, because the service reads its own
+                                // picture from disk rather than from this screen.
+                                TvServerConfigStore.save(context, tvServer)
+                                if (want) TvServerService.start(context) else TvServerService.stop(context)
+                            }
+                        )
+                    }
+
+                    AnimatedVisibility(visible = tvServer.enabled) {
+                        // The address is still worth reading out loud, because that is what the TV types if
+                        // its own network sweep missed this phone. The key below is never typed: a TV that
+                        // pairs gets one over the wire, and this line exists so a hand-entered setup or a
+                        // re-pair after "New" can be done at all.
+                        val host = remember { TvAddress.lanHost() }
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(
+                                text = if (host == null) {
+                                    "This phone has no address on a network a TV can see."
+                                } else {
+                                    "http://$host:${tvServer.port}"
+                                },
+                                fontSize = 13.sp,
+                                fontFamily = if (host == null) FontFamily.Default else FontFamily.Monospace,
+                                color = if (host == null) OneUiTextSecondary else OneUiTextPrimary
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Access key", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                                    Text(
+                                        tvServer.token,
+                                        fontSize = 12.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = OneUiTextSecondary
+                                    )
+                                }
+                                TextButton(
+                                    onClick = {
+                                        val fresh = TvServerConfigStore.rotateToken(context)
+                                        tvServer = tvServer.copy(token = fresh)
+                                        // The running server keeps the key it was built with, so a new one
+                                        // only means something once the port is rebound.
+                                        TvServerService.restart(context)
+                                    }
+                                ) {
+                                    Text("New", color = OneUiAccent)
+                                }
+                            }
+
+                            if (waitingPairings.isNotEmpty()) {
+                                LaunchedEffect(waitingPairings.isEmpty()) {
+                                    // A code dies on its own at 120 s and nothing pushes that here, so a
+                                    // card left open would keep offering a tap that can no longer be honoured.
+                                    while (waitingPairings.isNotEmpty()) {
+                                        delay(1000)
+                                        TvPairing.sweep()
+                                    }
+                                }
+                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Text(
+                                        "Waiting for you",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = OneUiTextSecondary
+                                    )
+                                    waitingPairings.forEach { pairing ->
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    pairing.tvName,
+                                                    fontSize = 14.sp,
+                                                    fontWeight = FontWeight.Medium,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Text(
+                                                    "Code ${pairing.code}",
+                                                    fontSize = 12.sp,
+                                                    fontFamily = FontFamily.Monospace,
+                                                    color = OneUiTextSecondary
+                                                )
+                                            }
+                                            TextButton(onClick = { TvPairing.answer(pairing.code, approved = false) }) {
+                                                Text("Deny", color = OneUiTextSecondary)
+                                            }
+                                            TextButton(onClick = { TvPairing.answer(pairing.code, approved = true) }) {
+                                                Text("Allow", color = OneUiAccent)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -9963,6 +10132,15 @@ private fun TitleWordmark(wordmark: Bitmap, modifier: Modifier = Modifier) {
     )
 }
 
+/**
+ * How narrow a tinted credit stretch may be on the seek track before it is widened.
+ *
+ * A mark can be believed and still be a hair wide, and a band nobody can see is a band that tells
+ * nobody the credits have started. Percent rather than pixels because the same floor has to hold on a
+ * phone held sideways and on a tablet. Openings are exempt — see the seek track.
+ */
+private const val MIN_MARK_BAND_PERCENT = 1.5f
+
 @OptIn(ExperimentalSharedTransitionApi::class, ExperimentalMaterial3Api::class)
 @Composable
 private fun HeroVlcVideoPlayerScreen(
@@ -10102,6 +10280,13 @@ private fun HeroVlcVideoPlayerScreen(
      * pill: this one is read for the whole length of a wait, not for the moment a gesture ends.
      */
     var seekStageText by remember(video.id) { mutableStateOf("") }
+
+    /**
+     * How far into the film a paused cloud copy has bytes on disk, or zero when nothing is describing a
+     * pause. The seek track draws this as the band ahead of the thumb, because film arriving in silence
+     * behind a stopped picture is indistinguishable from a player that has given up.
+     */
+    var pausedBufferedToMs by remember(video.id) { mutableStateOf(0L) }
 
     var zoomScale by remember { mutableFloatStateOf(1f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
@@ -10489,6 +10674,7 @@ private fun HeroVlcVideoPlayerScreen(
         var admittedSlowly = false
         var lastHeadMs = -1L
         var headMovedAtMs = BufferGuard.NEVER
+        var pausedPumpStopped = false
         while (true) {
             val durationMs = vlcEngine.durationMs
             val headMs = vlcEngine.resumablePositionMs
@@ -10500,6 +10686,10 @@ private fun HeroVlcVideoPlayerScreen(
             if (headMs != lastHeadMs) {
                 lastHeadMs = headMs
                 headMovedAtMs = now
+                // A head that moved while the film was stopped is a new place to be counting cushion
+                // from, so the cap gets measured again rather than being remembered against a position
+                // the viewer has left.
+                pausedPumpStopped = false
             }
             // The only thing that forgives the attempt count is the film getting clear of the spot it
             // keeps dying in. Two seconds used to do it, and that is what made a stall loop: re-opening at
@@ -10610,6 +10800,40 @@ private fun HeroVlcVideoPlayerScreen(
                     }
                     hudOffersRetry = true
                 }
+            }
+            // A viewer who pressed pause on a slow link is usually buying time, and the window that was
+            // already requested carries them exactly one hop — about a minute of a big file. This walks
+            // it forward past the pause point, then stops. Its own branch, and not the stall one above,
+            // because that one puts a buffering screen over the picture and presses play again when its
+            // bytes land, and a film somebody stopped wants neither of those.
+            if (vlcEngine.pausedByViewer) {
+                // Only while the screen is on and the film is on screen. This is cushion for a wait
+                // beside the phone, not a download to finish later — the keep queue is what survives a
+                // pocket, and it survives it on purpose.
+                if (!pausedPumpStopped &&
+                    lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) &&
+                    openedMedia != null &&
+                    durationMs > 1L && !vlcEngine.isSeekWaiting && !vlcEngine.isCatchingUpToItsPosition
+                ) {
+                    val headBytes = repository.cachedByteOffset(source, headMs, durationMs)
+                    val pump = runCatching {
+                        repository.pumpPausedWindow(source, headBytes)
+                    }.onFailure { android.util.Log.w("ArcCloud", "paused pump failed", it) }.getOrNull()
+                    if (pump != null) {
+                        if (pump.window is PausedWindow.Sufficient) pausedPumpStopped = true
+                        if (pump.readableAheadBytes > 0L && source.sizeBytes > 0L) {
+                            val bufferedToBytes = (headBytes + pump.readableAheadBytes)
+                                .coerceAtMost(source.sizeBytes)
+                            pausedBufferedToMs = (bufferedToBytes * durationMs / source.sizeBytes)
+                                .coerceIn(headMs, durationMs)
+                        }
+                    }
+                }
+            } else if (pausedPumpStopped || pausedBufferedToMs != 0L) {
+                // Play again and the head's own ticks own the window, so the band goes with the pause it
+                // was describing rather than sitting stale over a film that has moved on.
+                pausedPumpStopped = false
+                pausedBufferedToMs = 0L
             }
             delay(1_000L)
         }
@@ -12191,6 +12415,80 @@ private fun HeroVlcVideoPlayerScreen(
                                         strokeWidth = strokePx,
                                         cap = StrokeCap.Round
                                     )
+                                    // Where this part's opening and credits fall, laid under the white so
+                                    // the played stretch stays white and only what is still ahead of the
+                                    // head carries the colour. These are the same marks the two pills are
+                                    // offered from, and [TimingTrust.believe] has already refused the ones
+                                    // it does not trust, so an unmarked part is a plain track rather than a
+                                    // guess wearing a colour.
+                                    //
+                                    // Scaled against the length the player reports rather than the one the
+                                    // marks were judged against, which may be a catalogue runtime on the
+                                    // first watch of a cold file. Until there is a real length to place
+                                    // them on, nothing is drawn — a band at the wrong position is worse
+                                    // than no band, and it is a position the viewer will drag through.
+                                    val markScaleMs = vlcEngine.durationMs
+                                    if (markScaleMs >= ResumeRules.MIN_TRACKABLE_DURATION_MS) {
+                                        val markFraction: (Long) -> Float = {
+                                            (it.toFloat() / markScaleMs).coerceIn(0f, 1f)
+                                        }
+                                        // A believed mark can still be too narrow to see, so a credit roll
+                                        // is grown to a floor width. It grows rightwards, away from the
+                                        // start, because the start is the edge the app acts on — that is
+                                        // where the Next up card appears — and a roll whose stop is the
+                                        // end of the file has no room to grow into and is left the width
+                                        // the file actually is.
+                                        //
+                                        // An opening gets no floor, because it is already the widest thing
+                                        // it can be: it runs from the first second of the part, so there
+                                        // is no track to its left to grow into, and growing rightwards
+                                        // would move the one edge that matters — where a tap lands.
+                                        val minBandFraction = MIN_MARK_BAND_PERCENT / 100f
+                                        val openingEndMs = skipIntroToMs
+                                        if (openingEndMs != null) {
+                                            drawLine(
+                                                color = OneUiAccent.copy(alpha = 0.78f),
+                                                start = Offset(0f, centerY),
+                                                end = Offset(trackWidth * markFraction(openingEndMs), centerY),
+                                                strokeWidth = strokePx,
+                                                cap = StrokeCap.Round
+                                            )
+                                        }
+                                        // Both ends of the roll come from one submitted pair, so a credit
+                                        // stretch this app believes always has a start and a stop.
+                                        val creditsStartMs = partTimings?.outroStartMs
+                                        val creditsEndMs = partTimings?.outroEndMs
+                                        if (creditsStartMs != null && creditsEndMs != null) {
+                                            val creditsStart = markFraction(creditsStartMs)
+                                            val creditsWidth = (markFraction(creditsEndMs) - creditsStart)
+                                                .coerceAtLeast(minBandFraction)
+                                            drawLine(
+                                                color = OneUiAccent.copy(alpha = 0.78f),
+                                                start = Offset(trackWidth * creditsStart, centerY),
+                                                end = Offset(
+                                                    trackWidth * (creditsStart + creditsWidth).coerceAtMost(1f),
+                                                    centerY
+                                                ),
+                                                strokeWidth = strokePx,
+                                                cap = StrokeCap.Round
+                                            )
+                                        }
+                                    }
+                                    // Film that has landed past a paused play head. The band is the only
+                                    // thing that says a pause on a slow link is being answered — a
+                                    // stopped picture with bytes quietly arriving behind it looks
+                                    // exactly like a player that has given up.
+                                    val bufferedEnd = (pausedBufferedToMs.toFloat() /
+                                        vlcEngine.durationMs.coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f)
+                                    if (vlcEngine.pausedByViewer && bufferedEnd > slider.value) {
+                                        drawLine(
+                                            color = Color.White.copy(alpha = 0.62f),
+                                            start = playedEnd,
+                                            end = Offset(trackWidth * bufferedEnd, centerY),
+                                            strokeWidth = strokePx,
+                                            cap = StrokeCap.Round
+                                        )
+                                    }
                                     drawLine(
                                         color = Color.White,
                                         start = Offset(0f, centerY),

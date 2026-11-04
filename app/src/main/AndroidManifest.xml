@@ -75,6 +75,20 @@
             android:name=".cloud.DownloadService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <!--
+            The TV companion's server, and the same license to outlive the screen: a film being pushed to a
+            television is bytes moving, which is what dataSync is for. Not exported — the port it opens is
+            the surface, and nothing on the device needs to start this by name.
+        -->
+        <service
+            android:name=".tvserver.TvServerService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <!-- The two buttons on a pairing notification. Not exported: a yes or a no to a stranger on the
+             Wi-Fi cannot be pressable by some other install. -->
+        <receiver
+            android:name=".tvserver.TvPairingReceiver"
+            android:exported="false" />
     </application>
 
 </manifest>

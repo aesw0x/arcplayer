@@ -50,16 +50,16 @@ object CloudSession {
             hasCredentials = hasCredentials,
             // Beside Telegram's own file folder rather than inside it, so a shelf list read off disk
             // can never be mistaken for one of its video files.
-            manifestPath = File(rootDir(context), "shelf_manifest.txt").absolutePath,
-            subtitleManifestPath = File(rootDir(context), "shelf_subtitles.txt").absolutePath,
+            manifestPath = manifestFile(context).absolutePath,
+            subtitleManifestPath = subtitleManifestFile(context).absolutePath,
             // Beside the two shelf lists rather than inside Telegram's file folder: this one names files
             // the app promised to keep, and a sweep that walks the folder mistaking one for a video is
             // the failure this whole ledger exists to prevent.
-            ledgerPath = File(rootDir(context), "download_ledger.txt").absolutePath,
+            ledgerPath = ledgerFile(context).absolutePath,
             // Under the system's cache rather than the app's files: a caption copied out of Telegram's
             // hands is worth nothing to anyone if the system wants its room back, and it is a few
             // kilobytes rather than a film.
-            captionDirectory = File(context.cacheDir, "captions").absolutePath,
+            captionDirectory = captionDirectory(context).absolutePath,
             // The device's own media catalog, which is the only place on a phone that satisfies both
             // halves of a download: Telegram cannot empty it, and the gallery can see what is in it.
             keptMedia = KeptMedia(context.applicationContext),
@@ -91,6 +91,36 @@ object CloudSession {
         val files = File(root, "files").apply { mkdirs() }
         return database to files
     }
+
+    /**
+     * The shelf's file list, as the app last wrote it to disk.
+     *
+     * Named here rather than rebuilt by whatever else wants to read it, so there is one answer to "where
+     * does the shelf live" — [com.aeswox.arcplayer.tvserver] reads these two files directly instead of
+     * asking the repository, and a second copy of the path is how those two would drift apart.
+     */
+    fun manifestFile(context: Context): File = File(rootDir(context), "shelf_manifest.txt")
+
+    /** The list of films this install promised to keep, before [CloudRepository] restored it. */
+    fun ledgerFile(context: Context): File = File(rootDir(context), "download_ledger.txt")
+
+    /**
+     * The captions the channel holds, written beside the two shelf lists.
+     *
+     * Named here for the same reason [manifestFile] is: [com.aeswox.arcplayer.tvserver] answers a TV's
+     * subtitle request off this file without waking TDLib, and a second copy of the path is how those
+     * two readers would start disagreeing about which captions exist.
+     */
+    fun subtitleManifestFile(context: Context): File = File(rootDir(context), "shelf_subtitles.txt")
+
+    /**
+     * Where a caption copied out of Telegram's hands lands.
+     *
+     * Filed under the caption's own id, which is worked out from the message it arrived in rather than
+     * from the film it describes — so a reader that wants one has to start from [subtitleManifestFile]
+     * and come by name.
+     */
+    fun captionDirectory(context: Context): File = File(context.applicationContext.cacheDir, "captions")
 
     /** The corner of internal storage this app owns; TDLib fills it below with its database and files. */
     private fun rootDir(context: Context): File = File(context.applicationContext.filesDir, "telegram")
