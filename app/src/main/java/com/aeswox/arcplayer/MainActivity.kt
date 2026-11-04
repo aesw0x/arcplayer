@@ -11422,23 +11422,11 @@ private fun HeroVlcVideoPlayerScreen(
                                             multiTapSeconds = 0
                                         }
                                     }
-                                    zoomScale > 1.05f -> {
-                                        coroutineScope.launch {
-                                            AppHaptics.click()
-                                            gestureHudText = "Original"
-                                            panOffset = Offset.Zero
-                                            Animatable(zoomScale).animateTo(
-                                                targetValue = 1f,
-                                                animationSpec = spring(
-                                                    dampingRatio = Spring.DampingRatioLowBouncy,
-                                                    stiffness = Spring.StiffnessMediumLow
-                                                )
-                                            ) {
-                                                zoomScale = value
-                                            }
-                                        }
-                                    }
                                     else -> {
+                                        // A centre double tap is always play and pause, even when the film
+                                        // is pinched out to Cinema fill. Un-zooming is the pinch's own job:
+                                        // a viewer who taps the middle of the picture is asking to stop the
+                                        // film, not to change how big it is drawn.
                                         AppHaptics.click()
                                         vlcEngine.togglePlayPause()
                                     }
