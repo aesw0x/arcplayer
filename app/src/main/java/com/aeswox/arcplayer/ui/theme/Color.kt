@@ -53,5 +53,9 @@ val OnErrorContainer = Color(0xFFFF8A80)
  * monochrome and lets artwork supply colour, so the system has no brand accent to take; this is
  * Arc Music's documented accent fallback (`ArcNowPlayingScreen.kt`), used there until artwork
  * supplies a dominant colour.
+ *
+ * Held at the same perceived lightness as the rose it replaces (relative luminance 147 of 255),
+ * so a mark changed hue without becoming louder on the AMOLED black. The delete and offline
+ * affordances read their own red and green and are untouched by this value.
  */
-val Accent = Color(0xFFB28D84)
+val Accent = Color(0xFF8594B7)
