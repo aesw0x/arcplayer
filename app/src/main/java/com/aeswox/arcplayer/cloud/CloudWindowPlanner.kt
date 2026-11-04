@@ -32,6 +32,32 @@ sealed class WindowCommand {
 }
 
 /**
+ * What one tick of a paused film's window should do.
+ *
+ * Three answers, because the caller has to tell a wait from an end. [Transferring] means ask again in
+ * a moment; [Sufficient] means stop asking until the play head moves, so a film left paused for an
+ * hour spends one round trip rather than three thousand.
+ */
+sealed class PausedWindow {
+    /** A window is still arriving, and it is not to be broken off. */
+    data object Transferring : PausedWindow()
+
+    /** Enough film sits past the pause point, or the whole file does. */
+    data object Sufficient : PausedWindow()
+
+    /** Push the window on to [offset] for [limit] bytes. */
+    data class Fetch(val offset: Long, val limit: Long) : PausedWindow()
+}
+
+/**
+ * One tick of the paused pump, answered with the number the screen needs.
+ *
+ * [readableAheadBytes] is film past the pause point that could be read at this moment, so a paused
+ * film can show its cushion growing without spending a Telegram round trip of its own to ask.
+ */
+data class PausedPump(val window: PausedWindow, val readableAheadBytes: Long)
+
+/**
  * Decides when to move TDLib's download window for a video that is being watched as it arrives.
  *
  * The rule is deliberately boring: leave a running download alone, and only re-point it when the
@@ -50,6 +76,16 @@ object CloudWindowPlanner {
 
     /** How much to ask for in one go. Big enough to survive a burst of slow network. */
     const val DEFAULT_WINDOW_BYTES = 64L * 1024 * 1024
+
+    /**
+     * How far past the point a viewer paused at a stopped film's window is allowed to walk.
+     *
+     * Two windows, and no more. A pause is usually a wait for the link rather than a walk away from
+     * the film, but it is not a promise to finish it: every byte this fetches is film that is forgotten
+     * when the player lets go, so the ceiling is the difference between a two-minute pause buying
+     * several minutes of picture and buying a third of a movie nobody came back to.
+     */
+    const val PAUSED_AHEAD_BYTES = 2L * DEFAULT_WINDOW_BYTES
 
     /**
      * Where the play head sits inside the file, guessed from time.
@@ -113,6 +149,46 @@ object CloudWindowPlanner {
         // window, ask for the whole of what is left.
         if (size in 1 until groundEnd) return WindowCommand.None
         return fetchAt(groundEnd, windowBytes, size)
+    }
+
+    /**
+     * Whether a film the viewer stopped on purpose should keep pulling bytes, and how far.
+     *
+     * The play-head rule above deliberately stops when a head stops: it is driven by reports of where
+     * playback is, and a paused film makes none. That is the gap this fills — a pause on a slow link is
+     * usually the viewer asking for time, and one window of cushion is about a minute of a big file.
+     *
+     * Two rules it does not share with that one. It never breaks off a live transfer, because TDLib
+     * holds one window per file and the next hop is a cancel-and-repoint — so this walks only when the
+     * window has gone idle, and a hop that starts exactly where the last one finished leaves the run of
+     * film on disk unbroken behind it. And it stops at [PAUSED_AHEAD_BYTES] past the pause point, which
+     * is the whole difference between cushion and a download the viewer did not ask for.
+     */
+    fun pausedPlan(
+        readPositionBytes: Long,
+        facts: WindowFacts,
+        alreadyDelivered: DeliveredRun = DeliveredRun.NONE,
+        windowBytes: Long = DEFAULT_WINDOW_BYTES
+    ): PausedWindow {
+        if (facts.isDownloadingCompleted) return PausedWindow.Sufficient
+        if (readPositionBytes < 0L) return PausedWindow.Sufficient
+        if (facts.isDownloadingActive) return PausedWindow.Transferring
+
+        val size = facts.fileSizeBytes
+        // Ground, not a promise: a cancelled window is parked wherever it last pointed with an empty
+        // prefix, so only a window that reported landed bytes says anything about the disk.
+        val windowEnd = facts.downloadOffset + facts.downloadedPrefixSize
+        val groundEnd = if (facts.downloadedPrefixSize > 0L) windowEnd else alreadyDelivered.to
+
+        if (groundEnd - readPositionBytes >= PAUSED_AHEAD_BYTES) return PausedWindow.Sufficient
+        if (size in 1..groundEnd) return PausedWindow.Sufficient
+
+        // Never behind the head: a window re-aimed onto bytes the paused film has already eaten is a
+        // rewind of the download for nobody's benefit.
+        return when (val command = fetchAt(maxOf(groundEnd, readPositionBytes), windowBytes, size)) {
+            is WindowCommand.Fetch -> PausedWindow.Fetch(command.offset, command.limit)
+            WindowCommand.None -> PausedWindow.Sufficient
+        }
     }
 
     private fun fetchAt(offset: Long, windowBytes: Long, size: Long): WindowCommand {

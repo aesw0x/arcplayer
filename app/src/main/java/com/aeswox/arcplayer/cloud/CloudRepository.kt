@@ -1148,6 +1148,46 @@ class CloudRepository(
         )
     }
 
+    /**
+     * Push a paused film's window forward, up to the cap, and report the cushion it now has.
+     *
+     * The play head is what normally drags this window along, and a pause is precisely the moment it
+     * stops reporting — which leaves a viewer who stopped to wait for a slow link waiting for a window
+     * that already filled. This is asked on the watchdog's tick instead. It is deliberately not the
+     * stall pump: that one presses play again when its bytes land, and a film the viewer stopped does
+     * not want starting behind their back.
+     */
+    suspend fun pumpPausedWindow(video: CloudVideoItem, readPositionBytes: Long): PausedPump {
+        // A seek owns the window it is waiting for, for the same reason the play head's ticks stand
+        // down for one.
+        if (seekDepth.get() > 0) return PausedPump(PausedWindow.Transferring, 0L)
+        // A kept film is arriving from byte zero for the whole of itself, which is more cushion than a
+        // pause could ask for. Re-aiming it would trade a finished download away for the next window.
+        if (fetchingWhole(video.fileId)) return PausedPump(PausedWindow.Sufficient, 0L)
+        val facts = pollFacts(video.fileId) ?: return PausedPump(PausedWindow.Transferring, 0L)
+        publishProgress(video.fileId, facts)
+        val run = deliveredRuns[video.fileId] ?: DeliveredRun.NONE
+        val command = CloudWindowPlanner.pausedPlan(readPositionBytes, facts, run)
+        val readableAhead = StreamWindow.readableBytes(
+            position = readPositionBytes,
+            size = facts.fileSizeBytes,
+            windowStart = facts.downloadOffset,
+            windowLength = facts.downloadedPrefixSize,
+            completed = facts.isDownloadingCompleted,
+            alreadyDelivered = run
+        )
+        Log.i(
+            TAG,
+            "paused read=$readPositionBytes window=${facts.downloadOffset}+${facts.downloadedPrefixSize} " +
+                "size=${facts.fileSizeBytes} active=${facts.isDownloadingActive} run=$run " +
+                "ahead=$readableAhead -> $command"
+        )
+        if (command is PausedWindow.Fetch) {
+            cappedCall(TdApi.DownloadFile(video.fileId, PRIORITY, command.offset, command.limit, false))
+        }
+        return PausedPump(command, readableAhead)
+    }
+
     private suspend fun aimWindowAt(video: CloudVideoItem, readPositionBytes: Long) {
         // While a whole-file fetch owns this id, the play head does not get to move the window. The
         // planner's job is to keep bytes arriving ahead of playback, and a fetch starting at byte zero
