@@ -346,6 +346,7 @@ import com.aeswox.arcplayer.playback.StoryIsOver
 import com.aeswox.arcplayer.playback.TimingAnswer
 import com.aeswox.arcplayer.playback.TimingTrust
 import com.aeswox.arcplayer.playback.TrackChoice
+import com.aeswox.arcplayer.playback.WatchedStamps
 import com.aeswox.arcplayer.stream.ByteRate
 import com.aeswox.arcplayer.stream.BufferGuard
 import com.aeswox.arcplayer.tvserver.TvAddress
@@ -926,10 +927,9 @@ class ArcPreferencesStore(context: Context) {
      * would cost every install its place in the rail.
      */
     fun rememberWatchedAt(videoId: Long) {
-        watchedAt[videoId] = System.currentTimeMillis()
-        val obj = JSONObject()
-        watchedAt.forEach { (id, at) -> obj.put(id.toString(), at) }
-        prefs.edit().putString("cloud_watched_at", obj.toString()).apply()
+        val at = System.currentTimeMillis()
+        watchedAt[videoId] = at
+        WatchedStamps.stamp(appContext, videoId, at)
     }
 
     /**

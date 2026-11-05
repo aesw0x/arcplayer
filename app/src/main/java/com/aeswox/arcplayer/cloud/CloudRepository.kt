@@ -13,6 +13,8 @@ import com.aeswox.arcplayer.ui.components.AppIntro
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -21,7 +23,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
@@ -30,9 +34,11 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.drinkless.tdlib.TdApi
 import java.io.File
+import java.io.IOException
 import java.io.RandomAccessFile
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -44,6 +50,12 @@ const val SHELF_CHANNEL_TITLE = "Arc Player Server"
 
 /** The title every shelf made before the channel started carrying the app's name. */
 const val LEGACY_SHELF_CHANNEL_TITLE = "Movies"
+
+sealed interface TvOpenResult {
+    data class Opened(val session: CloudRepository.TvReadSession) : TvOpenResult
+    data object Busy : TvOpenResult
+    data object Unavailable : TvOpenResult
+}
 
 /**
  * Everything the Cloud tab asks Telegram for.
@@ -229,6 +241,13 @@ class CloudRepository(
      * does know is the path it gave the player, and that is the one thing the sweep must never take.
      */
     private val inUse = ConcurrentHashMap<Int, String>()
+
+    /** One cloud viewer at a time; local catalog playback does not pass through this ownership. */
+    private val televisionLifecycle = Mutex()
+    private val televisionLock = Any()
+
+    @Volatile
+    private var televisionOpen = false
 
     /** Whether this launch has handed back the copies older watches left behind. */
     @Volatile
@@ -716,6 +735,17 @@ class CloudRepository(
         return fresh.copy(chatTitle = fresh.chatTitle.ifBlank { video.chatTitle })
     }
 
+    /** A fresh file id for a new TV session; a stale integer must never start a different file. */
+    private suspend fun resolveLiveForTelevision(video: CloudVideoItem): CloudVideoItem? {
+        if (!video.isFromManifest) return video
+        val message = tryCall(TdApi.GetMessage(video.chatId, video.messageId)) ?: return null
+        val found = HashMap<Long, ByteArray>()
+        val fresh = toCloudVideo(video.chatId, message, found) ?: return null
+        if (fresh.stableId != video.stableId) return null
+        if (found.isNotEmpty()) _thumbnails.value = _thumbnails.value + found
+        return fresh.copy(chatTitle = fresh.chatTitle.ifBlank { video.chatTitle })
+    }
+
     /**
      * One filtered search, walked back through the chat until it runs dry.
      *
@@ -941,11 +971,21 @@ class CloudRepository(
      * download starts, but a player pointed at it with zero bytes reads it as broken. So this waits
      * for the first bytes of the window and gives up after a while rather than hanging the tab.
      */
-    suspend fun localPathFor(video: CloudVideoItem): String? {
+    suspend fun localPathFor(video: CloudVideoItem): String? =
+        localPathFor(video, prepareIndex = true, televisionOwned = false)
+
+    private suspend fun localPathFor(
+        video: CloudVideoItem,
+        prepareIndex: Boolean,
+        televisionOwned: Boolean,
+    ): String? {
         // Claimed before anything is waited for. The sweep hands back the copies no watch of this
         // session owns, and an open still waiting for its head is indistinguishable from one: the wait
         // is up to twelve seconds and the sweep walks the whole shelf inside that, deleting as it goes.
-        inUse[video.fileId] = OPENING
+        synchronized(televisionLock) {
+            if (televisionOpen && !televisionOwned) return null
+            inUse[video.fileId] = OPENING
+        }
         val record = bridge.call(TdApi.GetFile(video.fileId))
         // Telegram's own size outlives its local record, so read it here and not after a possible drop.
         // A record that does not know the size is not a licence to hand over an empty file: the shelf
@@ -986,7 +1026,7 @@ class CloudRepository(
             runCatching { RandomAccessFile(usable, "rw").use { it.setLength(size) } }
                 .onFailure { Log.w(TAG, "could not stretch $usable to $size", it) }
         }
-        prepareIndexForOpen(video)
+        if (prepareIndex) prepareIndexForOpen(video)
         return usable
     }
 
@@ -1112,6 +1152,172 @@ class CloudRepository(
             if (path != null && allocatedBytes(path) >= needBytes && !headIsHole(path)) return path
             if (SystemClock.elapsedRealtime() >= giveUpAt) return null
             delay(POLL_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * A television's own cloud window. The local catalog path never comes through here, so a complete
+     * offline film remains playable while this one cloud session is busy.
+     */
+    suspend fun openTvReadSession(video: CloudVideoItem): TvOpenResult = televisionLifecycle.withLock {
+        if (video.sizeBytes <= 0L) return@withLock TvOpenResult.Unavailable
+        synchronized(televisionLock) {
+            if (televisionOpen || inUse.isNotEmpty()) return@withLock TvOpenResult.Busy
+        }
+
+        val fresh = runCatching {
+            // The TV service can be the process's first component. This is idempotent and runs on the
+            // HTTP worker, so a cold open cannot race a not-yet-created client or load TDLib on main.
+            bridge.start()
+            val ready = withTimeoutOrNull(ROUND_TRIP_TIMEOUT_MS) {
+                _authState.first { it.parametersAccepted }
+            } != null
+            if (ready) resolveLiveForTelevision(video) else null
+        }.orCancelled().getOrNull() ?: return@withLock TvOpenResult.Unavailable
+
+        synchronized(televisionLock) {
+            if (televisionOpen || inUse.isNotEmpty()) return@withLock TvOpenResult.Busy
+            televisionOpen = true
+        }
+        val path = runCatching {
+            localPathFor(fresh, prepareIndex = false, televisionOwned = true)
+        }.orCancelled().getOrNull()
+        if (path == null) {
+            releaseTelevision(fresh)
+            return@withLock TvOpenResult.Unavailable
+        }
+
+        val file = runCatching { RandomAccessFile(path, "r") }.getOrNull()
+        if (file == null) {
+            releaseTelevision(fresh)
+            return@withLock TvOpenResult.Unavailable
+        }
+        Log.i(TAG, "TV open title=${fresh.title} file=${fresh.fileId} size=${fresh.sizeBytes}")
+        TvOpenResult.Opened(TvReadSession(fresh, file))
+    }
+
+    private suspend fun releaseTelevision(video: CloudVideoItem) {
+        if (fetchingWhole(video.fileId)) {
+            demoteToKeepPriority(video)
+        } else {
+            tryCall(TdApi.CancelDownloadFile(video.fileId, false))
+            demoteToKeepPriority(video)
+        }
+        _progress.value = _progress.value - video.fileId
+        synchronized(televisionLock) {
+            inUse.remove(video.fileId)
+            televisionOpen = false
+        }
+        Log.i(TAG, "TV closed file=${video.fileId}")
+    }
+
+    /** One persistent cloud download window, shared by every short-lived HTTP range connection. */
+    inner class TvReadSession internal constructor(
+        private val video: CloudVideoItem,
+        private val file: RandomAccessFile,
+    ) {
+        val stableId: Long = video.stableId
+
+        private val job = SupervisorJob()
+        private val readMutex = Mutex()
+        private val closed = AtomicBoolean(false)
+
+        fun openHandle(): TvReadHandle = TvReadHandle(this, job)
+
+        internal suspend fun read(offset: Long, buffer: ByteArray, off: Int, len: Int): Int {
+            if (len == 0) return 0
+            if (offset >= video.sizeBytes) return -1
+            val wanted = minOf(len.toLong(), video.sizeBytes - offset).toInt()
+
+            return readMutex.withLock {
+                val giveUpAt = SystemClock.elapsedRealtime() + TV_READ_TIMEOUT_MS
+                var lastRequestAt = 0L
+                while (SystemClock.elapsedRealtime() < giveUpAt) {
+                    if (closed.get()) throw IOException("Telegram stream is closed")
+                    val facts = runCatching { pollFacts(video.fileId) }.orCancelled().getOrNull()
+                    if (facts != null) {
+                        publishProgress(video.fileId, facts)
+                        val run = deliveredRuns[video.fileId] ?: DeliveredRun.NONE
+                        val readable = StreamWindow.readableBytes(
+                            position = offset,
+                            size = video.sizeBytes,
+                            windowStart = facts.downloadOffset,
+                            windowLength = facts.downloadedPrefixSize,
+                            completed = facts.isDownloadingCompleted,
+                            alreadyDelivered = run,
+                            includeInFlight = false,
+                        )
+                        if (readable > 0L) {
+                            val count = minOf(wanted.toLong(), readable).toInt()
+                            file.seek(offset)
+                            val read = file.read(buffer, off, count)
+                            if (read > 0) return@withLock read
+                            throw IOException("Telegram's local file ended inside a delivered range")
+                        }
+
+                        if (fetchingWhole(video.fileId)) {
+                            raiseToWatchPriority(video)
+                        } else {
+                            val command = CloudWindowPlanner.plan(offset, facts, run)
+                            val now = SystemClock.elapsedRealtime()
+                            if (command is WindowCommand.Fetch && now - lastRequestAt >= TV_REQUEST_RETRY_MS) {
+                                // TDLib does not move a live range merely because a new range was asked
+                                // for. A backward seek therefore cancels first; a whole-file keep never
+                                // reaches this branch and is left strictly alone.
+                                if (facts.isDownloadingActive) {
+                                    tryCall(TdApi.CancelDownloadFile(video.fileId, false))
+                                }
+                                Log.i(
+                                    TAG,
+                                    "TV range file=${video.fileId} wanted=$offset " +
+                                        "fetch=${command.offset}+${command.limit}"
+                                )
+                                tryCall(
+                                    TdApi.DownloadFile(
+                                        video.fileId,
+                                        PRIORITY,
+                                        command.offset,
+                                        command.limit,
+                                        false,
+                                    )
+                                )
+                                lastRequestAt = SystemClock.elapsedRealtime()
+                            }
+                        }
+                    }
+                    delay(POLL_INTERVAL_MS)
+                }
+                throw IOException("Timed out waiting for Telegram bytes at $offset")
+            }
+        }
+
+        suspend fun close() {
+            if (!closed.compareAndSet(false, true)) return
+            job.cancel()
+            readMutex.withLock { runCatching { file.close() } }
+            televisionLifecycle.withLock { releaseTelevision(video) }
+        }
+    }
+
+    /** A closable HTTP connection's view of a session; closing it never closes the other connections. */
+    class TvReadHandle internal constructor(
+        private val session: TvReadSession,
+        parent: Job,
+    ) {
+        private val job = SupervisorJob(parent)
+
+        fun readAt(offset: Long, buffer: ByteArray, off: Int, len: Int): Int {
+            try {
+                return runBlocking {
+                    withContext(job + Dispatchers.IO) { session.read(offset, buffer, off, len) }
+                }
+            } catch (cancelled: CancellationException) {
+                throw IOException("Telegram stream connection closed", cancelled)
+            }
+        }
+
+        fun close() {
+            job.cancel()
         }
     }
 
@@ -2711,6 +2917,8 @@ class CloudRepository(
         const val LEGACY_KEEP_FOLDER = "Arc Player"
 
         const val POLL_INTERVAL_MS = 150L
+        const val TV_READ_TIMEOUT_MS = 60_000L
+        const val TV_REQUEST_RETRY_MS = 1_000L
 
         /** How long to wait for the first bytes of a window before telling the user to come back. */
         const val FIRST_WINDOW_TIMEOUT_MS = 12_000L

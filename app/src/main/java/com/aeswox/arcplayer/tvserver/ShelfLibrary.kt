@@ -3,15 +3,18 @@ package com.aeswox.arcplayer.tvserver
 import android.content.Context
 import com.aeswox.arcplayer.cloud.CloudSession
 import com.aeswox.arcplayer.cloud.CloudSubtitleItem
+import com.aeswox.arcplayer.cloud.CloudVideoItem
 import com.aeswox.arcplayer.cloud.DownloadLedger
 import com.aeswox.arcplayer.cloud.ShelfManifest
 import com.aeswox.arcplayer.cloud.SubtitleManifest
 import com.aeswox.arcplayer.metadata.AudioTag
 import com.aeswox.arcplayer.metadata.MediaGuess
 import com.aeswox.arcplayer.metadata.MediaNameParser
+import com.aeswox.arcplayer.metadata.PosterCache
 import com.aeswox.arcplayer.metadata.TitleDetail
 import com.aeswox.arcplayer.metadata.titleDetailKey
 import com.aeswox.arcplayer.playback.ResumeBlob
+import com.aeswox.arcplayer.playback.WatchedStamps
 import com.aeswox.arcplayer.subtitle.SubtitleMatch
 import org.json.JSONObject
 import java.io.File
@@ -21,9 +24,9 @@ import java.util.Locale
 /**
  * One film the TV is allowed to ask for.
  *
- * [keptHandle] is the row the bytes live in, and its presence is the entry's whole claim to be listed: a
- * film the phone is still fetching is not offered yet, because serving it would mean either lying about
- * where its bytes are or aiming Telegram's one download window at two viewers at once.
+ * [cloudVideo] names the Telegram message wherever the bytes come from. [keptHandle] is present when a
+ * complete offline copy exists and is always preferred; otherwise the stream server opens a cloud read
+ * session rather than hiding the film from the shelf.
  */
 data class TvShelfItem(
     val stableId: Long,
@@ -39,13 +42,22 @@ data class TvShelfItem(
     val height: Int,
     val contentType: String,
     val resumeMs: Long,
+    /** When this copy was last opened, here or on the television; zero when it never has been. */
+    val watchedAtMs: Long,
     /** What the copy's own name says its audio is, or null when it says nothing. */
     val audioCodec: String?,
     /** The TV cannot decode any track this copy names, so its picture will run with nothing to hear. */
     val needsRemux: Boolean,
-    val keptHandle: String,
+    val cloudVideo: CloudVideoItem,
+    val keptHandle: String?,
     val posterFile: File?,
     val backdropFile: File?,
+    /**
+     * Where the catalogue keeps these two pictures, so [artworkFile] can go and get one the phone has
+     * never drawn. A shelf that only ever served cached files showed four posters out of 193 films.
+     */
+    val posterSource: String?,
+    val backdropSource: String?,
 ) {
     /**
      * Average bits per second, or zero when the length is unknown.
@@ -71,17 +83,15 @@ data class ShelfCounts(
 /**
  * The shelf as a file list, read off the records the app already writes.
  *
- * This deliberately does not go through [com.aeswox.arcplayer.cloud.CloudRepository]. `loadVideos` walks
- * the channel through TDLib, `localPathFor` claims a copy and stretches its shell to the promised
- * length so a seek is never past the end, and `advanceWindow` aims the one byte window the player is
- * using. A second viewer has no business doing any of those, so this reads the two files the shelf and
- * the keep queue already maintain and answers from disk.
+ * Browsing deliberately does not go through [com.aeswox.arcplayer.cloud.CloudRepository]: a shelf read
+ * should neither walk the channel nor claim a download window. The repository becomes involved only
+ * when a real stream GET opens a film that has no complete offline copy.
  *
  * Every call is file I/O and runs on the server's own worker thread, never the main one.
  */
 object ShelfLibrary {
 
-    /** The films on the shelf that are entirely on this device, in the channel's own order. */
+    /** Every film on the shelf, in the channel's own order. */
     fun items(context: Context): List<TvShelfItem> {
         val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val chatId = prefs.getLong(KEY_CHAT_ID, 0L)
@@ -94,18 +104,28 @@ object ShelfLibrary {
 
         val kept = read(CloudSession.ledgerFile(context))
             .map { DownloadLedger.decode(it) }
-            .getOrElse { return emptyList() }
+            .getOrElse { emptyMap() }
 
         // The player measures a length off the container when no upload carries one, and Telegram reports
         // nothing for a file sent as a document, so most of a shelf's durations live only in this map.
         val lengths = numberMap(prefs.getString(KEY_LENGTHS, "{}"))
         val resumes = ResumeBlob.read(context)
+        val watched = WatchedStamps.read(context)
         val cards = jsonObject(prefs.getString(KEY_CARDS, "{}"))
         val details = jsonObject(prefs.getString(KEY_DETAILS, "{}"))
+        val showCards = manifest.mapNotNull { video ->
+            val showCard = cards.optJSONObject(video.stableId.toString())
+                ?.takeIf { it.optBoolean("isSeries") }
+                ?: return@mapNotNull null
+            val title = showCard.optString("title").takeIf { it.isNotBlank() }
+                ?: return@mapNotNull null
+            title.trim().lowercase(Locale.ROOT) to showCard
+        }.toMap()
 
-        return manifest.mapNotNull { video ->
-            val entry = kept[video.stableId] ?: return@mapNotNull null
-            if (!entry.isComplete || !DownloadLedger.isCatalogHandle(entry.path)) return@mapNotNull null
+        return manifest.map { video ->
+            val keptHandle = kept[video.stableId]
+                ?.takeIf { it.isComplete && DownloadLedger.isCatalogHandle(it.path) }
+                ?.path
 
             val card = cards.optJSONObject(video.stableId.toString())
             val providerId = card?.optInt("providerId")?.takeIf { it > 0 }
@@ -121,6 +141,15 @@ object ShelfLibrary {
             }
             val measuredDuration = maxOf(video.durationMs, lengths[video.stableId] ?: 0L)
             val audio = AudioTag.of(video.title)
+            val showCard = (guess as? MediaGuess.Episode)
+                ?.series?.trim()?.lowercase(Locale.ROOT)?.let(showCards::get)
+            val showDetail = showCard?.optInt("providerId")?.takeIf { it > 0 }?.let { id ->
+                details.optJSONObject(titleDetailKey(id, true))?.let(TitleDetail::fromJson)
+            }
+            val posterSource = card?.optString("poster")?.takeIf { it.isNotBlank() }
+                ?: showCard?.optString("poster")?.takeIf { it.isNotBlank() }
+            val backdropSource = detail?.backdropUrl?.takeIf { it.isNotBlank() }
+                ?: showDetail?.backdropUrl?.takeIf { it.isNotBlank() }
 
             TvShelfItem(
                 stableId = video.stableId,
@@ -140,13 +169,30 @@ object ShelfLibrary {
                 height = video.height,
                 contentType = contentTypeFor(video.title, video.mimeType),
                 resumeMs = resumes[video.stableId] ?: 0L,
+                watchedAtMs = watched[video.stableId] ?: 0L,
                 audioCodec = audio.codec,
                 needsRemux = audio.unsupported,
-                keptHandle = entry.path,
-                posterFile = cachedArtwork(context, card?.optString("poster")),
-                backdropFile = cachedArtwork(context, detail?.backdropUrl),
+                cloudVideo = video,
+                keptHandle = keptHandle,
+                posterFile = cachedArtwork(context, posterSource),
+                backdropFile = cachedArtwork(context, backdropSource),
+                posterSource = posterSource,
+                backdropSource = backdropSource,
             )
         }
+    }
+
+    /**
+     * The picture for one film, fetching it from the catalogue when the phone has no copy.
+     *
+     * Called only by the artwork route, never by [items]: a shelf read is file I/O, and 193 posters of
+     * network would sit between the viewer and their film list. A missing picture costs one image request
+     * on the server's own worker, and the next viewer of the same card gets the file.
+     */
+    fun artworkFile(context: Context, item: TvShelfItem, kind: String): File? = when (kind) {
+        "poster" -> item.posterFile ?: PosterCache.diskImage(context, item.posterSource)
+        "backdrop" -> item.backdropFile ?: PosterCache.diskImage(context, item.backdropSource)
+        else -> null
     }
 
     /** The one film this id names, or nothing when the id is not a film the phone can hand over. */

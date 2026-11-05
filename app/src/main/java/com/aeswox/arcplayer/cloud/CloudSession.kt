@@ -1,6 +1,7 @@
 package com.aeswox.arcplayer.cloud
 
 import android.content.Context
+import com.aeswox.arcplayer.BuildConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -20,6 +21,23 @@ object CloudSession {
 
     private var repository: CloudRepository? = null
     private var appliedCredentials: Credentials? = null
+
+    /**
+     * The repository for the credentials this install already holds.
+     *
+     * Services use the same effective-credential rule as the interface: hand-entered values win, with
+     * the compiled-in app identity as the fallback. No credential value is logged or exposed.
+     */
+    fun repositoryFor(context: Context): CloudRepository {
+        val prefs = context.applicationContext.getSharedPreferences("arc_player_prefs", Context.MODE_PRIVATE)
+        val enteredId = prefs.getInt("tg_api_id", 0)
+        val enteredHash = prefs.getString("tg_api_hash", "").orEmpty()
+        return repositoryFor(
+            context = context,
+            apiId = if (enteredId > 0) enteredId else BuildConfig.TG_API_ID,
+            apiHash = enteredHash.ifBlank { BuildConfig.TG_API_HASH },
+        )
+    }
 
     /**
      * The repository for these credentials, creating or replacing it only when they actually move.

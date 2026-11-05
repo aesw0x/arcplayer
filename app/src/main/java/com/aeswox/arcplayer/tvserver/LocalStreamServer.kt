@@ -30,10 +30,12 @@ class LocalStreamServer(
     private val deviceName: String,
     private val libraryItems: () -> List<TvShelfItem>,
     private val shelfCounts: () -> ShelfCounts,
-    private val openStream: (String) -> ByteSource?,
+    private val describeStream: (String) -> StreamDescription?,
+    private val openStream: (String) -> StreamOpenResult,
     private val savedPositions: () -> Map<Long, Long>,
     private val savePosition: (id: String, positionMs: Long, durationMs: Long) -> Boolean,
     private val openCaption: (String) -> File?,
+    private val ensureArtwork: (item: TvShelfItem, kind: String) -> File?,
 ) : NanoHTTPD(port) {
 
     companion object {
@@ -163,18 +165,26 @@ class LocalStreamServer(
                     .put("year", item.year ?: JSONObject.NULL)
                     .put("overview", item.overview)
                     .put("genres", JSONArray(item.genres))
-                    .put("posterUrl", item.posterFile?.let {
+                    // Offered whenever the catalogue names a picture, not only when the phone already
+                    // holds the file: the artwork route fetches a missing one, so a film the phone never
+                    // scrolled past still gets a cover on the TV.
+                    .put("posterUrl", if (item.posterSource != null) {
                         artworkUrl(item.stableId, "poster")
-                    } ?: JSONObject.NULL)
-                    .put("backdropUrl", item.backdropFile?.let {
+                    } else {
+                        JSONObject.NULL
+                    })
+                    .put("backdropUrl", if (item.backdropSource != null) {
                         artworkUrl(item.stableId, "backdrop")
-                    } ?: JSONObject.NULL)
+                    } else {
+                        JSONObject.NULL
+                    })
                     .put("sizeBytes", item.sizeBytes)
                     .put("durationMs", item.durationMs)
                     .put("width", item.width)
                     .put("height", item.height)
                     .put("mimeType", item.contentType)
                     .put("resumeMs", item.resumeMs)
+                    .put("watchedAtMs", item.watchedAtMs)
                     // Always a number, never absent: the film page calls toFixed() on this straight off
                     // the response and a missing field is a blank page on the TV.
                     .put("bitrateMbps", item.bitrateMbps)
@@ -184,6 +194,7 @@ class LocalStreamServer(
                     // audio has nothing honest to say and a badge drawn from a guess is worse than none.
                     .put("audioCodec", item.audioCodec ?: JSONObject.NULL)
                     .put("needsRemux", item.needsRemux)
+                    .put("source", if (item.keptHandle != null) "local" else "telegram")
             )
         }
         return json(
@@ -310,11 +321,8 @@ class LocalStreamServer(
         val id = parts[0].toLongOrNull() ?: return plain(Response.Status.NOT_FOUND, "")
         val item = libraryItems().firstOrNull { it.stableId == id }
             ?: return plain(Response.Status.NOT_FOUND, "")
-        val file = when (parts[1]) {
-            "poster" -> item.posterFile
-            "backdrop" -> item.backdropFile
-            else -> null
-        }?.takeIf { it.isFile } ?: return plain(Response.Status.NOT_FOUND, "")
+        val file = ensureArtwork(item, parts[1])
+            ?.takeIf { it.isFile } ?: return plain(Response.Status.NOT_FOUND, "")
 
         val contentType = file.inputStream().buffered().use {
             URLConnection.guessContentTypeFromStream(it)
@@ -332,17 +340,11 @@ class LocalStreamServer(
     private fun stream(session: IHTTPSession, id: String): Response {
         if (!authorized(session)) return unauthorized()
 
-        // A HEAD asks for the shape of a film rather than its bytes, so it takes no slot: a viewer already
-        // watching must not be dropped because somebody else checked a file's size.
-        val head = session.method == Method.HEAD
-        val opened = openStream(id) ?: return plain(Response.Status.NOT_FOUND, "")
-        val source = if (head) opened else (streams.admit(id, opened) ?: return refused(session, id))
-
-        val size = source.sizeBytes
+        val description = describeStream(id) ?: return plain(Response.Status.NOT_FOUND, "")
+        val size = description.sizeBytes
         val header = session.headers["range"]
         val parsed = RangeHeader.parse(header, size)
         if (parsed is RangeResult.Unsatisfiable) {
-            source.close()
             val response = plain(Response.Status.RANGE_NOT_SATISFIABLE, "")
             response.addHeader("Content-Range", "bytes */$size")
             return response
@@ -351,20 +353,36 @@ class LocalStreamServer(
         val range = parsed as RangeResult.Satisfiable
         val length = range.endExclusive - range.start
         val partial = !header.isNullOrBlank()
-        // The body of a HEAD is an *empty* stream rather than a null one, because NanoHTTPD answers a null
-        // body with `Content-Length: 0` — and a zero-length film is a file no player will open. The handle
-        // goes straight back, so no byte of the film is read.
-        val body: InputStream = if (head) {
-            source.close()
-            ByteArrayInputStream(ByteArray(0))
-        } else {
-            RangeInputStream(source, range.start, range.endExclusive)
+        val status = if (partial) Response.Status.PARTIAL_CONTENT else Response.Status.OK
+
+        // Metadata never claims Telegram. A HEAD during another film's watch must not evict it.
+        if (session.method == Method.HEAD) {
+            val response = newFixedLengthResponse(
+                status,
+                description.contentType,
+                ByteArrayInputStream(ByteArray(0)),
+                length,
+            )
+            response.addHeader("Accept-Ranges", "bytes")
+            response.addHeader("Cache-Control", "no-store")
+            if (partial) {
+                response.addHeader("Content-Range", "bytes ${range.start}-${range.endExclusive - 1}/$size")
+            }
+            Log.i(TAG, "HEAD $id range=${header ?: "full"} len=$length of $size")
+            return response
         }
 
+        val source = when (val result = openStream(id)) {
+            is StreamOpenResult.Opened -> result.source
+            StreamOpenResult.NotFound -> return plain(Response.Status.NOT_FOUND, "")
+            StreamOpenResult.Busy -> return unavailable("another film is using Telegram")
+            StreamOpenResult.Unavailable -> return unavailable("Telegram stream unavailable")
+        }
+        val admitted = streams.admit(id, source) ?: return refused(session, id)
         val response = newFixedLengthResponse(
-            if (partial) Response.Status.PARTIAL_CONTENT else Response.Status.OK,
-            source.contentType,
-            body,
+            status,
+            description.contentType,
+            RangeInputStream(admitted, range.start, range.endExclusive),
             length,
         )
         response.addHeader("Accept-Ranges", "bytes")
@@ -388,6 +406,11 @@ class LocalStreamServer(
     }
 
     private fun unauthorized(): Response = plain(Response.Status.UNAUTHORIZED, "")
+
+    private fun unavailable(message: String): Response =
+        plain(Response.Status.SERVICE_UNAVAILABLE, message).apply {
+            addHeader("Retry-After", "2")
+        }
 
     private fun refused(session: IHTTPSession, id: String): Response {
         // A warning rather than the debug-only line above: "the TV says the phone is busy" has to be

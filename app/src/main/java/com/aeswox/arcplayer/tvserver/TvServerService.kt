@@ -14,7 +14,9 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.aeswox.arcplayer.BuildConfig
+import com.aeswox.arcplayer.cloud.CloudSession
 import com.aeswox.arcplayer.playback.ResumeBlob
+import com.aeswox.arcplayer.playback.WatchedStamps
 import fi.iki.elonen.NanoHTTPD
 import java.io.File
 import java.io.IOException
@@ -72,6 +74,9 @@ class TvServerService : Service() {
     private var server: LocalStreamServer? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
+    @Volatile
+    private var cloudStreams: TvCloudStreams? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -107,6 +112,7 @@ class TvServerService : Service() {
             deviceName = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
             libraryItems = { ShelfLibrary.items(this) },
             shelfCounts = { ShelfLibrary.counts(this) },
+            describeStream = { id -> describeSource(id) },
             openStream = { id -> openSource(id) },
             // The same two records the phone's own player reads, reached through the one object that owns
             // them, because a television writing this string directly is a second writer in a house where
@@ -114,6 +120,7 @@ class TvServerService : Service() {
             savedPositions = { ResumeBlob.read(this) },
             savePosition = { id, positionMs, durationMs -> recordProgress(id, positionMs, durationMs) },
             openCaption = { id -> captionFileFor(id) },
+            ensureArtwork = { item, kind -> ShelfLibrary.artworkFile(this, item, kind) },
         )
         try {
             started.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
@@ -130,24 +137,42 @@ class TvServerService : Service() {
     override fun onDestroy() {
         server?.stop()
         server = null
+        cloudStreams?.close()
         TvPairing.close()
         releaseWakeLock()
         Log.i(TAG, "server stopped")
         super.onDestroy()
     }
 
-    /**
-     * The bytes behind one id.
-     *
-     * Only films whose every byte is on the device answer; everything else is a 404 rather than a stall.
-     * Serving a file Telegram is still filling means aiming the phone's one download window at a second
-     * viewer, and that is a negotiation with the player rather than a lookup.
-     */
-    private fun openSource(id: String): ByteSource? {
-        if (BuildConfig.DEBUG && id == DEMO_ID) return demoSource()
+    private fun describeSource(id: String): StreamDescription? {
+        if (BuildConfig.DEBUG && id == DEMO_ID) {
+            val file = demoFile() ?: return null
+            return StreamDescription(file.length(), ShelfLibrary.contentTypeFor(file.name, ""))
+        }
         val item = ShelfLibrary.find(this, id) ?: return null
-        return CatalogHandleSource.open(contentResolver, item.keptHandle, item.contentType)
+        return StreamDescription(item.sizeBytes, item.contentType)
     }
+
+    private fun openSource(id: String): StreamOpenResult {
+        if (BuildConfig.DEBUG && id == DEMO_ID) {
+            val source = demoSource() ?: return StreamOpenResult.NotFound
+            return StreamOpenResult.Opened(source)
+        }
+        val item = ShelfLibrary.find(this, id) ?: return StreamOpenResult.NotFound
+        val keptHandle = item.keptHandle
+        if (keptHandle != null) {
+            val source = CatalogHandleSource.open(contentResolver, keptHandle, item.contentType)
+                ?: return StreamOpenResult.Unavailable
+            return StreamOpenResult.Opened(source)
+        }
+        return cloudStreams().open(item)
+    }
+
+    @Synchronized
+    private fun cloudStreams(): TvCloudStreams =
+        cloudStreams ?: TvCloudStreams(
+            CloudSession.repositoryFor(this).also { it.begin() }
+        ).also { cloudStreams = it }
 
     /**
      * The place a television reported, kept only if the phone would have kept it itself.
@@ -165,6 +190,10 @@ class TvServerService : Service() {
             positionMs = positionMs,
             durationMs = if (item.durationMs > 0L) item.durationMs else maxOf(0L, durationMs),
         )
+        // A film watched from the sofa is still the film this household last reached for, so it belongs at
+        // the front of the rail on both screens. Stamped on progress rather than on open, because an open
+        // that never delivers a frame is not a watch.
+        WatchedStamps.stamp(this, item.stableId)
         return true
     }
 
@@ -179,14 +208,15 @@ class TvServerService : Service() {
         ShelfLibrary.find(this, id)?.let { ShelfLibrary.captionFileFor(this, it) }
 
     private fun demoSource(): ByteSource? {
-        val configured = TvServerConfigStore.demoFile(this)?.let(::File)
-        val file = if (configured?.isFile == true) {
-            configured
-        } else {
-            val directory = getExternalFilesDir(null) ?: return null
-            DEMO_NAMES.map { File(directory, it) }.firstOrNull { it.isFile } ?: return null
-        }
+        val file = demoFile() ?: return null
         return CompleteFileSource.path(file, ShelfLibrary.contentTypeFor(file.name, ""))
+    }
+
+    private fun demoFile(): File? {
+        val configured = TvServerConfigStore.demoFile(this)?.let(::File)
+        if (configured?.isFile == true) return configured
+        val directory = getExternalFilesDir(null) ?: return null
+        return DEMO_NAMES.map { File(directory, it) }.firstOrNull { it.isFile }
     }
 
     private fun startForegroundCompat(config: TvServerConfig) {

@@ -85,6 +85,23 @@ object PosterCache {
         }
     }
 
+    /**
+     * The on-disk copy of one image, fetching it when nobody has drawn it yet.
+     *
+     * The television asks for artwork the phone's own grid never scrolled to, and a shelf read must stay
+     * pure file I/O, so the fetch happens here — on the one request that actually wants the picture. Same
+     * file name and same size floor as [bitmap], so whichever side gets there first fills the cache for
+     * both. Blocking, and only ever called from a worker thread.
+     */
+    fun diskImage(context: Context, url: String?): File? {
+        if (url.isNullOrBlank()) return null
+        val file = diskFile(context, url)
+        if (!file.isFile || file.length() < MIN_REAL_IMAGE_BYTES) {
+            runCatching { download(url, file) }
+        }
+        return file.takeIf { it.isFile && it.length() >= MIN_REAL_IMAGE_BYTES }
+    }
+
     /** Bytes first, downsampled second: re-encoding a JPEG to store a poster only costs quality. */
     private fun download(url: String, into: File) {
         val bytes = HttpJson.getBytes(url) ?: return
