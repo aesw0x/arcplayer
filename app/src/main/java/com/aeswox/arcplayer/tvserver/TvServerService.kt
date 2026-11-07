@@ -110,7 +110,7 @@ class TvServerService : Service() {
             port = config.port,
             token = config.token,
             deviceName = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
-            libraryItems = { ShelfLibrary.items(this) },
+            libraryGroups = { ShelfLibrary.groups(this) },
             shelfCounts = { ShelfLibrary.counts(this) },
             describeStream = { id -> describeSource(id) },
             openStream = { id -> openSource(id) },

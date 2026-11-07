@@ -28,7 +28,7 @@ class LocalStreamServer(
     port: Int,
     private val token: String,
     private val deviceName: String,
-    private val libraryItems: () -> List<TvShelfItem>,
+    private val libraryGroups: () -> List<TvShelfGroup>,
     private val shelfCounts: () -> ShelfCounts,
     private val describeStream: (String) -> StreamDescription?,
     private val openStream: (String) -> StreamOpenResult,
@@ -42,7 +42,13 @@ class LocalStreamServer(
         private const val TAG = "ArcTV-Server"
         private const val MIME_JSON = "application/json; charset=utf-8"
         private const val MIME_TEXT = "text/plain; charset=utf-8"
-        private const val VERSION = 1
+        /**
+         * Bumped to 2 when `/api/library` stopped answering with files and started answering with works.
+         *
+         * The shape changed rather than grew: a companion app on 1 reads nothing out of a response with no
+         * `items`, so the number is the only thing that tells the two apart.
+         */
+        private const val VERSION = 2
 
         /**
          * How many films are pushed at once.
@@ -148,60 +154,109 @@ class LocalStreamServer(
         return json(body)
     }
 
+    /**
+     * The shelf as cards, each holding the copies that make it up.
+     *
+     * A file-shaped library is what made a television scroll past nine identical posters to reach the same
+     * film twice: one row of the manifest became one card. Everything the work owns — its name, its
+     * pictures, its synopsis — now rides on the card, and the parts beneath carry only what differs per
+     * file, because ninety episodes of one show agreeing on a poster URL is ninety copies of one string.
+     *
+     * The ids a viewer acts on stay file ids, all the way down: `playId` and `resumeId` name the part the
+     * phone picked, and `/stream`, `/api/progress` and `/api/subtitles` still take whatever id the card
+     * hands them.
+     */
     private fun library(): Response {
-        val items = JSONArray()
-        libraryItems().forEach { item ->
-            items.put(
+        val groups = JSONArray()
+        libraryGroups().forEach { group ->
+            val parts = JSONArray()
+            group.items.forEach { item ->
+                parts.put(
+                    JSONObject()
+                        // A string, not a number: a stable id is a 64-bit Telegram-derived long, and the TV
+                        // parses this with JavaScript, which rounds anything past 2^53. Asked for
+                        // -3217499465312568008 it returned a URL for ...568000 — the same film read as a
+                        // different one, and a 404 no log on the phone explains. The path segment is read
+                        // back with toLongOrNull(), so the digits travel unchanged.
+                        .put("id", item.stableId.toString())
+                        .put("fileName", item.fileName)
+                        // Both null for a film. A card says what work it is; these say which part of it
+                        // the television is about to open, which is the one thing the card cannot say.
+                        .put("season", item.season ?: JSONObject.NULL)
+                        .put("episode", item.episode ?: JSONObject.NULL)
+                        .put("sizeBytes", item.sizeBytes)
+                        .put("durationMs", item.durationMs)
+                        .put("introEndMs", item.introEndMs ?: JSONObject.NULL)
+                        .put("outroStartMs", item.outroStartMs ?: JSONObject.NULL)
+                        .put("outroEndMs", item.outroEndMs ?: JSONObject.NULL)
+                        .put("width", item.width)
+                        .put("height", item.height)
+                        .put("mimeType", item.contentType)
+                        .put("resumeMs", item.resumeMs)
+                        .put("watchedAtMs", item.watchedAtMs)
+                        // Always a number, never absent: the film page calls toFixed() on this straight off
+                        // the response and a missing number is a blank page on the TV.
+                        .put("bitrateMbps", item.bitrateMbps)
+                        // Both always present. A television deciding whether to warn a viewer about a film
+                        // cannot tell an absent flag from a false one, and a missing `needsRemux` reads as a
+                        // film that will play; `audioCodec` is the exception, because a name that states no
+                        // audio has nothing honest to say and a badge drawn from a guess is worse than none.
+                        .put("audioCodec", item.audioCodec ?: JSONObject.NULL)
+                        .put("needsRemux", item.needsRemux)
+                        .put("source", if (item.keptHandle != null) "local" else "telegram")
+                )
+            }
+            val episodes = JSONArray()
+            group.episodes.forEach { episode ->
+                episodes.put(
+                    JSONObject()
+                        .put("season", episode.season)
+                        .put("episode", episode.episode)
+                        .put("playId", episode.playId.toString())
+                        .put("resumeMs", episode.resumeMs)
+                        .put("durationMs", episode.durationMs)
+                        .put("watched", episode.watched)
+                        .put("copyIds", JSONArray(episode.copyIds.map { it.toString() }))
+                )
+            }
+            groups.put(
                 JSONObject()
-                    // A string, not a number: a stable id is a 64-bit Telegram-derived long, and the TV
-                    // parses this with JavaScript, which rounds anything past 2^53. Asked for
-                    // -3217499465312568008 it returned a URL for ...568000 — the same film read as a
-                    // different one, and a 404 no log on the phone explains. The path segment is read back
-                    // with toLongOrNull(), so the digits travel unchanged.
-                    .put("id", item.stableId.toString())
-                    .put("fileName", item.fileName)
-                    .put("title", item.title)
-                    .put("subtitle", item.subtitle ?: JSONObject.NULL)
-                    .put("year", item.year ?: JSONObject.NULL)
-                    .put("overview", item.overview)
-                    .put("genres", JSONArray(item.genres))
-                    // Offered whenever the catalogue names a picture, not only when the phone already
-                    // holds the file: the artwork route fetches a missing one, so a film the phone never
-                    // scrolled past still gets a cover on the TV.
-                    .put("posterUrl", if (item.posterSource != null) {
-                        artworkUrl(item.stableId, "poster")
-                    } else {
-                        JSONObject.NULL
-                    })
-                    .put("backdropUrl", if (item.backdropSource != null) {
-                        artworkUrl(item.stableId, "backdrop")
-                    } else {
-                        JSONObject.NULL
-                    })
-                    .put("sizeBytes", item.sizeBytes)
-                    .put("durationMs", item.durationMs)
-                    .put("width", item.width)
-                    .put("height", item.height)
-                    .put("mimeType", item.contentType)
-                    .put("resumeMs", item.resumeMs)
-                    .put("watchedAtMs", item.watchedAtMs)
-                    // Always a number, never absent: the film page calls toFixed() on this straight off
-                    // the response and a missing field is a blank page on the TV.
-                    .put("bitrateMbps", item.bitrateMbps)
-                    // Both always present. A television deciding whether to warn a viewer about a film
-                    // cannot tell an absent flag from a false one, and a missing `needsRemux` reads as a
-                    // film that will play; `audioCodec` is the exception, because a name that states no
-                    // audio has nothing honest to say and a badge drawn from a guess is worse than none.
-                    .put("audioCodec", item.audioCodec ?: JSONObject.NULL)
-                    .put("needsRemux", item.needsRemux)
-                    .put("source", if (item.keptHandle != null) "local" else "telegram")
+                    .put("key", group.key)
+                    .put("isSeries", group.isSeries)
+                    .put("title", group.title)
+                    .put("year", group.year ?: JSONObject.NULL)
+                    .put("overview", group.overview)
+                    .put("genres", JSONArray(group.genres))
+                    // Offered whenever the catalogue names a picture, not only when the phone already holds
+                    // the file: the artwork route fetches a missing one, so a film the viewer never scrolled
+                    // past on the phone still gets a cover here.
+                    .put(
+                        "posterUrl", group.posterItem?.let { artworkUrl(it.stableId, "poster") } ?: JSONObject.NULL
+                    )
+                    .put(
+                        "backdropUrl",
+                        group.backdropItem?.let { artworkUrl(it.stableId, "backdrop") } ?: JSONObject.NULL
+                    )
+                    .put(
+                        "logoUrl", group.logoItem?.let { artworkUrl(it.stableId, "logo") } ?: JSONObject.NULL
+                    )
+                    .put("episodes", episodes)
+                    .put("partCount", group.partCount)
+                    .put("seasonCount", group.seasonCount)
+                    .put("watchedAtMs", group.watchedAtMs)
+                    .put("playId", group.playId.toString())
+                    .put("playResumeMs", group.playResumeMs)
+                    .put("resumeId", group.resumeId?.toString() ?: JSONObject.NULL)
+                    .put("resumeMs", group.resumeMs)
+                    .put("resumeLengthMs", group.resumeLengthMs)
+                    .put("items", parts)
             )
         }
         return json(
             JSONObject()
                 .put("version", VERSION)
                 .put("generatedAt", System.currentTimeMillis())
-                .put("items", items),
+                .put("groups", groups),
         )
     }
 
@@ -319,7 +374,7 @@ class LocalStreamServer(
         val parts = idAndKind.split('/')
         if (parts.size != 2) return plain(Response.Status.NOT_FOUND, "")
         val id = parts[0].toLongOrNull() ?: return plain(Response.Status.NOT_FOUND, "")
-        val item = libraryItems().firstOrNull { it.stableId == id }
+        val item = libraryGroups().asSequence().flatMap { it.items }.firstOrNull { it.stableId == id }
             ?: return plain(Response.Status.NOT_FOUND, "")
         val file = ensureArtwork(item, parts[1])
             ?.takeIf { it.isFile } ?: return plain(Response.Status.NOT_FOUND, "")

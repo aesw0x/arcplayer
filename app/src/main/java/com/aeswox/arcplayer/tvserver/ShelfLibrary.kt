@@ -11,9 +11,17 @@ import com.aeswox.arcplayer.metadata.AudioTag
 import com.aeswox.arcplayer.metadata.MediaGuess
 import com.aeswox.arcplayer.metadata.MediaNameParser
 import com.aeswox.arcplayer.metadata.PosterCache
+import com.aeswox.arcplayer.metadata.PlayOrder
+import com.aeswox.arcplayer.metadata.TitleCandidate
 import com.aeswox.arcplayer.metadata.TitleDetail
+import com.aeswox.arcplayer.metadata.TitleGroups
+import com.aeswox.arcplayer.metadata.TitleKind
+import com.aeswox.arcplayer.metadata.nullIfBlank
+import com.aeswox.arcplayer.metadata.timingRequestFor
 import com.aeswox.arcplayer.metadata.titleDetailKey
+import com.aeswox.arcplayer.metadata.toTimingAnswer
 import com.aeswox.arcplayer.playback.ResumeBlob
+import com.aeswox.arcplayer.playback.TimingTrust
 import com.aeswox.arcplayer.playback.WatchedStamps
 import com.aeswox.arcplayer.subtitle.SubtitleMatch
 import org.json.JSONObject
@@ -22,7 +30,10 @@ import java.security.MessageDigest
 import java.util.Locale
 
 /**
- * One film the TV is allowed to ask for.
+ * One file the TV is allowed to ask for.
+ *
+ * A file is not always a work: two uploads of one film and ninety of one show are the same card, and
+ * [groups] is what says so.
  *
  * [cloudVideo] names the Telegram message wherever the bytes come from. [keptHandle] is present when a
  * complete offline copy exists and is always preferred; otherwise the stream server opens a cloud read
@@ -31,13 +42,24 @@ import java.util.Locale
 data class TvShelfItem(
     val stableId: Long,
     val fileName: String,
-    val title: String,
-    val subtitle: String?,
+    /**
+     * The name the catalogue gave this copy, or null when it never answered for it.
+     *
+     * A card takes its name from whichever of its copies has one of these: [fileName] is what an uploader
+     * typed, and "The Rookie · Episode 4" names a part, which belongs beneath a card rather than on it.
+     */
+    val cardTitle: String?,
+    /** Which part of the work this file is, off its own name. Both null for a film. */
+    val season: Int?,
+    val episode: Int?,
     val year: Int?,
     val overview: String,
     val genres: List<String>,
     val sizeBytes: Long,
     val durationMs: Long,
+    val introEndMs: Long?,
+    val outroStartMs: Long?,
+    val outroEndMs: Long?,
     val width: Int,
     val height: Int,
     val contentType: String,
@@ -58,6 +80,7 @@ data class TvShelfItem(
      */
     val posterSource: String?,
     val backdropSource: String?,
+    val logoSource: String?,
 ) {
     /**
      * Average bits per second, or zero when the length is unknown.
@@ -69,7 +92,61 @@ data class TvShelfItem(
         get() = if (durationMs <= 0L || sizeBytes <= 0L) 0.0 else sizeBytes * 8.0 / durationMs / 1000.0
 }
 
-/** Which gate of [ShelfLibrary.items] closed, in the order the reads happen. */
+/**
+ * One card on the television's shelf: a work, with every copy of it the phone holds filed underneath.
+ *
+ * [items] is a file list, and a file list is what made a viewer scroll past nine identical posters to
+ * reach the same film twice. This is the same shelf read the phone's own grid uses, so a numbered run
+ * of one show and two uploads of one film each get one card here too.
+ *
+ * The card speaks for the work — [title], [year], [overview], [genres] and the two pictures all come
+ * from whichever copy the catalogue actually answered for, which for a series is rarely the one whose
+ * file is first in the list. [playId] then names the part the card's button opens and [resumeId] the
+ * part still underway, so the television never has to work out on its own which of [items] a "Resume"
+ * belongs to; the byte routes keep taking a file id, because those are the bytes being fetched.
+ */
+data class TvShelfGroup(
+    val key: String,
+    val isSeries: Boolean,
+    val title: String,
+    val year: Int?,
+    val overview: String,
+    val genres: List<String>,
+    /** Best copy first inside each part, parts in watch order — the phone's own order, unchanged. */
+    val items: List<TvShelfItem>,
+    val playId: Long,
+    val playResumeMs: Long,
+    /** The part being watched, or null when every part here is either untouched or finished. */
+    val resumeId: Long?,
+    val resumeMs: Long,
+    val resumeLengthMs: Long,
+    /** The newest "opened" stamp anywhere in the group; the figure the hero is ranked on. */
+    val watchedAtMs: Long,
+    /** Distinct slots, not copies: every copy of a film belongs to its single slot. */
+    val partCount: Int,
+    val seasonCount: Int,
+    val posterItem: TvShelfItem?,
+    val backdropItem: TvShelfItem?,
+    val logoItem: TvShelfItem?,
+    val episodes: List<TvShelfEpisode>,
+)
+
+data class TvShelfEpisode(
+    val season: Int,
+    val episode: Int,
+    val playId: Long,
+    val resumeMs: Long,
+    val durationMs: Long,
+    val watched: Boolean,
+    val copyIds: List<Long>,
+)
+
+/**
+ * Which gate of [ShelfLibrary.groups] closed, in the order the reads happen.
+ *
+ * [served] counts cards, not files: a shelf that groups 193 files into one card has a grouping bug, and a
+ * count of what [items] handed over would call that healthy.
+ */
 data class ShelfCounts(
     val chatId: Long,
     val manifestHeaderChatId: String,
@@ -113,6 +190,7 @@ object ShelfLibrary {
         val watched = WatchedStamps.read(context)
         val cards = jsonObject(prefs.getString(KEY_CARDS, "{}"))
         val details = jsonObject(prefs.getString(KEY_DETAILS, "{}"))
+        val timings = jsonObject(prefs.getString(KEY_TIMINGS, "{}"))
         val showCards = manifest.mapNotNull { video ->
             val showCard = cards.optJSONObject(video.stableId.toString())
                 ?.takeIf { it.optBoolean("isSeries") }
@@ -134,6 +212,7 @@ object ShelfLibrary {
                 details.optJSONObject(titleDetailKey(id, isSeries))?.let(TitleDetail::fromJson)
             }
             val guess = MediaNameParser.parse(video.title)
+            val episodeGuess = guess as? MediaGuess.Episode
             val guessedYear = when (guess) {
                 is MediaGuess.Movie -> guess.year
                 is MediaGuess.Episode -> guess.year
@@ -141,7 +220,7 @@ object ShelfLibrary {
             }
             val measuredDuration = maxOf(video.durationMs, lengths[video.stableId] ?: 0L)
             val audio = AudioTag.of(video.title)
-            val showCard = (guess as? MediaGuess.Episode)
+            val showCard = episodeGuess
                 ?.series?.trim()?.lowercase(Locale.ROOT)?.let(showCards::get)
             val showDetail = showCard?.optInt("providerId")?.takeIf { it > 0 }?.let { id ->
                 details.optJSONObject(titleDetailKey(id, true))?.let(TitleDetail::fromJson)
@@ -150,21 +229,34 @@ object ShelfLibrary {
                 ?: showCard?.optString("poster")?.takeIf { it.isNotBlank() }
             val backdropSource = detail?.backdropUrl?.takeIf { it.isNotBlank() }
                 ?: showDetail?.backdropUrl?.takeIf { it.isNotBlank() }
+            val logoSource = rasterLogo(card) ?: rasterLogo(showCard)
+            val durationMs = if (measuredDuration > 0L) {
+                measuredDuration
+            } else {
+                ((detail ?: showDetail)?.runtimeMinutes ?: 0) * 60_000L
+            }
+            val timingRequest = timingRequestFor(
+                providerId ?: showCard?.optInt("providerId")?.takeIf { it > 0 },
+                guess,
+                (detail ?: showDetail)?.seasons.orEmpty(),
+            )
+            val trustedTimings = timingRequest?.let { timings.optJSONObject(it.key)?.toTimingAnswer() }
+                ?.let { TimingTrust.believe(it, durationMs) }
 
             TvShelfItem(
                 stableId = video.stableId,
                 fileName = video.title,
-                title = card?.optString("title")?.takeIf { it.isNotBlank() } ?: guess.fallbackTitle,
-                subtitle = card?.optString("subtitle")?.takeIf { it.isNotBlank() },
+                cardTitle = card?.optString("title")?.takeIf { it.isNotBlank() },
+                season = episodeGuess?.season,
+                episode = episodeGuess?.episode,
                 year = detail?.startYear ?: guessedYear,
                 overview = detail?.overview.orEmpty(),
                 genres = detail?.genres.orEmpty(),
                 sizeBytes = video.sizeBytes,
-                durationMs = if (measuredDuration > 0L) {
-                    measuredDuration
-                } else {
-                    (detail?.runtimeMinutes ?: 0) * 60_000L
-                },
+                durationMs = durationMs,
+                introEndMs = trustedTimings?.introEndMs,
+                outroStartMs = trustedTimings?.outroStartMs,
+                outroEndMs = trustedTimings?.outroEndMs,
                 width = video.width,
                 height = video.height,
                 contentType = contentTypeFor(video.title, video.mimeType),
@@ -178,6 +270,100 @@ object ShelfLibrary {
                 backdropFile = cachedArtwork(context, backdropSource),
                 posterSource = posterSource,
                 backdropSource = backdropSource,
+                logoSource = logoSource,
+            )
+        }
+    }
+
+    /**
+     * The shelf as the television should draw it: one card per work, not one per file.
+     *
+     * [items] answers with a file for every row the manifest carries, so a show uploaded episode by
+     * episode arrived as ninety cards and a film uploaded twice arrived twice — which is what the viewer
+     * saw as nine identical posters running down one row. The grouping is the phone's own [TitleGroups]
+     * asked of the same names its grid reads, so the two shelves cannot disagree about what one work is,
+     * and the part a card plays is [PlayOrder]'s answer, the same one the phone's Play button gets, so a
+     * television resumes the episode the viewer is actually inside rather than the lowest number the
+     * channel still owes.
+     */
+    fun groups(context: Context): List<TvShelfGroup> {
+        val files = items(context)
+        if (files.isEmpty()) return emptyList()
+
+        val byId = files.associateBy { it.stableId }
+        val lengths = files.associate { it.stableId to it.durationMs }
+        val resumes = files.associate { it.stableId to it.resumeMs }
+        val lastPlayed = files.associate { it.stableId to it.watchedAtMs }
+        val savedIds = files.filter { it.keptHandle != null }.map { it.stableId }.toSet()
+        val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val finishedMs = numberMap(prefs.getString(KEY_FINISHED, "{}"))
+
+        return TitleGroups.group(
+            files.map { TitleCandidate(it.stableId, it.fileName, it.sizeBytes, it.height, it.keptHandle != null) }
+        ).mapNotNull { work ->
+            val parts = work.parts.mapNotNull { byId[it.id] }
+            if (parts.isEmpty()) return@mapNotNull null
+
+            // One slot per part, its copies best first, the slots in watch order — the shape PlayOrder reads.
+            val slots = work.parts
+                .groupBy { (it.season ?: 0) to (it.episode ?: 0) }
+                .values
+                .map { part -> part.map { it.id } }
+            val positionByCopy = PlayOrder.positionByCopy(slots, resumes)
+            val play = PlayOrder.nextCopy(slots, positionByCopy, lengths, lastPlayed, savedIds)
+            val underway = PlayOrder.progress(slots, positionByCopy, lengths, lastPlayed, savedIds)
+            val episodes = if (work.kind == TitleKind.SERIES) {
+                // Normalize browsing slots separately so the existing work-level play choice stays unchanged.
+                val episodeSlots = work.parts
+                    .groupBy { (it.season ?: 1) to (it.episode ?: 0) }
+                    .mapValues { (_, copies) -> copies.map { it.id } }
+                val episodePositions = PlayOrder.positionByCopy(episodeSlots.values.toList(), resumes)
+                episodeSlots.map { (number, slot) ->
+                    val episodePlay = PlayOrder.nextCopy(listOf(slot), episodePositions, lengths, lastPlayed, savedIds)
+                    val playId = episodePlay?.partId ?: slot.first()
+                    val standing = PlayOrder.standing(
+                        episodes = listOf(number.second to slot),
+                        resumeMs = episodePositions,
+                        lengthsMs = lengths,
+                        finishedMs = finishedMs,
+                    ).episodes.single()
+                    TvShelfEpisode(
+                        season = number.first,
+                        episode = number.second,
+                        playId = playId,
+                        resumeMs = episodePlay?.resumeMs ?: 0L,
+                        durationMs = lengths[playId]?.takeIf { it > 0L }
+                            ?: (slot.maxOfOrNull { lengths[it] ?: 0L } ?: 0L),
+                        watched = standing.watch == PlayOrder.EpisodeWatch.WATCHED,
+                        copyIds = slot,
+                    )
+                }.sortedWith(compareBy(TvShelfEpisode::season, TvShelfEpisode::episode))
+            } else {
+                emptyList()
+            }
+
+            TvShelfGroup(
+                key = work.key,
+                isSeries = work.kind == TitleKind.SERIES,
+                // A catalogue name beats the parser's whenever one of the copies carries it, because the
+                // parser reads what an uploader typed and gets the work's name right only by luck.
+                title = parts.firstOrNull { it.cardTitle != null }?.cardTitle ?: work.displayTitle,
+                year = parts.firstOrNull { it.year != null }?.year ?: work.year,
+                overview = parts.firstOrNull { it.overview.isNotBlank() }?.overview.orEmpty(),
+                genres = parts.firstOrNull { it.genres.isNotEmpty() }?.genres.orEmpty(),
+                items = parts,
+                playId = play?.partId ?: parts.first().stableId,
+                playResumeMs = play?.resumeMs ?: 0L,
+                resumeId = underway?.partId,
+                resumeMs = underway?.resumeMs ?: 0L,
+                resumeLengthMs = underway?.lengthMs ?: 0L,
+                watchedAtMs = parts.maxOfOrNull { it.watchedAtMs } ?: 0L,
+                partCount = slots.size,
+                seasonCount = work.seasons.size,
+                posterItem = parts.firstOrNull { it.posterSource != null },
+                backdropItem = parts.firstOrNull { it.backdropSource != null },
+                logoItem = parts.firstOrNull { it.logoSource != null },
+                episodes = episodes,
             )
         }
     }
@@ -192,6 +378,7 @@ object ShelfLibrary {
     fun artworkFile(context: Context, item: TvShelfItem, kind: String): File? = when (kind) {
         "poster" -> item.posterFile ?: PosterCache.diskImage(context, item.posterSource)
         "backdrop" -> item.backdropFile ?: PosterCache.diskImage(context, item.backdropSource)
+        "logo" -> cachedArtwork(context, item.logoSource) ?: PosterCache.diskImage(context, item.logoSource)
         else -> null
     }
 
@@ -260,7 +447,7 @@ object ShelfLibrary {
             ledgerRows = kept.size,
             keptComplete = kept.values.count { it.isComplete },
             keptInCatalog = kept.values.count { it.isComplete && DownloadLedger.isCatalogHandle(it.path) },
-            served = items(context).size,
+            served = groups(context).size,
         )
     }
 
@@ -268,6 +455,12 @@ object ShelfLibrary {
 
     private fun jsonObject(text: String?): JSONObject =
         runCatching { JSONObject(text ?: "{}") }.getOrElse { JSONObject() }
+
+    private fun rasterLogo(card: JSONObject?): String? =
+        card?.optString("logo").nullIfBlank()?.takeIf { url ->
+            url.substringBefore('?').substringBefore('#').substringAfterLast('.', "")
+                .lowercase(Locale.ROOT) in RASTER_LOGO_EXTENSIONS
+        }
 
     private fun cachedArtwork(context: Context, url: String?): File? {
         if (url.isNullOrBlank()) return null
@@ -326,4 +519,7 @@ object ShelfLibrary {
     private const val KEY_LENGTHS = "known_lengths"
     private const val KEY_CARDS = "media_cards"
     private const val KEY_DETAILS = "title_details"
+    private const val KEY_TIMINGS = "episode_timings"
+    private const val KEY_FINISHED = "film_finished_at"
+    private val RASTER_LOGO_EXTENSIONS = setOf("png", "jpg", "jpeg", "webp", "gif", "bmp")
 }
