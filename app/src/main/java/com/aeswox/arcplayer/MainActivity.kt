@@ -9053,8 +9053,9 @@ private fun SettingsContent(
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Serve films to a TV", fontSize = 14.sp, fontWeight = FontWeight.Medium)
                             Text(
-                                "A TV on the same Wi-Fi browses and plays what this phone is holding. " +
-                                    "Only films fully downloaded are offered.",
+                                "A TV on the same Wi-Fi browses and plays your whole shelf. " +
+                                    "Copies this phone is holding play from storage; the rest stream " +
+                                    "from Telegram.",
                                 fontSize = 12.sp,
                                 color = OneUiTextSecondary
                             )
