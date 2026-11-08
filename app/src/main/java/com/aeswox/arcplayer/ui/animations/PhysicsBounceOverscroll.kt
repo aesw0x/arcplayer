@@ -16,7 +16,6 @@ import androidx.compose.ui.unit.Velocity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
@@ -98,6 +97,10 @@ fun Modifier.physicsBounceOverscroll(isHorizontal: Boolean = false, displacement
 
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
                 if (!isFinger(source)) return Offset.Zero
+                // A finger that lands owns the surface from wherever the swing had got to. Stopping
+                // the oscillator here, before any branch below can return early, is what keeps it
+                // from writing its own curve over this drag on every frame that follows.
+                swing?.cancel()
                 val current = displacementAnim.value
                 if (current == 0f) return Offset.Zero
                 // Pulling back towards rest is charged to the stretch first, so the surface unwinds
@@ -106,7 +109,6 @@ fun Modifier.physicsBounceOverscroll(isHorizontal: Boolean = false, displacement
                 if (along == 0f || sign(current) == sign(along)) return Offset.Zero
                 val proposed = current + along * STRETCH_GRIP
                 val crossedRest = sign(proposed) != sign(current)
-                swing?.cancel()
                 swing = scope.launch { displacementAnim.snapTo(if (crossedRest) 0f else proposed) }
                 return if (crossedRest) {
                     if (isHorizontal) Offset(-current / STRETCH_GRIP, 0f) else Offset(0f, -current / STRETCH_GRIP)
@@ -145,9 +147,15 @@ fun Modifier.physicsBounceOverscroll(isHorizontal: Boolean = false, displacement
                     (abs(releasedFrom) / 100f).coerceIn(0.1f, 1f)
                 }
                 val pixelScale = 3000f * settings.amplitudeMultiplier
-                val startedAt = withFrameNanos { it }
 
-                try {
+                // The swing runs in a job this connection holds, not inline in the fling. Compose
+                // launches a whole fling — post-fling dispatch included — into a detached coroutine
+                // it never cancels when a finger lands, so a loop that lived there would out-write
+                // every drag with its own curve until the window had simply run out. Cancelling this
+                // job leaves the displacement where the swing stood, which is where the finger picks
+                // it up.
+                swing = scope.launch {
+                    val startedAt = withFrameNanos { it }
                     while (true) {
                         val elapsed = withFrameNanos { it } - startedAt
                         if (elapsed > BOUNCE_DURATION_NS) {
@@ -157,15 +165,10 @@ fun Modifier.physicsBounceOverscroll(isHorizontal: Boolean = false, displacement
                         val t = elapsed / 1_000_000_000f
                         val decay = exp(-decayRate * t)
                         // The swing that starts from rest plus the stretched surface falling back.
-                        val seconds = t
-                        val swingPx = force * direction * pixelScale * amplitude * decay * sin(drivePulse * seconds)
-                        val settlePx = releasedFrom * decay * cos(drivePulse * seconds)
+                        val swingPx = force * direction * pixelScale * amplitude * decay * sin(drivePulse * t)
+                        val settlePx = releasedFrom * decay * cos(drivePulse * t)
                         displacementAnim.snapTo(swingPx + settlePx)
                     }
-                } catch (intercepted: CancellationException) {
-                    // A finger that lands mid-swing takes the surface from where it stands, so the
-                    // displacement is left as it is rather than snapped flat.
-                    throw intercepted
                 }
                 return if (isHorizontal) Velocity(leftoverVelocity, 0f) else Velocity(0f, leftoverVelocity)
             }
