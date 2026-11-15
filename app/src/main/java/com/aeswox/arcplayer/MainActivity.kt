@@ -1939,6 +1939,7 @@ class ArcVlcPlayerEngine(
     private fun vlcInstanceArgs(): ArrayList<String> {
         val args = arrayListOf(
             "--avcodec-hw=any",
+            "--vout=android_display",
             "--android-display-chroma=RV32",
             "--no-drop-late-frames",
             "--no-skip-frames"
@@ -2180,6 +2181,9 @@ class ArcVlcPlayerEngine(
     var videoAspectRatio by mutableFloatStateOf(16f / 9f)
         private set
 
+    var videoVerticalCompensation by mutableFloatStateOf(1f)
+        private set
+
     /**
      * Whether [videoAspectRatio] is the film's own or the placeholder the layout is drawn against
      * before libVLC has reported a video track.
@@ -2387,6 +2391,7 @@ class ArcVlcPlayerEngine(
         pausedByViewer = false
         isBuffering = false
         videoLayoutKnown = false
+        videoVerticalCompensation = 1f
         lastTickAtMs = BufferGuard.NEVER
         playOwedSinceMs = BufferGuard.NEVER
         currentPositionMs = startPositionMs.coerceAtLeast(0L)
@@ -2489,28 +2494,26 @@ class ArcVlcPlayerEngine(
     ) {
         val w = if (visibleWidth > 0) visibleWidth else width
         val h = if (visibleHeight > 0) visibleHeight else height
+        // android_display scales the coded buffer, including rows outside the visible picture.
+        val verticalCompensation = if (height > 0 && visibleHeight > 0) {
+            height / visibleHeight.toFloat()
+        } else {
+            1f
+        }
         if (w > 0 && h > 0) {
             val sar = if (sarNum > 0 && sarDen > 0) sarNum.toFloat() / sarDen.toFloat() else 1f
             val ratio = (w * sar) / h.toFloat()
             if (ratio in 0.25f..4.0f) {
                 mainHandler.post {
                     videoAspectRatio = ratio
+                    videoVerticalCompensation = verticalCompensation
                     videoLayoutKnown = true
                 }
             }
         }
     }
 
-    /**
-     * The film's own shape, read off the track the decoder is actually showing.
-     *
-     * [onNewVideoLayout] is the documented source for this and it never answers on a real phone:
-     * measured on a Note10+, every call it made carried six zeros, so the layout kept drawing against
-     * the 16:9 placeholder and nothing downstream ever learned the film was widescreen. The selected
-     * video track holds the same numbers — the coded size, plus the sample aspect ratio that says how
-     * wide each of those pixels is — and the player is already asked for it once the picture exists,
-     * which is why this runs from the same event rather than on a poll of its own.
-     */
+    // Fallback for vouts that do not report usable dimensions.
     private fun publishVideoLayout() {
         val track = runCatching { mediaPlayer.currentVideoTrack }.getOrNull() ?: return
         val width = track.width
@@ -11756,6 +11759,11 @@ private fun HeroVlcVideoPlayerScreen(
                         .align(Alignment.Center)
                         .aspectRatio(videoRatio)
                         .graphicsLayer {
+                            val verticalCompensation = vlcEngine.videoVerticalCompensation
+                            transformOrigin = TransformOrigin(
+                                0.5f,
+                                if (verticalCompensation > 1f) 0f else 0.5f
+                            )
                             if (fitW > 0 && fitH > 0) {
                                 when (scaleMode) {
                                     VideoScaleMode.FIT -> {
@@ -11775,6 +11783,7 @@ private fun HeroVlcVideoPlayerScreen(
                                         scaleY = cover
                                     }
                                 }
+                                scaleY *= verticalCompensation
                             }
                         }
                         .onSizeChanged { intSize ->
