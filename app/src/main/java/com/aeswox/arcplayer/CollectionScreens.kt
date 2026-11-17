@@ -295,12 +295,24 @@ private fun buildCollectionShelf(
  * transition. What comes back is the state, not its contents, so each tab reads the shelf in its own
  * scope and a late catalogue answer redraws the page showing it rather than only the page that asked.
  */
+/**
+ * The shelf plus the one manual way to ask Telegram for it again.
+ *
+ * [refreshing] is deliberately not [CollectionShelf.loading]: a pull that blanks the grid would look
+ * like the collection had been lost, so the cards stay on screen while the walk runs underneath them.
+ */
+internal class CollectionShelfHandle(
+    val shelf: State<CollectionShelf>,
+    val refreshing: Boolean,
+    val refresh: () -> Unit
+)
+
 @Composable
 internal fun rememberCollectionShelf(
     repository: CloudRepository,
     prefsStore: ArcPreferencesStore,
     snapshot: MediaLibrarySnapshot
-): State<CollectionShelf> {
+): CollectionShelfHandle {
     val videosByChat by repository.videos.collectAsState()
     val auth by repository.authState.collectAsState()
     val downloads by repository.downloads.collectAsState()
@@ -338,6 +350,34 @@ internal fun rememberCollectionShelf(
         }
     }
 
+    var refreshTick by remember { mutableStateOf(0) }
+    var refreshing by remember { mutableStateOf(false) }
+    val refreshAuthorized by rememberUpdatedState(authorized)
+    val refreshShelfId by rememberUpdatedState(shelfId)
+    LaunchedEffect(refreshTick) {
+        if (refreshTick == 0 || !refreshAuthorized || refreshShelfId == 0L) return@LaunchedEffect
+        refreshing = true
+        readFailed = false
+        try {
+            when (val result = repository.readShelf(refreshShelfId)) {
+                is CloudRepository.ShelfRead.Ready -> {
+                    gone = false
+                    if (result.chatId != refreshShelfId) prefsStore.rememberMovieFolder(result.chatId)
+                }
+                CloudRepository.ShelfRead.Gone -> gone = true
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            readFailed = true
+        } finally {
+            refreshing = false
+        }
+    }
+    val refresh: () -> Unit = {
+        if (!refreshing && !loading && authorized && shelfId != 0L) refreshTick++
+    }
+
     // Handed back as the state rather than its contents: the tabs read it in their own scope, so a late
     // catalogue answer redraws the page that shows it instead of only the page that asked.
     val shelf = remember(repository, prefsStore, snapshot, authorized, connectionKnown, shelfId) {
@@ -353,7 +393,7 @@ internal fun rememberCollectionShelf(
     // comes with the title's detail. Asked here rather than when a page opens, because a card that
     // swaps its own artwork at the moment of the tap is a visible flicker behind the incoming page.
     ShelfArtworkWarmPass(shelf.value.titles, prefsStore)
-    return shelf
+    return CollectionShelfHandle(shelf, refreshing, refresh)
 }
 
 @Composable
@@ -372,7 +412,9 @@ internal fun CollectionScreens(
     onOpenPlaylists: () -> Unit,
     onManageCollection: () -> Unit,
     activeDownloads: Int,
-    onOpenDownloads: () -> Unit
+    onOpenDownloads: () -> Unit,
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit
 ) {
     if (tab == BottomNavTab.SETTINGS) return
     val shelf = shelfState.value
@@ -389,6 +431,7 @@ internal fun CollectionScreens(
     val onShelf = shelf.onShelf
     val continuing = shelf.continuing
     val savedIds = shelf.savedIds
+    val pullRefreshEnabled = authorized && connectionKnown && !gone && !loading
     val favourites = prefsStore.favoriteIds
     val playResume: (CollectionResume) -> Unit = { entry ->
         val title = entry.title
@@ -413,6 +456,7 @@ internal fun CollectionScreens(
     var filter by rememberSaveable { mutableStateOf(CollectionFilter.ALL) }
     var query by rememberSaveable { mutableStateOf("") }
     val homeScroll = rememberLazyListState()
+    val libraryPull = remember { Animatable(0f) }
     BackHandler(enabled = browse != null) { browse = null }
     val selectedFilter = browse ?: filter
     val filtered = titles.filter {
@@ -450,8 +494,9 @@ internal fun CollectionScreens(
     Box(Modifier.fillMaxSize().background(JellyBackground)) {
         when {
             browse != null || tab == BottomNavTab.LIBRARY -> {
+                ShelfRefreshOnPull(libraryPull, pullRefreshEnabled && !isRefreshing, onRefresh)
                 LazyVerticalGrid(
-                    columns = GridCells.Adaptive(128.dp), modifier = Modifier.physicsBounceOverscroll().fillMaxSize(),
+                    columns = GridCells.Adaptive(128.dp), modifier = Modifier.physicsBounceOverscroll(displacement = libraryPull).fillMaxSize(),
                     contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = topInset + 24.dp, bottom = bottomInset + 120.dp),
                     horizontalArrangement = Arrangement.spacedBy(16.dp), verticalArrangement = Arrangement.spacedBy(24.dp)
                 ) {
@@ -570,6 +615,7 @@ internal fun CollectionScreens(
                     val heroHeight = rememberCollectionHeroHeight()
                     val heroPager = rememberPagerState(pageCount = { featured.size })
                     val heroPull = remember { Animatable(0f) }
+                    ShelfRefreshOnPull(heroPull, pullRefreshEnabled && !isRefreshing, onRefresh)
                     val heroArrival = rememberHeroArrival(featured.isNotEmpty())
                     // The rails wait for the picture. A lead that applies when there is no picture to
                     // wait for would just be a delay, so it is only paid when the hero has something to
@@ -629,6 +675,37 @@ internal fun CollectionScreens(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/** How far the top stretch must give before letting go counts as asking for the shelf again. */
+private const val REFRESH_ARM_PX = 100f
+
+/**
+ * A pull-down at the top of a collection page asks Telegram for the shelf again, in the background.
+ *
+ * Nothing here draws or moves: the page keeps its own bounce exactly as it was, and this only reads
+ * the stretch the bounce already publishes. Past [REFRESH_ARM_PX] the pull is armed; the first return
+ * through rest — a release or a drag back — is the gesture letting go, and the walk starts then.
+ */
+@Composable
+private fun ShelfRefreshOnPull(pull: Animatable<Float, *>, enabled: Boolean, onRefresh: () -> Unit) {
+    val active by rememberUpdatedState(enabled)
+    val trigger by rememberUpdatedState(onRefresh)
+    LaunchedEffect(pull) {
+        var armed = false
+        snapshotFlow { pull.value }.collect { value ->
+            if (!active) {
+                armed = false
+                return@collect
+            }
+            if (value > REFRESH_ARM_PX) armed = true
+            else if (armed && value <= 0f) {
+                armed = false
+                AppHaptics.refresh()
+                trigger()
             }
         }
     }

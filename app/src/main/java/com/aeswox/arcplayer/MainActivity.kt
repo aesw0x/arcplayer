@@ -203,6 +203,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithCache
@@ -260,6 +261,7 @@ import com.aeswox.arcplayer.ui.animations.rememberHeaderActionsVisible
 import com.aeswox.arcplayer.ui.animations.jellyCombinedClickable
 import com.aeswox.arcplayer.ui.animations.jellyTabCrossSlide
 import com.aeswox.arcplayer.ui.animations.jellySkeletonSweep
+import com.aeswox.arcplayer.ui.animations.JellySkeleton
 import com.aeswox.arcplayer.ui.animations.physicsBounceOverscroll
 import com.aeswox.arcplayer.ui.components.AppIntro
 import com.aeswox.arcplayer.update.Release
@@ -308,6 +310,7 @@ import com.aeswox.arcplayer.cloud.CloudProgress
 import com.aeswox.arcplayer.cloud.SHELF_CHANNEL_TITLE
 import com.aeswox.arcplayer.cloud.formatCloudBytes
 import com.aeswox.arcplayer.metadata.AbsoluteSeasons
+import com.aeswox.arcplayer.metadata.CastMember
 import com.aeswox.arcplayer.metadata.EpisodeDetail
 import com.aeswox.arcplayer.metadata.LookupRequest
 import com.aeswox.arcplayer.metadata.MediaCard
@@ -315,11 +318,15 @@ import com.aeswox.arcplayer.metadata.MediaGuess
 import com.aeswox.arcplayer.metadata.MediaLibrary
 import com.aeswox.arcplayer.metadata.MediaNameParser
 import com.aeswox.arcplayer.metadata.PosterCache
+import com.aeswox.arcplayer.metadata.PersonCredits
+import com.aeswox.arcplayer.metadata.PersonCredit
+import com.aeswox.arcplayer.metadata.PersonDetail
 import com.aeswox.arcplayer.metadata.PlayOrder
 import com.aeswox.arcplayer.metadata.ReleaseInfo
 import com.aeswox.arcplayer.metadata.ShelfSearch
 import com.aeswox.arcplayer.metadata.SkipTimingLibrary
 import com.aeswox.arcplayer.metadata.TmdbDetails
+import com.aeswox.arcplayer.metadata.TmdbPeople
 import com.aeswox.arcplayer.metadata.TmdbSearch
 import com.aeswox.arcplayer.metadata.TmdbSearchResult
 import com.aeswox.arcplayer.metadata.TimingRequest
@@ -566,6 +573,14 @@ class ArcPreferencesStore(context: Context) {
     val titleDetails = mutableStateMapOf<String, TitleDetail>()
 
     /**
+     * A cast member's page, keyed by the catalogue's person id.
+     *
+     * The same actor sits in the cast of several shelf titles, and every one of those headshots opens
+     * the same page; keying by person is what makes the second tap free.
+     */
+    val personDetails = mutableStateMapOf<Int, PersonDetail>()
+
+    /**
      * One season's episodes, keyed the same way as [titleDetails].
      *
      * Deliberately not written to disk: a season list is only ever read on the page that asked for it,
@@ -804,6 +819,12 @@ class ArcPreferencesStore(context: Context) {
                 TitleDetail.fromJson(obj)?.let { titleDetails[key] = it }
             }
 
+            val personJson = JSONObject(prefs.getString("person_details", "{}") ?: "{}")
+            personJson.keys().forEach { key ->
+                val obj = personJson.optJSONObject(key) ?: return@forEach
+                PersonDetail.fromJson(obj)?.let { personDetails[it.id] = it }
+            }
+
             val timingJson = JSONObject(prefs.getString("episode_timings", "{}") ?: "{}")
             timingJson.keys().forEach { key ->
                 val obj = timingJson.optJSONObject(key) ?: return@forEach
@@ -864,6 +885,16 @@ class ArcPreferencesStore(context: Context) {
         val obj = JSONObject()
         titleDetails.forEach { (key, detail) -> obj.put(key, detail.toJson()) }
         prefs.edit().putString("title_details", obj.toString()).apply()
+    }
+
+    /** The page for one cast member, or null when no headshot of theirs has been tapped yet. */
+    fun personDetail(personId: Int): PersonDetail? = personDetails[personId]
+
+    fun rememberPersonDetail(detail: PersonDetail) {
+        personDetails[detail.id] = detail
+        val obj = JSONObject()
+        personDetails.forEach { (id, person) -> obj.put(id.toString(), person.toJson()) }
+        prefs.edit().putString("person_details", obj.toString()).apply()
     }
 
     /**
@@ -3069,7 +3100,23 @@ fun ArcPlayerHomeScreen() {
      */
     var shelfTitle by remember { mutableStateOf<ShelfTitle?>(null) }
     var lastShelfTitle by remember { mutableStateOf<ShelfTitle?>(null) }
-    LaunchedEffect(shelfTitle) { shelfTitle?.let { lastShelfTitle = it } }
+    /**
+     * The cast headshot tapped on a title page, pushed over that page as a third level.
+     *
+     * Only a cast tap opens it — there is no search route and no rail of people anywhere else — so the
+     * payload is the cast row itself, which already carries the name and face to draw while the
+     * catalogue answer is on its way. Cleared with the title page beneath it: a person left standing
+     * over a shelf that has closed would be a page with no way back to where it came from.
+     */
+    var personPage by remember { mutableStateOf<CastMember?>(null) }
+    var lastPersonPage by remember { mutableStateOf<CastMember?>(null) }
+    LaunchedEffect(personPage) { personPage?.let { lastPersonPage = it } }
+    LaunchedEffect(shelfTitle) {
+        shelfTitle?.let { lastShelfTitle = it }
+        if (shelfTitle == null) personPage = null
+    }
+    /** The shelf's titles, published out of the receding box so a person page can tell held work from not. */
+    var shelfTitlesSnapshot by remember { mutableStateOf<List<ShelfTitle>>(emptyList()) }
     // The shelf's own recede while a title page slides in over it. Frosted Jelly runs a detail push as
     // two independent destination transitions rather than one linked number: the screen leaving dims on
     // the shorter fade and shrinks on the longer slide, which is what gives the incoming page depth.
@@ -3087,6 +3134,21 @@ fun ArcPlayerHomeScreen() {
         animationSpec = if (detailOpen) tween(durationMillis = 400)
         else spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessLow),
         label = "ShelfRecedeFade"
+    )
+    // The same two transitions one level up: the title page recedes under a person page exactly as the
+    // shelf recedes under it, so depth reads the same at every step of the stack.
+    val personOpen = personPage != null
+    val infoRecede by animateFloatAsState(
+        targetValue = if (personOpen) 1f else 0f,
+        animationSpec = if (personOpen) tween(durationMillis = 600, easing = DetailPushEase)
+        else spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
+        label = "InfoRecedeScale"
+    )
+    val infoDim by animateFloatAsState(
+        targetValue = if (personOpen) 1f else 0f,
+        animationSpec = if (personOpen) tween(durationMillis = 400)
+        else spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessLow),
+        label = "InfoRecedeFade"
     )
     val cloudRepository = remember(
         prefsStore.telegramApiId,
@@ -3391,6 +3453,11 @@ fun ArcPlayerHomeScreen() {
     BackHandler(enabled = activePlayback == null && shelfTitle != null) {
         shelfTitle = null
     }
+    // Composed after the title page's handler so it wins while a person page is up: one back press
+    // unwinds one level, landing on the title whose cast was tapped rather than on the shelf.
+    BackHandler(enabled = activePlayback == null && personPage != null) {
+        personPage = null
+    }
 
     val foldersGridState = rememberLazyGridState()
     val allVideosGridState = rememberLazyGridState()
@@ -3586,7 +3653,9 @@ fun ArcPlayerHomeScreen() {
                 // shelf away with the page that held it, and rebuilding it re-ran the catalogue passes,
                 // which write back into the same prefs a rebuild reads from: measured on the Note as
                 // three full library parses of ~260 ms each between the tap and the first moved pixel.
-                val shelfState = rememberCollectionShelf(cloudRepository, prefsStore, librarySnapshot)
+                val shelfHandle = rememberCollectionShelf(cloudRepository, prefsStore, librarySnapshot)
+                val shelfState = shelfHandle.shelf
+                LaunchedEffect(shelfState.value.titles) { shelfTitlesSnapshot = shelfState.value.titles }
                 // The library every screen below reads. The raw scan is the camera roll as much as it is
                 // the collection, and the shelf is the one pass that can tell a film from a clip, so the
                 // device screens, the playlists and the Settings counts all work off this narrowed copy
@@ -3654,7 +3723,9 @@ fun ArcPlayerHomeScreen() {
                         // and a Library tab that recomposes with them is a Library tab that drops frames
                         // while a film is arriving.
                         activeDownloads = cloudDownloads.values.count { !it.isComplete },
-                        onOpenDownloads = { openLibraryBrowser(LibraryPage.DOWNLOADS, CloudScreen.SHELF) }
+                        onOpenDownloads = { openLibraryBrowser(LibraryPage.DOWNLOADS, CloudScreen.SHELF) },
+                        isRefreshing = shelfHandle.refreshing,
+                        onRefresh = shelfHandle.refresh
                     )
                     }
                     }
@@ -4069,39 +4140,78 @@ fun ArcPlayerHomeScreen() {
                         modifier = Modifier.fillMaxSize()
                     ) {
                         (shelfTitle ?: lastShelfTitle)?.let { opened ->
-                            CloudTitleInfoPage(
-                                title = opened,
+                            Box(
+                                modifier = Modifier.fillMaxSize().graphicsLayer {
+                                    scaleX = 1f - 0.06f * infoRecede
+                                    scaleY = 1f - 0.06f * infoRecede
+                                    alpha = 1f - infoDim
+                                }
+                            ) {
+                                CloudTitleInfoPage(
+                                    title = opened,
+                                    prefsStore = prefsStore,
+                                    statusText = cloudStatus,
+                                    isResolving = cloudResolving,
+                                    downloads = cloudDownloads,
+                                    keepLine = keepLine,
+                                    downloadProgress = cloudRepository.progress,
+                                    topInset = statusBarTopPadding,
+                                    bottomInset = navBarBottomPadding,
+                                    onBack = { shelfTitle = null },
+                                    onOpenPerson = { member -> personPage = member },
+                                    onPlay = { item, list, slots -> launchShelfVideo(item, list, slots, opened.card) },
+                                    onRemove = removeFromShelf,
+                                    onDownload = { file ->
+                                        if (DownloadNotifier.needsPermissionAsk(context)) {
+                                            notificationsLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                                        }
+                                        coroutineScope.launch { cloudRepository.download(file) }
+                                    },
+                                    onCancelDownload = { file -> coroutineScope.launch { cloudRepository.cancelDownload(file) } },
+                                    onRemoveDownload = { file -> coroutineScope.launch { cloudRepository.removeDownload(file) } },
+                                    onDownloadBatch = { files ->
+                                        if (DownloadNotifier.needsPermissionAsk(context)) {
+                                            notificationsLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                                        }
+                                        coroutineScope.launch {
+                                            files.forEach { file -> cloudRepository.download(file) }
+                                        }
+                                    },
+                                    onCancelBatch = { files ->
+                                        coroutineScope.launch {
+                                            files.forEach { file -> cloudRepository.cancelDownload(file) }
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    // A cast headshot opens the person behind it, pushed over the title page on the same
+                    // curve and the same recede. It is the third level of the same stack, so it leaves the
+                    // way it came and lands on the title whose cast was tapped.
+                    AnimatedVisibility(
+                        visible = personPage != null,
+                        enter = fadeIn(tween(400)) +
+                            slideInHorizontally(tween(600, easing = DetailPushEase)) { it },
+                        exit = fadeOut(tween(400)) +
+                            slideOutHorizontally(tween(600, easing = DetailPushEase)) { it },
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        (personPage ?: lastPersonPage)?.let { member ->
+                            PersonPage(
+                                member = member,
                                 prefsStore = prefsStore,
-                                statusText = cloudStatus,
-                                isResolving = cloudResolving,
-                                downloads = cloudDownloads,
-                                keepLine = keepLine,
-                                downloadProgress = cloudRepository.progress,
+                                heldTitles = shelfTitlesSnapshot,
                                 topInset = statusBarTopPadding,
                                 bottomInset = navBarBottomPadding,
-                                onBack = { shelfTitle = null },
-                                onPlay = { item, list, slots -> launchShelfVideo(item, list, slots, opened.card) },
-                                onRemove = removeFromShelf,
-                                onDownload = { file ->
-                                    if (DownloadNotifier.needsPermissionAsk(context)) {
-                                        notificationsLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-                                    }
-                                    coroutineScope.launch { cloudRepository.download(file) }
-                                },
-                                onCancelDownload = { file -> coroutineScope.launch { cloudRepository.cancelDownload(file) } },
-                                onRemoveDownload = { file -> coroutineScope.launch { cloudRepository.removeDownload(file) } },
-                                onDownloadBatch = { files ->
-                                    if (DownloadNotifier.needsPermissionAsk(context)) {
-                                        notificationsLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-                                    }
-                                    coroutineScope.launch {
-                                        files.forEach { file -> cloudRepository.download(file) }
-                                    }
-                                },
-                                onCancelBatch = { files ->
-                                    coroutineScope.launch {
-                                        files.forEach { file -> cloudRepository.cancelDownload(file) }
-                                    }
+                                onBack = { personPage = null },
+                                onOpenTitle = { held ->
+                                    // Forward, not deeper: the work replaces the title page underneath and
+                                    // the person page leaves, so one back press from the new title lands on
+                                    // the shelf rather than on a filmography nobody asked to return to.
+                                    personPage = null
+                                    shelfTitle = held
                                 }
                             )
                         }
@@ -5702,6 +5812,7 @@ private fun CloudTitleInfoPage(
     topInset: Dp,
     bottomInset: Dp,
     onBack: () -> Unit,
+    onOpenPerson: (CastMember) -> Unit = {},
     onPlay: (Playable, List<Playable>, List<List<Long>>) -> Unit,
     onRemove: (ShelfTitle) -> Unit,
     onDownload: (CloudVideoItem) -> Unit,
@@ -6195,7 +6306,7 @@ private fun CloudTitleInfoPage(
                             StaggeredListItem(6, "$arrivalKey:cast") {
                                 Column {
                                     InfoSectionHeading("Cast")
-                                    InfoCastRail(info)
+                                    InfoCastRail(info, onOpenPerson)
                                 }
                             }
                         }
@@ -6869,7 +6980,7 @@ private fun InfoSectionHeading(text: String) {
 }
 
 @Composable
-private fun InfoCastRail(detail: TitleDetail) {
+private fun InfoCastRail(detail: TitleDetail, onOpenPerson: (CastMember) -> Unit) {
     Row(
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         modifier = Modifier
@@ -6880,7 +6991,12 @@ private fun InfoCastRail(detail: TitleDetail) {
         detail.cast.forEach { member ->
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.width(78.dp)
+                modifier = Modifier
+                    .width(78.dp)
+                    .jellyClick(role = Role.Button, onClickLabel = "About ${member.name}") {
+                        AppHaptics.click()
+                        onOpenPerson(member)
+                    }
             ) {
                 ArtSlot(
                     art = rememberCachedArt(member.photoUrl, 170),
@@ -8316,6 +8432,469 @@ internal fun TitleDetailFetch(providerId: Int?, isSeries: Boolean, prefsStore: A
         if (fetched != null) prefsStore.rememberTitleDetail(id, isSeries, fetched)
     }
     return prefsStore.titleDetail(providerId, isSeries)
+}
+
+/**
+ * A cast member's page, asked once per person.
+ *
+ * A row cached before person ids were stored carries only a name, so the id is looked up first and the
+ * answer is filed under it — the next tap on that face, from any title's cast, is then free.
+ * [PersonLookup.settled] separates "still asking" from "asked and got nothing", so a name the
+ * catalogues do not know stops the spinner instead of spinning for good.
+ */
+private data class PersonLookup(val detail: PersonDetail?, val settled: Boolean)
+
+@Composable
+private fun PersonDetailFetch(personId: Int?, name: String, prefsStore: ArcPreferencesStore): PersonLookup {
+    var settled by remember(personId, name) { mutableStateOf(false) }
+    LaunchedEffect(personId, name) {
+        settled = false
+        val cached = personId?.let { prefsStore.personDetail(it) }
+            ?: prefsStore.personDetails.values.firstOrNull { it.name.equals(name, ignoreCase = true) }
+        if (cached != null) {
+            settled = true
+            return@LaunchedEffect
+        }
+        val fetched = withContext(Dispatchers.IO) {
+            runCatching {
+                val id = personId ?: TmdbPeople.idByName(BuildConfig.TMDB_API_KEY, name)
+                id?.let { TmdbPeople.person(BuildConfig.TMDB_API_KEY, it) }
+            }.getOrNull()
+        }
+        if (fetched != null) prefsStore.rememberPersonDetail(fetched)
+        settled = true
+    }
+    val detail = personId?.let { prefsStore.personDetail(it) }
+        ?: prefsStore.personDetails.values.firstOrNull { it.name.equals(name, ignoreCase = true) }
+    return PersonLookup(detail, settled || detail != null)
+}
+
+private enum class PersonFilter { ALL, MOVIES, SERIES }
+
+/**
+ * The person behind a cast headshot: their face, their dates, and the work they are known for.
+ *
+ * Built from the title page's own parts — the same pinned hero drifting at 0.6x under a feathered
+ * cover sheet, the same frosted back circle, the same poster cards and staggered arrival — because a
+ * page that arrived in a different language would read as a different app. The filmography is the
+ * catalogue's combined credits ranked by popularity weighted with votes, so the work an audience
+ * actually knows sits above a talk-show slot and an unvoted short.
+ *
+ * A work the shelf holds is marked and opens its title page; one it does not hold is left inert. There
+ * is deliberately no way to add anything from here.
+ */
+@Composable
+private fun PersonPage(
+    member: CastMember,
+    prefsStore: ArcPreferencesStore,
+    heldTitles: List<ShelfTitle>,
+    topInset: Dp,
+    bottomInset: Dp,
+    onBack: () -> Unit,
+    onOpenTitle: (ShelfTitle) -> Unit
+) {
+    val lookup = PersonDetailFetch(member.personId, member.name, prefsStore)
+    val person = lookup.detail
+    val fetching = person == null && !lookup.settled
+    val gridState = rememberLazyGridState()
+    val heroHeight = rememberCollectionHeroHeight()
+    val heroPx = with(LocalDensity.current) { heroHeight.toPx() }
+    val collapsePx = heroPx * INFO_HERO_COLLAPSE_FRACTION
+    val featherPx = with(LocalDensity.current) { INFO_HERO_FEATHER_DP.dp.toPx() }
+    val seamPx = with(LocalDensity.current) { 3.dp.toPx() }
+    val pull = remember { Animatable(0f) }
+    // A grid reports its offset against the first item only, so once the hero's slot has scrolled off
+    // the travel is the whole hero: the picture is gone and the scrim stands at full strength.
+    val travel = if (gridState.firstVisibleItemIndex == 0) {
+        gridState.firstVisibleItemScrollOffset.toFloat()
+    } else {
+        heroPx
+    }
+    val topScrim = (travel / collapsePx).coerceIn(0f, 1f)
+
+    val faceUrl = person?.photoUrl ?: member.photoUrl
+    val face = rememberCachedArt(faceUrl, 632)
+    val credits = remember(person) { PersonCredits.rank(person?.credits.orEmpty()) }
+    val knownFor = remember(person) { PersonCredits.knownFor(person?.credits.orEmpty()) }
+    var filter by remember(member) { mutableStateOf(PersonFilter.ALL) }
+    val shown = remember(credits, filter) {
+        when (filter) {
+            PersonFilter.ALL -> credits
+            PersonFilter.MOVIES -> credits.filter { !it.isSeries }
+            PersonFilter.SERIES -> credits.filter { it.isSeries }
+        }
+    }
+    val heldByKey = remember(heldTitles) {
+        heldTitles.mapNotNull { title -> title.providerId?.let { (it to title.isSeries) to title } }.toMap()
+    }
+    val metaLine = listOfNotNull(
+        person?.birthday?.take(4)?.toIntOrNull()?.let { birth ->
+            person.deathday?.take(4)?.toIntOrNull()?.let { death -> "$birth–$death" } ?: "b. $birth"
+        },
+        person?.placeOfBirth
+    ).joinToString(" · ")
+
+    val contentReveal = remember(member) { Animatable(0f) }
+    LaunchedEffect(member) {
+        if (contentReveal.value < 1f) {
+            contentReveal.animateTo(1f, tween(durationMillis = 220, delayMillis = 160, easing = FastOutSlowInEasing))
+        }
+    }
+    val revealRisePx = with(LocalDensity.current) { 14.dp.toPx() }
+    val arrivalKey = "person:${member.personId ?: member.name}"
+
+    val pageHaze = remember { HazeState() }
+    val pageBackdrop = rememberLayerBackdrop()
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .jellySource(hazeState = pageHaze, backdrop = pageBackdrop)
+                .background(OneUiBackground)
+        ) {
+            // The face is the hero, blurred and overzoomed the way a title's wide shot is: the page
+            // opens on a person rather than on a wall of text, and the crisp headshot below is the
+            // same photograph seen clearly.
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .fillMaxWidth()
+                    .height(heroHeight)
+                    .graphicsLayer {
+                        clip = true
+                        translationY = -travel * INFO_ARTWORK_PARALLAX
+                        alpha = (1f - travel / collapsePx).coerceIn(0f, 1f)
+                    }
+            ) {
+                val picture = face
+                if (picture != null) {
+                    Image(
+                        bitmap = picture.asImageBitmap(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .blur(48.dp)
+                            .graphicsLayer { scaleX = 1.18f; scaleY = 1.18f }
+                    )
+                } else {
+                    PlaceholderThumbnailBox(modifier = Modifier.fillMaxSize())
+                }
+                Box(modifier = Modifier.fillMaxSize().background(HeroScrim))
+            }
+
+            Column(
+                modifier = Modifier
+                    .graphicsLayer {
+                        translationY = heroPx - travel + pull.value.coerceAtMost(0f) - seamPx - featherPx
+                    }
+                    .fillMaxSize()
+            ) {
+                Box(modifier = Modifier.fillMaxWidth().height(INFO_HERO_FEATHER_DP.dp).background(HeroFeather))
+                Box(modifier = Modifier.fillMaxWidth().weight(1f).background(OneUiBackground))
+            }
+
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(3),
+                state = gridState,
+                modifier = Modifier
+                    .physicsBounceOverscroll(displacement = pull)
+                    .fillMaxSize(),
+                contentPadding = PaddingValues(start = 18.dp, end = 18.dp, bottom = 36.dp + bottomInset),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    Box(modifier = Modifier.fillMaxWidth().height(heroHeight)) {
+                        Column(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .fillMaxWidth()
+                                .padding(start = 24.dp, end = 24.dp)
+                                .graphicsLayer {
+                                    alpha = contentReveal.value
+                                    translationY = (1f - contentReveal.value) * revealRisePx
+                                },
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(116.dp)
+                                    .clip(CircleShape)
+                                    .background(OneUiTextSecondary.copy(alpha = 0.14f))
+                                    .border(2.dp, Color.White.copy(alpha = 0.22f), CircleShape)
+                            ) {
+                                if (face != null) {
+                                    ArtSlot(
+                                        art = face,
+                                        contentDescription = member.name,
+                                        modifier = Modifier.fillMaxSize().clip(CircleShape)
+                                    )
+                                } else {
+                                    JellySkeleton()
+                                }
+                            }
+                            Text(
+                                text = person?.name ?: member.name,
+                                color = Color.White,
+                                fontSize = 30.sp,
+                                lineHeight = 36.sp,
+                                textAlign = TextAlign.Center,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (knownFor.isNotEmpty()) {
+                                Text(
+                                    text = knownFor.joinToString(" · "),
+                                    color = Color.White,
+                                    fontSize = 13.sp,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            } else if (fetching) {
+                                PersonSkeletonBar(Modifier.width(200.dp).height(12.dp))
+                            }
+                        }
+                    }
+                }
+
+                if (metaLine.isNotBlank()) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        StaggeredListItem(0, "$arrivalKey:meta") {
+                            Text(
+                                text = metaLine,
+                                fontSize = 13.sp,
+                                color = OneUiTextSecondary,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth().padding(top = 18.dp)
+                            )
+                        }
+                    }
+                } else if (fetching) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(top = 18.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            PersonSkeletonBar(Modifier.width(180.dp).height(12.dp))
+                        }
+                    }
+                }
+
+                val bio = person?.biography?.takeIf { it.isNotBlank() }
+                if (bio != null) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        StaggeredListItem(1, "$arrivalKey:bio") { InfoSynopsis(bio) }
+                    }
+                } else if (fetching) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        Column(
+                            modifier = Modifier.padding(top = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            PersonSkeletonBar(Modifier.fillMaxWidth().height(12.dp))
+                            PersonSkeletonBar(Modifier.fillMaxWidth().height(12.dp))
+                            PersonSkeletonBar(Modifier.fillMaxWidth(0.6f).height(12.dp))
+                        }
+                    }
+                }
+
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    StaggeredListItem(2, "$arrivalKey:filmography") {
+                        Column {
+                            InfoSectionHeading("Filmography")
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .physicsBounceOverscroll(isHorizontal = true)
+                                    .horizontalScroll(rememberScrollState())
+                            ) {
+                                if (fetching) {
+                                    repeat(3) {
+                                        PersonSkeletonBar(
+                                            Modifier.width(76.dp).height(44.dp),
+                                            shape = RoundedCornerShape(28.dp)
+                                        )
+                                    }
+                                } else {
+                                    PersonFilter.entries.forEach { option ->
+                                        CollectionPill(
+                                            text = when (option) {
+                                                PersonFilter.ALL -> "All"
+                                                PersonFilter.MOVIES -> "Movies"
+                                                PersonFilter.SERIES -> "Series"
+                                            },
+                                            selected = filter == option,
+                                            onClick = {
+                                                AppHaptics.tick()
+                                                filter = option
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (fetching) {
+                    items(6) { PersonSkeletonCard() }
+                } else if (shown.isEmpty()) {
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        Text(
+                            text = if (person == null) {
+                                "The catalogues have no page for this name."
+                            } else {
+                                "The catalogues list no ranked work for this name."
+                            },
+                            fontSize = 12.sp,
+                            color = OneUiTextSecondary,
+                            modifier = Modifier.padding(top = 12.dp)
+                        )
+                    }
+                }
+
+                itemsIndexed(shown, key = { _, credit -> "${credit.id}/${credit.isSeries}" }) { index, credit ->
+                    StaggeredListItem(index, "$arrivalKey:credit:${credit.id}/${credit.isSeries}") {
+                        PersonCreditCard(
+                            credit = credit,
+                            held = heldByKey[credit.id to credit.isSeries],
+                            onOpenTitle = onOpenTitle
+                        )
+                    }
+                }
+            }
+        }
+
+        val scrimBandHeight = topInset + 18.dp
+        val statusBarFraction = (topInset / scrimBandHeight).coerceIn(0.05f, 0.85f)
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .fillMaxWidth()
+                .height(scrimBandHeight)
+                .background(Brush.verticalGradient(
+                    0f to OneUiBackground.copy(alpha = 0.88f * topScrim),
+                    statusBarFraction to OneUiBackground.copy(alpha = 0.74f * topScrim),
+                    1f to OneUiBackground.copy(alpha = 0f)
+                ))
+        )
+
+        val backSource = remember { MutableInteractionSource() }
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(start = 14.dp, top = topInset + 10.dp)
+                .size(44.dp)
+                .jelly(backSource, scaleDownTo = 0.88f)
+                .clip(CircleShape)
+                .jellyGlass(hazeState = pageHaze, backdrop = pageBackdrop, shape = CircleShape)
+                .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape)
+                .clickable(
+                    interactionSource = backSource,
+                    indication = null,
+                    onClick = {
+                        AppHaptics.click()
+                        onBack()
+                    }
+                )
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                contentDescription = "Back",
+                tint = OneUiTextPrimary,
+                modifier = Modifier.size(22.dp)
+            )
+        }
+    }
+}
+
+/** One work in a filmography: the shelf's own poster card, marked when the shelf holds it. */
+@Composable
+private fun PersonCreditCard(credit: PersonCredit, held: ShelfTitle?, onOpenTitle: (ShelfTitle) -> Unit) {
+    val click = if (held != null) {
+        Modifier.jellyClick(role = Role.Button, onClickLabel = "View ${credit.title}") { onOpenTitle(held) }
+    } else {
+        Modifier
+    }
+    val art = rememberCachedArt(credit.posterUrl, 342)
+    Column(click, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(2f / 3f)
+                .graphicsLayer { clip = true; shape = RoundedCornerShape(22.dp) }
+        ) {
+            if (art != null) {
+                ArtSlot(art = art, contentDescription = credit.title, modifier = Modifier.fillMaxSize())
+            } else {
+                JellySkeleton()
+            }
+            if (held != null) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(8.dp)
+                        .background(OneUiAccent, CircleShape)
+                        .padding(4.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = "On your shelf",
+                        tint = Color.Black,
+                        modifier = Modifier.size(12.dp)
+                    )
+                }
+            }
+        }
+        Text(
+            text = credit.title,
+            modifier = Modifier.height(40.dp),
+            color = OneUiTextPrimary,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 13.sp,
+            lineHeight = 18.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = listOfNotNull(credit.year?.toString(), if (credit.isSeries) "Series" else "Movie")
+                .joinToString(" · "),
+            color = OneUiTextSecondary,
+            fontSize = 11.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/** A shimmering bar standing in for a line of text that has not arrived. */
+@Composable
+private fun PersonSkeletonBar(modifier: Modifier = Modifier, shape: RoundedCornerShape = RoundedCornerShape(6.dp)) {
+    Box(modifier.clip(shape).jellySkeletonSweep())
+}
+
+/** A poster slot with its two caption lines, shimmering while the filmography is on its way. */
+@Composable
+private fun PersonSkeletonCard() {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(2f / 3f)
+                .graphicsLayer { clip = true; shape = RoundedCornerShape(22.dp) }
+        ) {
+            JellySkeleton()
+        }
+        PersonSkeletonBar(Modifier.fillMaxWidth().height(12.dp))
+        PersonSkeletonBar(Modifier.fillMaxWidth(0.5f).height(10.dp))
+    }
 }
 
 /**

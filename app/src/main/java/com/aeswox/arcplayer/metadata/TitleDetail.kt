@@ -25,7 +25,8 @@ private fun JSONArray?.castMembers(): List<CastMember> =
         CastMember(
             name = name,
             role = row.optString("character").orEmpty(),
-            photoUrl = tmdbImage(row.optString("profile_path"), "w185")
+            photoUrl = tmdbImage(row.optString("profile_path"), "w185"),
+            personId = row.optInt("id").takeIf { it > 0 }
         )
     }.take(20)
 
@@ -39,7 +40,9 @@ private fun JSONArray?.castMembers(): List<CastMember> =
 data class CastMember(
     val name: String,
     val role: String,
-    val photoUrl: String?
+    val photoUrl: String?,
+    /** The catalogue's own person id, which is what a cast headshot opens a page with. */
+    val personId: Int? = null
 )
 
 /** One episode, as the catalogue numbers it. */
@@ -116,7 +119,12 @@ data class TitleDetail(
             val genres = obj.optJSONArray("genres").plainValues()
             val cast = obj.optJSONArray("cast").objects().mapNotNull { row ->
                 val name = row.optString("name").nullIfBlank() ?: return@mapNotNull null
-                CastMember(name, row.optString("role").orEmpty(), row.optString("photo").nullIfBlank())
+                CastMember(
+                    name,
+                    row.optString("role").orEmpty(),
+                    row.optString("photo").nullIfBlank(),
+                    row.optInt("personId").takeIf { it > 0 }
+                )
             }
             val seasons = obj.optJSONArray("seasons").objects().mapNotNull { row ->
                 val number = row.optInt("number", -1)
@@ -152,6 +160,7 @@ private fun CastMember.toJson(): JSONObject = JSONObject()
     .put("name", name)
     .put("role", role)
     .put("photo", photoUrl ?: JSONObject.NULL)
+    .put("personId", personId ?: JSONObject.NULL)
 
 private fun SeasonCard.toJson(): JSONObject = JSONObject()
     .put("number", number)

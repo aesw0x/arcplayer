@@ -90,6 +90,19 @@ object AppHaptics {
         )
     }
 
+    /** Two knocks close together: a pull-down let go into a shelf refresh, felt without looking. */
+    fun refresh() {
+        if (!isEnabled) return
+        val scale = intensity.scaleFactor
+        vibrate(
+            composition(
+                Step(VibrationEffect.Composition.PRIMITIVE_CLICK, scale * 0.8f),
+                Step(VibrationEffect.Composition.PRIMITIVE_CLICK, scale, delay = 90)
+            )
+                ?: VibrationEffect.createPredefined(VibrationEffect.EFFECT_DOUBLE_CLICK)
+        )
+    }
+
     fun toggle(checked: Boolean) {
         if (checked) click() else tick()
     }
