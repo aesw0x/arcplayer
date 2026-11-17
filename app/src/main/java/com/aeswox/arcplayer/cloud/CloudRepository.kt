@@ -1026,7 +1026,7 @@ class CloudRepository(
             runCatching { RandomAccessFile(usable, "rw").use { it.setLength(size) } }
                 .onFailure { Log.w(TAG, "could not stretch $usable to $size", it) }
         }
-        if (prepareIndex) prepareIndexForOpen(video)
+        if (prepareIndex) prepareIndexForOpen(video, usable)
         return usable
     }
 
@@ -1088,21 +1088,60 @@ class CloudRepository(
         return tryCall(TdApi.GetFile(video.fileId))
     }
 
-    /**
-     * Put the file's seek index on disk while the player is still waiting to be handed the file.
-     *
-     * The player reads a Matroska index of its own when it opens, and that index is what turns a
-     * "go to 19:47" into a byte to read. If the cue table is still a hole at that moment the player
-     * gets no index and every later seek is silently dropped: measured on device, the scrubber went
-     * to the target, the fetch delivered the bytes there, and the film carried on playing from
-     * wherever it had been. Waiting for a fraction of a megabyte now is what makes seeking work at
-     * all, and nothing is competing for the download window while we wait, because the player has
-     * not started reading yet.
-     *
-     * Failing to get one is not a reason to hold up playback: the proportional byte guess still
-     * answers our own seeks, so this gives up on a budget and puts the window back on the head.
-     */
-    private suspend fun prepareIndexForOpen(video: CloudVideoItem) {
+    private suspend fun readContainerHead(path: String): ByteArray = withContext(Dispatchers.IO) {
+        RandomAccessFile(path, "r").use { file ->
+            ByteArray(file.length().coerceAtMost(HEAD_READ_BYTES).toInt()).also { file.readFully(it) }
+        }
+    }
+
+    private suspend fun prepareMp4MetadataForOpen(
+        video: CloudVideoItem,
+        path: String,
+        head: ByteArray,
+    ): Boolean {
+        var lookup = Mp4Metadata.scan(head, video.sizeBytes)
+        var probes = 0
+        while (lookup is Mp4Metadata.Lookup.NeedHeader && probes < MAX_MP4_BOX_PROBES) {
+            probes++
+            val offset = lookup.offset
+            val length = minOf(MP4_BOX_HEADER_BYTES.toLong(), video.sizeBytes - offset)
+            if (!awaitExactWindow(video, offset, length, "MP4 box header", includeDeliveredRun = true)) {
+                return false
+            }
+            val header = withContext(Dispatchers.IO) {
+                RandomAccessFile(path, "r").use { file ->
+                    file.seek(offset)
+                    ByteArray(length.toInt()).also { file.readFully(it) }
+                }
+            }
+            lookup = Mp4Metadata.afterHeader(header, offset, video.sizeBytes)
+        }
+        val movie = lookup as? Mp4Metadata.Lookup.Found ?: return false
+        if (!awaitExactWindow(
+                video,
+                movie.offset,
+                movie.size,
+                "MP4 metadata",
+                includeDeliveredRun = true
+            )
+        ) {
+            return false
+        }
+        Log.i(TAG, "MP4 metadata landed for ${video.fileId}: ${movie.offset}+${movie.size}")
+        return true
+    }
+
+    private suspend fun prepareIndexForOpen(video: CloudVideoItem, path: String) {
+        val head = readContainerHead(path)
+        if (Mp4Metadata.scan(head, video.sizeBytes) !is Mp4Metadata.Lookup.NotMp4) {
+            cueTables[video.fileId] = EMPTY_CUE_TABLE
+            val prepared = withTimeoutOrNull(CUES_WINDOW_TIMEOUT_MS) {
+                prepareMp4MetadataForOpen(video, path, head)
+            } ?: false
+            Log.i(TAG, "MP4 metadata for open file=${video.fileId} prepared=$prepared")
+            aimWindowAt(video, 0L)
+            return
+        }
         if (cueTables.containsKey(video.fileId)) return
         val startedAt = SystemClock.elapsedRealtime()
         var tries = 0
@@ -1609,8 +1648,8 @@ class CloudRepository(
             Log.i(TAG, "cue offset ${layout.cuesOffset} is not inside ${video.sizeBytes} for file ${video.fileId}")
             return null
         }
-        if (!awaitCuesWindow(video, layout.cuesOffset)) return null
         val length = minOf(CUES_READ_BYTES, video.sizeBytes - layout.cuesOffset).toInt()
+        if (!awaitExactWindow(video, layout.cuesOffset, length.toLong(), "cue table")) return null
         // The file was stretched to its full length when playback opened, so this read is in bounds
         // even though everything ahead of the cue table is still a hole.
         val buffer = withContext(Dispatchers.IO) {
@@ -1624,47 +1663,46 @@ class CloudRepository(
         return table
     }
 
-    /** Ask Telegram for the cue table and wait until it is on disk. */
-    private suspend fun awaitCuesWindow(video: CloudVideoItem, cuesOffset: Long): Boolean {
-        val room = video.sizeBytes - cuesOffset
-        if (room <= 0L) return false
-        val limit = minOf(CUES_READ_BYTES, room)
-        // A download has this file coming from byte zero already, so the index is not worth a window of
-        // its own: it will land on the way to the rest of the film. This turns into a wait rather than a
-        // fetch, on the same budget, and a seek that arrives before it does falls back to the
-        // proportional byte guess the way a file with no cue table always does.
+    /** Ask Telegram for one exact container span and wait until all of it is on disk. */
+    private suspend fun awaitExactWindow(
+        video: CloudVideoItem,
+        offset: Long,
+        limit: Long,
+        label: String,
+        includeDeliveredRun: Boolean = false,
+    ): Boolean {
+        if (offset < 0L || limit <= 0L || limit > video.sizeBytes - offset) return false
         val downloading = fetchingWhole(video.fileId)
         val ask = suspend {
             if (downloading) null
-            else cappedCall(TdApi.DownloadFile(video.fileId, PRIORITY, cuesOffset, limit, false))
+            else cappedCall(TdApi.DownloadFile(video.fileId, PRIORITY, offset, limit, false))
         }
         ask()
-        // Each poll is a TDLib round trip that can itself take seconds while the network is busy, so
-        // the deadline is measured on the clock and no poll is waited for longer than the budget
-        // allows.
         val giveUpAt = SystemClock.elapsedRealtime() + CUES_WINDOW_TIMEOUT_MS
-        val watch = RedirectWatch(cuesOffset)
+        val watch = RedirectWatch(offset)
         while (true) {
             val facts = pollFacts(video.fileId)
             if (facts != null) {
                 publishProgress(video.fileId, facts)
-                // The window is placed exactly on the element, so "the whole of it has arrived" is
-                // the test; anything short would read a hole at the far end of the buffer.
+                val delivered = if (includeDeliveredRun) {
+                    deliveredRuns[video.fileId] ?: DeliveredRun.NONE
+                } else {
+                    DeliveredRun.NONE
+                }
                 if (StreamWindow.readableBytes(
-                        position = cuesOffset,
+                        position = offset,
                         size = facts.fileSizeBytes,
                         windowStart = facts.downloadOffset,
                         windowLength = facts.downloadedPrefixSize,
-                        completed = facts.isDownloadingCompleted
+                        completed = facts.isDownloadingCompleted,
+                        alreadyDelivered = delivered
                     ) >= limit
                 ) {
                     return true
                 }
                 if (!downloading && watch.shouldRedirect(facts, giveUpAt)) {
-                    Log.i(TAG, "redirect file=${video.fileId} wanted=$cuesOffset (cue table)")
+                    Log.i(TAG, "redirect file=${video.fileId} wanted=$offset ($label)")
                     cappedCall(TdApi.CancelDownloadFile(video.fileId, false))
-                    // The play-head planner would aim a whole window here, so the exact range is
-                    // asked for again by hand.
                     ask()
                 }
             }
@@ -2978,6 +3016,9 @@ class CloudRepository(
 
         /** Enough of a Matroska header to read the seek head and the timecode scale out of. */
         const val HEAD_READ_BYTES = 64L * 1024
+
+        const val MP4_BOX_HEADER_BYTES = 16
+        const val MAX_MP4_BOX_PROBES = 8
 
         /**
          * How much of the cue table to fetch. A two and a half hour film's is a hundred kilobytes,
