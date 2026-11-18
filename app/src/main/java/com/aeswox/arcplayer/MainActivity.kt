@@ -1968,8 +1968,12 @@ class ArcVlcPlayerEngine(
      * a new media, which is what [restartVlcInstance] is for.
      */
     private fun vlcInstanceArgs(): ArrayList<String> {
+        // Direct-to-surface hardware decode hands the vout an opaque buffer (ANOP) it cannot alpha-blend
+        // captions into, so subtitles only render on a blendable software picture. Pay that cost only
+        // while a subtitle is actually on; hardware decode returns the moment they are switched off.
+        softwareDecodeInUse = subtitlesActive
         val args = arrayListOf(
-            "--avcodec-hw=any",
+            "--avcodec-hw=${if (softwareDecodeInUse) "none" else "any"}",
             "--vout=android_display",
             "--android-display-chroma=RV32",
             "--no-drop-late-frames",
@@ -1983,6 +1987,23 @@ class ArcVlcPlayerEngine(
             args += "--sub-text-scale=$subtitleSizePercent"
         }
         return args
+    }
+
+    /**
+     * Whether a subtitle is on right now, and whether the running instance was built for software
+     * decode. Declared ahead of [libVlc] so the first instance reads a real false rather than an
+     * uninitialised track id. A change between the two is what [ensureDecodeMode] restarts on.
+     */
+    private var subtitlesActive = false
+    private var softwareDecodeInUse = false
+
+    private fun ensureDecodeMode() {
+        if (subtitlesActive == softwareDecodeInUse || currentVideo == null) return
+        // Posted, never run inline: this is reached from the player's own event thread (the Playing
+        // hook re-adds a caption), and releasing a player from inside its callback deadlocks libVLC.
+        mainHandler.post {
+            if (subtitlesActive != softwareDecodeInUse && currentVideo != null) restartVlcInstance()
+        }
     }
 
     private var libVlc: LibVLC = LibVLC(appContext, vlcInstanceArgs())
@@ -2444,6 +2465,7 @@ class ArcVlcPlayerEngine(
             loadedVideoId = video.id
             preferredAudioTrackId = null
             preferredSubtitleTrackId = null
+            subtitlesActive = false
             subtitleDelayMs = 0L
             captionUri = null
             // A different file is a different chance to paint, so the refusal recorded against the last
@@ -2472,7 +2494,7 @@ class ArcVlcPlayerEngine(
             Media(libVlc, video.uri)
         }
 
-        media.setHWDecoderEnabled(true, false)
+        media.setHWDecoderEnabled(!softwareDecodeInUse, false)
         mediaPlayer.media = media
         media.release()
 
@@ -2771,13 +2793,17 @@ class ArcVlcPlayerEngine(
         mediaPlayer.spuTrack = trackId
         selectedSubtitleTrackId = mediaPlayer.spuTrack
         preferredSubtitleTrackId = selectedSubtitleTrackId
+        subtitlesActive = selectedSubtitleTrackId != -1 || captionIsOn
+        ensureDecodeMode()
     }
 
     fun addExternalSubtitle(subtitleUri: Uri) {
-        runCatching {
-            mediaPlayer.addSlave(IMedia.Slave.Type.Subtitle, subtitleUri, true)
-            mainHandler.postDelayed({ refreshTracks() }, 250L)
-        }
+        // Ride the caption lane so the file survives the decode-mode restart that turning subtitles
+        // on triggers: a slave added straight to the old media would be dropped with it.
+        captionUri = subtitleUri
+        captionIsOn = false
+        attachCaption(subtitleUri)
+        mainHandler.postDelayed({ refreshTracks() }, 250L)
     }
 
     /**
@@ -2794,7 +2820,11 @@ class ArcVlcPlayerEngine(
 
     private fun attachCaption(subtitleUri: Uri) {
         runCatching { mediaPlayer.addSlave(IMedia.Slave.Type.Subtitle, subtitleUri, true) }
-            .onSuccess { captionIsOn = true }
+            .onSuccess {
+                captionIsOn = true
+                subtitlesActive = true
+                ensureDecodeMode()
+            }
             .onFailure { android.util.Log.w("ArcPlayer", "caption $subtitleUri refused", it) }
     }
 
