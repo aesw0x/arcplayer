@@ -62,7 +62,9 @@ jobs:
             }
           }
           const tags = execFileSync('git', ['tag', '--list', `v${name}`], { encoding: 'utf8' }).trim();
-          if (tags) changed = false;
+          // No tag yet means this version never shipped, so any push rebuilds it — a CI fix
+          // retries the release without needing a manual dispatch or a pointless version bump.
+          changed = !tags;
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `changed=${changed}\nname=${name}\ncode=${code}\n`);
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
             changed ? `Building Arc Player ${name} (${code}).\n` : `No unreleased version change: ${name}.\n`);
@@ -126,8 +128,13 @@ jobs:
           }
           fs.mkdirSync('dist', { recursive: true });
           const checksums = [];
+          // AGP puts the flavor before the ABI in split names; find them rather than guess.
+          const outDir = 'app/build/outputs/apk/github/release';
+          const apks = fs.readdirSync(outDir).filter(f => f.endsWith('-release.apk'));
           for (const abi of ['arm64-v8a', 'x86_64', 'universal']) {
-            const apk = `app/build/outputs/apk/github/release/app-${abi}-github-release.apk`;
+            const file = apks.find(f => f.includes(abi));
+            if (!file) throw new Error(`No ${abi} APK in ${outDir}: ${apks.join(', ')}`);
+            const apk = path.join(outDir, file);
             execFileSync(path.join(buildTools, 'apksigner'), ['verify', '--verbose', apk]);
             const badging = execFileSync(path.join(buildTools, 'aapt'), ['dump', 'badging', apk], { encoding: 'utf8' });
             if (!badging.includes(`versionName='${process.env.VERSION_NAME}'`) ||

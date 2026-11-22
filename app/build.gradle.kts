@@ -132,7 +132,7 @@ val validateReleaseInputs by tasks.registering {
         }
     }
 }
-tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+tasks.matching { it.name == "preGithubReleaseBuild" }.configureEach {
     dependsOn(validateReleaseInputs)
 }
 
