@@ -111,6 +111,9 @@ class TdBridge(
     private fun mapAuthorizationState(state: TdApi.AuthorizationState?): CloudAuthInput? = when (state) {
         is TdApi.AuthorizationStateWaitTdlibParameters -> CloudAuthInput.StartRequested
         is TdApi.AuthorizationStateWaitPhoneNumber -> CloudAuthInput.PhoneNumberNeeded
+        // TDLib supplies a new link when the old QR expires. Do not log or persist this update.
+        is TdApi.AuthorizationStateWaitOtherDeviceConfirmation ->
+            CloudAuthInput.OtherDeviceConfirmationNeeded(state.link.orEmpty())
         is TdApi.AuthorizationStateWaitCode -> CloudAuthInput.CodeNeeded(mapCodeInfo(state.codeInfo))
         is TdApi.AuthorizationStateWaitPassword -> CloudAuthInput.PasswordNeeded
         is TdApi.AuthorizationStateWaitRegistration -> CloudAuthInput.RegistrationNeeded

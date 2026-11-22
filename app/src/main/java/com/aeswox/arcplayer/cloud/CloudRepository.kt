@@ -86,6 +86,9 @@ class CloudRepository(
     private val _authState = MutableStateFlow(CloudAuthMachine.initial(hasCredentials))
     val authState: StateFlow<CloudAuthState> = _authState.asStateFlow()
 
+    /** Reserve before enqueueing: repeated D-pad presses must not queue a second QR request. */
+    private val qrRequestQueued = AtomicBoolean(false)
+
     /** Read-only backing for a video's [CloudVideoItem.chatTitle]; the shelf is the only chat that matters. */
     private val _chats = MutableStateFlow<List<CloudChat>>(emptyList())
 
@@ -315,6 +318,14 @@ class CloudRepository(
         }
     }
 
+    /** Explicit TV opt-in; begin() and the phone flow never request QR authentication. */
+    fun requestQrCodeAuthentication() {
+        val state = _authState.value
+        if (state.stage != CloudAuthStage.WAITING_FOR_PHONE_NUMBER || state.qrRequestInFlight) return
+        if (!qrRequestQueued.compareAndSet(false, true)) return
+        launchInput { CloudAuthInput.QrCodeRequested }
+    }
+
     fun submitPhoneNumber(phoneNumber: String) = launchInput { CloudAuthInput.PhoneSubmitted(phoneNumber) }
     fun submitCode(code: String) = launchInput { CloudAuthInput.CodeSubmitted(code) }
     fun submitPassword(password: String) = launchInput { CloudAuthInput.PasswordSubmitted(password) }
@@ -340,11 +351,16 @@ class CloudRepository(
     }
 
     private suspend fun onAuthInput(input: CloudAuthInput) {
+        val previousStage = _authState.value.stage
         val transition = CloudAuthMachine.transition(_authState.value, input)
         _authState.value = transition.state
+        if (input is CloudAuthInput.QrCodeRequestFinished ||
+            (input is CloudAuthInput.QrCodeRequested && transition.effect == CloudAuthEffect.None)) {
+            qrRequestQueued.set(false)
+        }
         runEffect(transition.effect)
 
-        if (transition.state.stage == CloudAuthStage.AUTHORIZED) {
+        if (previousStage != CloudAuthStage.AUTHORIZED && transition.state.stage == CloudAuthStage.AUTHORIZED) {
             if (_chats.value.isEmpty()) {
                 // Off the collector: a chat sweep is tens of round trips, and holding the queue during
                 // it would stall any login update TDLib sends while the list is being built.
@@ -357,10 +373,39 @@ class CloudRepository(
     }
 
     private suspend fun runEffect(effect: CloudAuthEffect) {
+        if (effect == CloudAuthEffect.None) return
+        if (effect == CloudAuthEffect.RequestQrCodeAuthentication) {
+            // Authorization updates can arrive before the reply, so keep the collector free.
+            scope.launch {
+                val error = try {
+                    val completed = withTimeoutOrNull(30_000L) {
+                        bridge.call(TdApi.RequestQrCodeAuthentication(longArrayOf()))
+                        true
+                    }
+                    if (completed == true) null else "Couldn't reach Telegram. Check your connection and try again."
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Throwable) {
+                    // Never log a QR reply or propagate an arbitrary server message containing a link.
+                    val message = failure.message.orEmpty()
+                    when {
+                        (failure as? TdBridge.TelegramError)?.code == 429 || "FLOOD_WAIT" in message ->
+                            "Telegram needs you to wait before trying again. Please try later."
+                        "API_ID_INVALID" in message ->
+                            "This build's Telegram app keys weren't accepted. Use a configured build."
+                        "NETWORK" in message || "TIMEOUT" in message ->
+                            "Couldn't reach Telegram. Check your connection and try again."
+                        else -> "Couldn't request a QR code. Try again or use your phone number."
+                    }
+                }
+                bridge.submit(CloudAuthInput.QrCodeRequestFinished(error))
+            }
+            return
+        }
         _busy.value = true
         try {
             when (effect) {
-                CloudAuthEffect.None -> Unit
+                CloudAuthEffect.None, CloudAuthEffect.RequestQrCodeAuthentication -> Unit
                 CloudAuthEffect.SendParameters -> bridge.applyParameters()
                 /**
                  * `sendPhoneNumberCode` still exists in the schema but TDLib no longer treats it as

@@ -112,14 +112,14 @@ jobs:
           printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$RELEASE_STORE_FILE"
           trap 'rm -f "$RELEASE_STORE_FILE"' EXIT
           ./gradlew --no-daemon --no-build-cache --no-configuration-cache --console=plain \
-            :app:testDebugUnitTest :app:assembleRelease -PsplitApks=true
+            :app:testGithubDebugUnitTest :app:assembleGithubRelease -PsplitApks=true
           node <<'NODE'
           const fs = require('node:fs');
           const path = require('node:path');
           const crypto = require('node:crypto');
           const { execFileSync } = require('node:child_process');
           const buildTools = path.join(process.env.ANDROID_HOME, 'build-tools/35.0.0');
-          const generated = fs.readFileSync('app/build/generated/source/buildConfig/release/com/aeswox/arcplayer/BuildConfig.java', 'utf8');
+          const generated = fs.readFileSync('app/build/generated/source/buildConfig/github/release/com/aeswox/arcplayer/BuildConfig.java', 'utf8');
           for (const key of ['TG_API_ID', 'TG_API_HASH', 'TMDB_API_KEY']) {
             const literal = key === 'TG_API_ID' ? String(Number(process.env[key])) : JSON.stringify(process.env[key]);
             if (!generated.includes(`${key} = ${literal};`)) throw new Error(`${key} was not compiled into the release.`);
@@ -127,7 +127,7 @@ jobs:
           fs.mkdirSync('dist', { recursive: true });
           const checksums = [];
           for (const abi of ['arm64-v8a', 'x86_64', 'universal']) {
-            const apk = `app/build/outputs/apk/release/app-${abi}-release.apk`;
+            const apk = `app/build/outputs/apk/github/release/app-${abi}-github-release.apk`;
             execFileSync(path.join(buildTools, 'apksigner'), ['verify', '--verbose', apk]);
             const badging = execFileSync(path.join(buildTools, 'aapt'), ['dump', 'badging', apk], { encoding: 'utf8' });
             if (!badging.includes(`versionName='${process.env.VERSION_NAME}'`) ||

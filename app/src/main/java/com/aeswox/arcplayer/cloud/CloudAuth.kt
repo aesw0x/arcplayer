@@ -13,6 +13,8 @@ enum class CloudAuthStage {
     READY_TO_START,
     WAITING_FOR_PARAMETERS,
     WAITING_FOR_PHONE_NUMBER,
+    REQUESTING_QR_CODE,
+    WAITING_FOR_OTHER_DEVICE_CONFIRMATION,
     REQUESTING_CODE,
     WAITING_FOR_CODE,
     CHECKING_CODE,
@@ -45,7 +47,10 @@ fun telegramStep(state: CloudAuthState, started: Boolean): TelegramStep {
     }
     return when (form) {
         CloudAuthStage.MISSING_CREDENTIALS -> TelegramStep.KEYS
-        CloudAuthStage.WAITING_FOR_PHONE_NUMBER -> TelegramStep.PHONE
+        // Phone surfaces still offer their existing form if a TV login was opened first.
+        CloudAuthStage.WAITING_FOR_PHONE_NUMBER,
+        CloudAuthStage.REQUESTING_QR_CODE,
+        CloudAuthStage.WAITING_FOR_OTHER_DEVICE_CONFIRMATION -> TelegramStep.PHONE
         CloudAuthStage.WAITING_FOR_CODE -> TelegramStep.CODE
         CloudAuthStage.WAITING_FOR_PASSWORD -> TelegramStep.PASSWORD
         CloudAuthStage.WAITING_FOR_REGISTRATION -> TelegramStep.REGISTER
@@ -80,6 +85,9 @@ sealed class CloudAuthInput {
     /** The user tapped "Connect", or the tab opened with credentials already stored. */
     data object StartRequested : CloudAuthInput()
 
+    /** Opt-in only: shared phone onboarding never emits this input. */
+    data object QrCodeRequested : CloudAuthInput()
+    data class QrCodeRequestFinished(val error: String? = null) : CloudAuthInput()
     data class PhoneSubmitted(val phoneNumber: String) : CloudAuthInput()
     data class CodeSubmitted(val code: String) : CloudAuthInput()
     data class PasswordSubmitted(val password: String) : CloudAuthInput()
@@ -87,6 +95,9 @@ sealed class CloudAuthInput {
 
     /** Observed translations of `TdApi.AuthorizationState`. */
     data object PhoneNumberNeeded : CloudAuthInput()
+    data class OtherDeviceConfirmationNeeded(val link: String) : CloudAuthInput() {
+        override fun toString() = "OtherDeviceConfirmationNeeded(link=<redacted>)"
+    }
     data class CodeNeeded(val hint: CodeHint) : CloudAuthInput()
     data object PasswordNeeded : CloudAuthInput()
     data object RegistrationNeeded : CloudAuthInput()
@@ -98,6 +109,7 @@ sealed class CloudAuthInput {
 sealed class CloudAuthEffect {
     data object None : CloudAuthEffect()
     data object SendParameters : CloudAuthEffect()
+    data object RequestQrCodeAuthentication : CloudAuthEffect()
     data class RequestCode(val phoneNumber: String) : CloudAuthEffect()
     data class SubmitCode(val code: String) : CloudAuthEffect()
     data class SubmitPassword(val password: String) : CloudAuthEffect()
@@ -124,7 +136,13 @@ data class CloudAuthState(
      * "never sent" from "already in".
      */
     val parametersAccepted: Boolean = false,
-)
+    /** Live TDLib link only. Never persist this value or include it in diagnostics. */
+    val qrCodeLink: String? = null,
+    /** A link update may arrive before the QR request's reply. Keep guarding until both are handled. */
+    val qrRequestInFlight: Boolean = false,
+) {
+    override fun toString() = "CloudAuthState(stage=$stage, parametersAccepted=$parametersAccepted)"
+}
 
 data class CloudAuthTransition(val state: CloudAuthState, val effect: CloudAuthEffect)
 
@@ -135,12 +153,51 @@ object CloudAuthMachine {
     )
 
     fun transition(state: CloudAuthState, input: CloudAuthInput): CloudAuthTransition {
-        if ((state.stage == CloudAuthStage.REQUESTING_CODE || state.stage == CloudAuthStage.CHECKING_CODE) &&
+        // Request replies and stale form actions must never undo a successful authorization update.
+        if (state.stage == CloudAuthStage.AUTHORIZED && input !is CloudAuthInput.Closed &&
+            input !is CloudAuthInput.Authorized && input !is CloudAuthInput.QrCodeRequestFinished) {
+            return unchanged(state)
+        }
+        if ((state.stage == CloudAuthStage.REQUESTING_CODE || state.stage == CloudAuthStage.CHECKING_CODE ||
+                state.qrRequestInFlight) &&
             (input is CloudAuthInput.PhoneSubmitted || input is CloudAuthInput.CodeSubmitted ||
-                input is CloudAuthInput.PasswordSubmitted || input is CloudAuthInput.RegistrationSubmitted)) {
+                input is CloudAuthInput.PasswordSubmitted || input is CloudAuthInput.RegistrationSubmitted ||
+                input is CloudAuthInput.QrCodeRequested)) {
             return unchanged(state)
         }
         return when (input) {
+            CloudAuthInput.QrCodeRequested ->
+                if (state.stage != CloudAuthStage.WAITING_FOR_PHONE_NUMBER) {
+                    unchanged(state)
+                } else {
+                    CloudAuthTransition(
+                        state.copy(
+                            stage = CloudAuthStage.REQUESTING_QR_CODE,
+                            error = null,
+                            qrCodeLink = null,
+                            qrRequestInFlight = true,
+                            retryStage = CloudAuthStage.WAITING_FOR_PHONE_NUMBER
+                        ),
+                        CloudAuthEffect.RequestQrCodeAuthentication
+                    )
+                }
+
+            is CloudAuthInput.QrCodeRequestFinished -> {
+                val finished = state.copy(qrRequestInFlight = false)
+                // A late request reply must not undo a newer authorization update.
+                if (input.error != null && state.stage == CloudAuthStage.REQUESTING_QR_CODE) {
+                    CloudAuthTransition(
+                        finished.copy(
+                            stage = CloudAuthStage.WAITING_FOR_PHONE_NUMBER,
+                            qrCodeLink = null,
+                            error = input.error,
+                            retryStage = null
+                        ),
+                        CloudAuthEffect.None
+                    )
+                } else unchanged(finished)
+            }
+
             CloudAuthInput.StartRequested ->
                 if (state.parametersAccepted ||
                     state.stage == CloudAuthStage.MISSING_CREDENTIALS ||
@@ -167,6 +224,7 @@ object CloudAuthMachine {
                         state.copy(
                             stage = CloudAuthStage.REQUESTING_CODE,
                             lastPhoneNumber = cleaned,
+                            qrCodeLink = null,
                             error = null,
                             retryStage = CloudAuthStage.WAITING_FOR_PHONE_NUMBER
                         ),
@@ -224,6 +282,31 @@ object CloudAuthMachine {
             CloudAuthInput.PhoneNumberNeeded ->
                 settle(state, CloudAuthStage.WAITING_FOR_PHONE_NUMBER)
 
+            is CloudAuthInput.OtherDeviceConfirmationNeeded -> {
+                // TDLib rotates this link itself. Never request on a timer or keep the previous token.
+                // Ignore an already-queued QR update after the viewer submitted the phone fallback.
+                if (state.stage == CloudAuthStage.REQUESTING_CODE ||
+                    state.stage == CloudAuthStage.CHECKING_CODE ||
+                    state.stage == CloudAuthStage.WAITING_FOR_CODE ||
+                    state.stage == CloudAuthStage.WAITING_FOR_PASSWORD ||
+                    state.stage == CloudAuthStage.WAITING_FOR_REGISTRATION ||
+                    state.stage == CloudAuthStage.CLOSED) {
+                    unchanged(state)
+                } else {
+                    val link = input.link.takeIf { it.startsWith("tg://login?token=") && it.length > 17 }
+                    CloudAuthTransition(
+                        state.copy(
+                            stage = CloudAuthStage.WAITING_FOR_OTHER_DEVICE_CONFIRMATION,
+                            parametersAccepted = true,
+                            qrCodeLink = link,
+                            error = if (link == null) "Telegram couldn't provide a QR code. Use your phone number instead." else null,
+                            retryStage = null
+                        ),
+                        CloudAuthEffect.None
+                    )
+                }
+            }
+
             is CloudAuthInput.CodeNeeded ->
                 settle(state.copy(codeHint = input.hint), CloudAuthStage.WAITING_FOR_CODE)
 
@@ -237,7 +320,7 @@ object CloudAuthMachine {
                 // A stage re-announcement can clear that memory, so the live form stage counts too.
                 val back = state.retryStage ?: state.stage.takeIf { it in FORM_STAGES } ?: CloudAuthStage.FAILED
                 CloudAuthTransition(
-                    state.copy(stage = back, error = input.message, retryStage = null),
+                    state.copy(stage = back, error = input.message, retryStage = null, qrCodeLink = null),
                     CloudAuthEffect.None
                 )
             }
@@ -278,7 +361,7 @@ object CloudAuthMachine {
 
     private fun settle(state: CloudAuthState, stage: CloudAuthStage): CloudAuthTransition {
         // Any state past waitTdlibParameters is proof that the parameters landed.
-        val seen = state.copy(parametersAccepted = true)
+        val seen = state.copy(parametersAccepted = true, qrCodeLink = null)
         if (seen.stage == stage) return CloudAuthTransition(seen, CloudAuthEffect.None)
         return CloudAuthTransition(
             seen.copy(stage = stage, error = null, retryStage = null),

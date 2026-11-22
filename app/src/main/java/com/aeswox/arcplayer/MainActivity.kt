@@ -30,7 +30,6 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
-import android.os.PowerManager
 import android.os.StatFs
 import android.os.SystemClock
 import android.provider.MediaStore
@@ -410,6 +409,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         val systemPanel = installSplashScreen()
         super.onCreate(savedInstanceState)
+        if (isTelevision()) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            autoPipEnabled = false
+        }
         // Android's own splash panel would show the launcher icon and then crossfade into the app — a
         // second, frozen clapperboard stacked on top of the one the intro draws. It is not removed, only
         // kept up until the app has drawn its first frame: the handover is black onto black, and the
@@ -428,7 +431,7 @@ class MainActivity : ComponentActivity() {
                 ClapperIntroGate(
                     onFirstFrame = { introNotDrawnYet = false }
                 ) {
-                    ArcPlayerHomeScreen()
+                    if (isTelevision()) ArcTvApp() else ArcPlayerHomeScreen()
                 }
             }
         }
@@ -436,7 +439,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (isVideoActivelyPlaying && autoPipEnabled) {
+        if (isVideoActivelyPlaying && autoPipEnabled && !isTelevision()) {
             runCatching {
                 val params = PictureInPictureParams.Builder()
                     .setAspectRatio(Rational(16, 9))
@@ -3014,7 +3017,7 @@ class ArcVlcPlayerEngine(
 // ============================================================================
 
 @Immutable
-private data class ActiveVideoPlayback(
+internal data class ActiveVideoPlayback(
     val video: VideoItem,
     val playlist: List<VideoItem>,
     val sharedKeyPrefix: String,
@@ -3229,7 +3232,7 @@ fun ArcPlayerHomeScreen() {
     var updateDismissed by remember { mutableStateOf(false) }
     var updateDownload by remember { mutableStateOf<UpdateDownload>(UpdateDownload.Idle) }
     val checkForUpdates: () -> Unit = {
-        if (!updateChecking) {
+        if (BuildConfig.SELF_UPDATE && !updateChecking) {
             updateChecking = true
             updateUnreachable = false
             coroutineScope.launch {
@@ -4668,7 +4671,7 @@ private fun CloudVideoItem.toGridVideoItem(streamUri: Uri? = null, card: MediaCa
  * [Playable] was documented to leave for a cast, and it is the only thing here that cares which of the
  * two a given copy turned out to be.
  */
-private fun Playable.toPlayerRow(): VideoItem =
+internal fun Playable.toPlayerRow(): VideoItem =
     if (this is CloudVideoItem) toGridVideoItem() else this as VideoItem
 
 /**
@@ -9034,47 +9037,9 @@ private fun CloudEmptyRow(
 }
 
 /**
- * Whether the system has promised not to put this install to sleep.
- *
- * A question the app asks the device rather than remembers answering: the viewer can revoke it from the
- * battery screen at any time, and a settings page that said "off" while the system said "on" would be
- * worse than no page at all.
- */
-private fun isExemptFromSleep(context: Context): Boolean {
-    val power = ContextCompat.getSystemService(context, PowerManager::class.java) ?: return false
-    return runCatching { power.isIgnoringBatteryOptimizations(context.packageName) }.getOrDefault(false)
-}
-
-/**
- * Ask the system to stop putting this install to sleep.
- *
- * Two ways in, because the door is not in the same place on every build: the direct request is answered
- * by the system with a dialog naming this app, and on installs that refuse it the list of optimised apps
- * is the same switch with a person in front of it. The `package:` data is what makes the first dialog
- * about Arc Player rather than about the battery screen in general.
- */
-private fun askToSkipSleep(context: Context) {
-    val asked = runCatching {
-        context.startActivity(
-            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-                .setData(Uri.parse("package:${context.packageName}"))
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
-    }.isSuccess || runCatching {
-        context.startActivity(
-            Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
-    }.isSuccess
-    if (!asked) {
-        Toast.makeText(context, "This device has no battery optimisation settings.", Toast.LENGTH_LONG).show()
-    }
-}
-
-/**
  * The app's own page inside system settings, which is where Samsung hides its second sleeper.
  *
- * One UI puts an app to sleep on its own schedule as well as through the optimisation asked about above,
+ * One UI puts an app to sleep on its own schedule as well as through the system's optimisation,
  * and no public intent lands on that screen. The nearest honest route is this app's page, one entry short
  * of Battery, and the row says which switch to look for rather than pretending a button reaches it.
  */
@@ -9090,6 +9055,8 @@ private fun openAppSettings(context: Context) {
         Toast.makeText(context, "This device has no app settings to open.", Toast.LENGTH_LONG).show()
     }
 }
+
+private const val PRIVACY_POLICY_URL = "https://aesw0x.github.io/arcplayer/privacy-policy.html"
 
 /**
  * One line of the ledger with the shelf next to it: what this install is keeping, what the viewer calls
@@ -9478,15 +9445,13 @@ private fun SettingsContent(
     val authState by repository.authState.collectAsState()
     val connected = authState.stage == CloudAuthStage.AUTHORIZED
     val context = LocalContext.current
-    // Both are the device's answers, not this app's, so both are re-read every time the page is looked at
-    // again — which is also the moment the viewer has most likely just come back from changing one.
-    var exemptFromSleep by remember { mutableStateOf(isExemptFromSleep(context)) }
+    // The device's answer, not this app's, so it is re-read every time the page is looked at again —
+    // which is also the moment the viewer has most likely just come back from changing it.
     var notificationsAllowed by remember { mutableStateOf(DownloadNotifier.canNotify(context)) }
-    // The TV door is this app's own answer rather than the system's, so unlike the two above it is not
+    // The TV door is this app's own answer rather than the system's, so unlike the one above it is not
     // re-read on resume: nothing moves it except the switch below.
     var tvServer by remember { mutableStateOf(TvServerConfigStore.load(context)) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
-        exemptFromSleep = isExemptFromSleep(context)
         notificationsAllowed = DownloadNotifier.canNotify(context)
     }
 
@@ -9599,27 +9564,8 @@ private fun SettingsContent(
                         }
                     }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Battery optimization", fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                            Text(
-                                "While it is on, the phone is free to freeze a download the moment the " +
-                                    "screen goes off. Off means a long film can land from a pocket.",
-                                fontSize = 12.sp,
-                                color = OneUiTextSecondary
-                            )
-                        }
-                        TextButton(onClick = { askToSkipSleep(context) }, enabled = !exemptFromSleep) {
-                            Text(if (exemptFromSleep) "Off" else "Turn off", color = OneUiAccent)
-                        }
-                    }
-
-                    // Said out loud because it is the second sleeper and the one that bites on this brand:
-                    // the exemption above is the system's, and this is the manufacturer's on top of it.
+                    // Said out loud because it is the sleeper that bites on this brand: the
+                    // manufacturer's own, on top of the system's, and no intent reaches its switch.
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -9788,7 +9734,7 @@ private fun SettingsContent(
             ) {
                 Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                     Text(
-                        text = "Playback & One UI Settings",
+                        text = "Playback Settings",
                         fontSize = 16.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = OneUiTextPrimary
@@ -10020,24 +9966,65 @@ private fun SettingsContent(
                         Text(BuildConfig.VERSION_NAME, fontSize = 13.sp, color = OneUiTextSecondary)
                     }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Check for updates", fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                            Text(updateCaption, fontSize = 12.sp, color = OneUiTextSecondary)
-                        }
-                        if (updateDownload !is UpdateDownload.Running) {
-                            TextButton(onClick = onUpdateAction, enabled = !updateChecking) {
-                                Text(updateActionLabel, color = OneUiAccent)
+                    if (BuildConfig.SELF_UPDATE) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Check for updates", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                                Text(updateCaption, fontSize = 12.sp, color = OneUiTextSecondary)
+                            }
+                            if (updateDownload !is UpdateDownload.Running) {
+                                TextButton(onClick = onUpdateAction, enabled = !updateChecking) {
+                                    Text(updateActionLabel, color = OneUiAccent)
+                                }
                             }
                         }
-                    }
 
-                    if (updateDownload is UpdateDownload.Running) {
-                        UpdateProgress(updateDownload.fraction)
+                        if (updateDownload is UpdateDownload.Running) {
+                            UpdateProgress(updateDownload.fraction)
+                        }
+                    } else {
+                        Text(
+                            "Updates arrive through Google Play, which installed this copy.",
+                            fontSize = 12.sp,
+                            color = OneUiTextSecondary
+                        )
+                    }
+                }
+            }
+        }
+
+        item(key = "menu_privacy") {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = OneUiCardSurface,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(20.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Privacy policy", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Text(
+                            "What this app keeps on the phone, and what it never sends",
+                            fontSize = 12.sp,
+                            color = OneUiTextSecondary
+                        )
+                    }
+                    TextButton(onClick = {
+                        runCatching {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL))
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            )
+                        }
+                    }) {
+                        Text("Open", color = OneUiAccent)
                     }
                 }
             }
@@ -10756,7 +10743,7 @@ private const val MIN_MARK_BAND_PERCENT = 1.5f
 
 @OptIn(ExperimentalSharedTransitionApi::class, ExperimentalMaterial3Api::class)
 @Composable
-private fun HeroVlcVideoPlayerScreen(
+internal fun HeroVlcVideoPlayerScreen(
     playback: ActiveVideoPlayback,
     prefsStore: ArcPreferencesStore,
     sharedTransitionScope: SharedTransitionScope,
@@ -10764,7 +10751,8 @@ private fun HeroVlcVideoPlayerScreen(
     cloudRepository: CloudRepository?,
     onSelectAdjacentVideo: (VideoItem) -> Unit,
     onFallToAnotherCopy: (VideoItem, String) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    tvMode: Boolean = false
 ) {
     val context = LocalContext.current
     val activity = remember(context) { context.findActivity() }
@@ -10835,7 +10823,8 @@ private fun HeroVlcVideoPlayerScreen(
     // the last touch inside it, the frame goes back to the film. A finger resting on the scrubber is
     // still using it, so the countdown waits for the lift rather than pulling the bar out from under
     // the drag, and an open tracks sheet is an answer the viewer is still reading.
-    LaunchedEffect(showControls, isControlsLocked, trackSheet, controlsTouchStamp, isTouchingControls) {
+    LaunchedEffect(showControls, isControlsLocked, trackSheet, controlsTouchStamp, isTouchingControls, tvMode) {
+        if (tvMode) return@LaunchedEffect // The remote overlay owns its own inactivity/focus lifecycle.
         if (!showControls || isControlsLocked || trackSheet != TrackSheet.NONE || isTouchingControls) return@LaunchedEffect
         delay(3_000L)
         showControls = false
@@ -11169,7 +11158,8 @@ private fun HeroVlcVideoPlayerScreen(
         if (!tryAnotherCopy("That file would not open here. Playing another copy.")) {
             openGaveUp = true
             gestureHudSticky = true
-            gestureHudText = "This file would not open on this phone."
+            gestureHudText = if (tvMode) "This file would not open on this TV."
+                else "This file would not open on this phone."
             // Asking again of a player that has already read this container and refused it would only
             // spend another round trip on the same answer, so this sentence has no button under it.
             hudOffersRetry = false
@@ -11547,10 +11537,12 @@ private fun HeroVlcVideoPlayerScreen(
      * The player defaults to [ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE] immediately upon opening,
      * allowing sensor flips between standard and reverse landscape. When the player exits, [onDispose]
      * restores [ActivityInfo.SCREEN_ORIENTATION_PORTRAIT] so the rest of the app remains locked in portrait.
-     * The Rotate tool in player controls acts as a manual toggle to portrait if desired.
+     * The Rotate tool in phone controls acts as a manual toggle to portrait if desired.
+     * A TV has no rotation tool and stays landscape both here and on return to its home.
      */
-    LaunchedEffect(video.id) {
-        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+    LaunchedEffect(video.id, tvMode) {
+        activity?.requestedOrientation = if (tvMode) ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            else ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         activity?.window?.let { win ->
             val controller = WindowInsetsControllerCompat(win, hostView)
             controller.systemBarsBehavior =
@@ -11687,7 +11679,8 @@ private fun HeroVlcVideoPlayerScreen(
             // app had before the player ever spoke up.
             pendingSingleTapJob?.cancel()
             multiTapResetJob?.cancel()
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            activity?.requestedOrientation = if (tvMode) ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             vlcEngine.release()
         }
     }
@@ -11916,7 +11909,8 @@ private fun HeroVlcVideoPlayerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black.copy(alpha = (1f - dragProgress * 0.75f).coerceIn(0f, 1f)))
-            .pointerInput(isControlsLocked, trackSheet) {
+            .pointerInput(isControlsLocked, trackSheet, tvMode) {
+                if (tvMode) return@pointerInput
                 val touchSlop = viewConfiguration.touchSlop
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
@@ -12068,9 +12062,10 @@ private fun HeroVlcVideoPlayerScreen(
                 shadeBandPx,
                 homeBandPx,
                 backBandLeftPx,
-                backBandRightPx
+                backBandRightPx,
+                tvMode
             ) {
-                if (isControlsLocked || trackSheet != TrackSheet.NONE) return@pointerInput
+                if (tvMode || isControlsLocked || trackSheet != TrackSheet.NONE) return@pointerInput
                 val touchSlop = viewConfiguration.touchSlop
 
                 awaitEachGesture {
@@ -12480,6 +12475,55 @@ private fun HeroVlcVideoPlayerScreen(
             }
         }
 
+        if (tvMode) {
+            TvPlayerControls(
+                engine = vlcEngine,
+                videoId = video.id,
+                title = playerTitle,
+                subtitle = playerSubtitle,
+                canControl = openedMedia?.id == video.id && !isWaitingForFirstFrame && !openGaveUp,
+                waitingForPicture = isWaitingForPicture,
+                loadingMessage = seekStageText,
+                message = gestureHudText,
+                messageIsPersistent = gestureHudSticky,
+                offersRetry = hudOffersRetry,
+                onRetry = { retryDelivery() },
+                aspectLabel = scaleMode.label,
+                onCycleAspect = {
+                    scaleMode = VideoScaleMode.entries[(scaleMode.ordinal + 1) % VideoScaleMode.entries.size]
+                },
+                bufferedToMs = pausedBufferedToMs,
+                introEndMs = skipIntroToMs,
+                creditsStartMs = partTimings?.outroStartMs,
+                creditsEndMs = partTimings?.outroEndMs,
+                onSkipIntro = if (isSkipIntroOffered) {
+                    { skipIntroToMs?.let(vlcEngine::seekTo); Unit }
+                } else null,
+                nextLabel = nextVideo?.let { NextUp.labelFor(it.title) },
+                onNext = nextVideo?.takeIf { hasNext }?.let { upcoming ->
+                    {
+                        nextUpSeconds = 0
+                        nextUpEarly = false
+                        declinedPartId = null
+                        onSelectAdjacentVideo(upcoming)
+                    }
+                },
+                nextOffered = nextUpEarly || nextUpSeconds > 0,
+                nextUpSeconds = nextUpSeconds,
+                onCancelNext = {
+                    declinedPartId = video.id
+                    nextUpSeconds = 0
+                    nextUpEarly = false
+                },
+                subtitleLiftStepPercent = SUBTITLE_LIFT_STEP_PERCENT,
+                subtitleSizeStepPercent = SUBTITLE_SIZE_STEP_PERCENT,
+                onDismiss = {
+                    if (!prefsStore.backgroundAudioEnabled) vlcEngine.pause()
+                    onDismiss()
+                }
+            )
+        } else {
+        // Phone chrome and track sheets are not composed on TV: only one layer can own focus/Back.
         AnimatedVisibility(
             visible = sizeToastVisible && !isInPipMode,
             enter = fadeIn(tween(450)),
@@ -13560,6 +13604,7 @@ private fun HeroVlcVideoPlayerScreen(
                 }
             }
         }
+        } // Phone-only chrome.
     }
 }
 

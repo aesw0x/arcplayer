@@ -41,7 +41,7 @@ android {
     defaultConfig {
         applicationId = "com.aeswox.arcplayer"
         minSdk = 31
-        targetSdk = 35
+        targetSdk = 36
         versionCode = releaseVersion.getProperty("VERSION_CODE").toInt()
         versionName = releaseVersion.getProperty("VERSION_NAME")
 
@@ -86,6 +86,22 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+        }
+    }
+
+    // Two distributions of one app: GitHub sideloads keep the in-app updater, Play copies must not
+    // self-update because Play delivers updates itself. The play flavor also drops the install
+    // permission through src/play/AndroidManifest.xml.
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("github") {
+            dimension = "distribution"
+            isDefault = true
+            buildConfigField("boolean", "SELF_UPDATE", "true")
+        }
+        create("play") {
+            dimension = "distribution"
+            buildConfigField("boolean", "SELF_UPDATE", "false")
         }
     }
 
@@ -145,6 +161,7 @@ dependencies {
 
     // TDLib (Boost-licensed official Telegram client library) with prebuilt Android JNI
     implementation("com.github.tdlibx:td:1.8.56")
+    implementation("com.google.zxing:core:3.5.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     // The LAN server the TV companion talks to (Apache-2.0/BSD dual-licensed, pure Java, no native)

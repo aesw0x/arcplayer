@@ -33,18 +33,19 @@
     <!-- Keeps the link alive when the screen goes off mid-download, until the last film lands -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <!-- The settings row that asks the system to stop putting this app to sleep -->
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-
     <!-- The updater fetches a signed release and hands it to the installer, which is the one thing on
          Android that still needs asking about rather than merely declaring. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <application
         android:name=".ArcPlayerApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
+        android:banner="@drawable/tv_banner"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.ArcPlayer">
@@ -67,6 +68,7 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
         <!-- Not exported: it exists only while this app is fetching a film, and nothing outside the

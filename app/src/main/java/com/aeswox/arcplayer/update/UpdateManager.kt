@@ -53,6 +53,9 @@ internal class UpdateManager(private val context: Context) {
      * things to someone who pressed a button, even though a card nobody asked for says neither.
      */
     suspend fun check(): UpdateCheck = withContext(Dispatchers.IO) {
+        // The Play build is updated by the store that installed it; asking GitHub there is a policy
+        // violation, so the question is never asked.
+        if (!BuildConfig.SELF_UPDATE) return@withContext UpdateCheck.Current
         val payload = HttpJson.get(LATEST_RELEASE) ?: return@withContext UpdateCheck.Unreachable
         val assets = payload.optJSONArray("assets") ?: return@withContext UpdateCheck.Unreachable
         val tag = payload.optString("tag_name")
@@ -87,6 +90,7 @@ internal class UpdateManager(private val context: Context) {
      * out of it rather than tracked here, so a paused or retried transfer reports what it really is.
      */
     fun download(scope: CoroutineScope, release: Release, onState: (UpdateDownload) -> Unit) {
+        if (!BuildConfig.SELF_UPDATE) return
         val asset = UpdateRules.apkFor(release.assets, Build.SUPPORTED_ABIS.toList())
         val directory = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
         if (asset == null || directory == null) {
@@ -123,7 +127,7 @@ internal class UpdateManager(private val context: Context) {
      * [installPermissionRequest] is the way there.
      */
     fun install(): Boolean {
-        if (downloadId == -1L || !canInstallPackages()) return false
+        if (!BuildConfig.SELF_UPDATE || downloadId == -1L || !canInstallPackages()) return false
         val manager = context.getSystemService(DownloadManager::class.java)
         val uri = runCatching { manager.getUriForDownloadedFile(downloadId) }.getOrNull() ?: return false
         val intent = Intent(Intent.ACTION_VIEW).apply {

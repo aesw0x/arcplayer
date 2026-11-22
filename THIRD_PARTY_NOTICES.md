@@ -11,6 +11,7 @@ to, vendors, and took ideas from, and how each line was checked.
 | TDLib (`com.github.tdlibx:td`, via JitPack) | 1.8.56 | **Apache-2.0** | Read from the artifact POM in the local Gradle cache |
 | NanoHTTPD (`org.nanohttpd:nanohttpd`) | 2.3.1 | **BSD-3-Clause** | Read from the project POM and from `LICENSE.txt` inside the artifact jar; reproduced below |
 | Haze (`dev.chrisbanes.haze:haze`) | 0.7.3 | Apache-2.0 per upstream repository | **Not** verified from the artifact — the cached AAR carries no licence metadata |
+| ZXing core (`com.google.zxing:core`) | 3.5.3 | Apache-2.0 | Verified in the published `zxing-parent:3.5.3` POM; QR codes are generated on-device |
 | AndroidX, Compose BOM, Kotlin, kotlinx.coroutines | see `app/build.gradle.kts` | Apache-2.0 | Standard |
 | JUnit | 4.13.2 | EPL 1.0 | Test-only, never ships |
 | Google Fonts (`ui-text-google-fonts`) | via Compose BOM | n/a | Typefaces are fetched at runtime and stay licensed by their own designers |
