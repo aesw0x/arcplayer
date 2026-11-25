@@ -45,6 +45,10 @@ android {
         versionCode = releaseVersion.getProperty("VERSION_CODE").toInt()
         versionName = releaseVersion.getProperty("VERSION_NAME")
 
+        ndk {
+            debugSymbolLevel = "SYMBOL_TABLE"
+        }
+
         if (!splitApks) {
             ndk { abiFilters += supportedAbis }
         }
