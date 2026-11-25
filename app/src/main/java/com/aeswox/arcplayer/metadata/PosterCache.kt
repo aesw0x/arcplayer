@@ -69,6 +69,32 @@ object PosterCache {
         val key = memoryKey(url, targetWidthPx)
         memory.get(key)?.let { return it }
 
+        // Bundled artwork (the reviewer demo) never touches the network or the disk cache.
+        if (url.startsWith("asset:")) {
+            return withContext(Dispatchers.IO) {
+                memory.get(key)?.let { return@withContext it }
+                decodeSemaphore.withPermit {
+                    coroutineContext.ensureActive()
+                    val bytes = runCatching {
+                        context.assets.open(url.removePrefix("asset:")).use { it.readBytes() }
+                    }.getOrNull() ?: return@withPermit null
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                    if (bounds.outWidth <= 0) return@withPermit null
+                    val poster = BitmapFactory.decodeByteArray(
+                        bytes, 0, bytes.size,
+                        BitmapFactory.Options().apply {
+                            inSampleSize = sampleSizeFor(bounds.outWidth, targetWidthPx)
+                        }
+                    ) ?: return@withPermit null
+                    coroutineContext.ensureActive()
+                    poster.prepareToDraw()
+                    memory.put(key, poster)
+                    poster
+                }
+            }
+        }
+
         return withContext(Dispatchers.IO) {
             memory.get(key)?.let { return@withContext it }
             decodeSemaphore.withPermit {

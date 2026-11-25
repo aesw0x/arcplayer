@@ -5,6 +5,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,6 +21,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -48,6 +53,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aeswox.arcplayer.metadata.AbsoluteSeasons
+import com.aeswox.arcplayer.cloud.CloudVideoItem
+import com.aeswox.arcplayer.cloud.DownloadEntry
 import com.aeswox.arcplayer.metadata.CastMember
 import com.aeswox.arcplayer.metadata.EpisodeDetail
 import com.aeswox.arcplayer.metadata.MediaLibrary
@@ -68,12 +75,21 @@ internal fun TvTitleDetails(
     title: ShelfTitle,
     prefsStore: ArcPreferencesStore,
     authorized: Boolean,
+    twoPane: Boolean = false,
+    touchMode: Boolean = false,
+    siblings: List<ShelfTitle> = emptyList(),
+    onSelectTitle: (ShelfTitle) -> Unit = {},
+    downloads: Map<Long, DownloadEntry> = emptyMap(),
+    onDownload: (CloudVideoItem) -> Unit = {},
+    onCancelDownload: (CloudVideoItem) -> Unit = {},
+    onRemoveDownload: (CloudVideoItem) -> Unit = {},
     onPlay: (Playable) -> Unit,
     onBack: () -> Unit,
     onNavigate: (TvPage) -> Unit,
 ) {
     key(title.group.key, title.cardKey) {
-        TvTitleDetailContent(title, prefsStore, authorized, onPlay, onBack, onNavigate)
+        TvTitleDetailContent(title, prefsStore, authorized, twoPane, touchMode, siblings,
+            onSelectTitle, downloads, onDownload, onCancelDownload, onRemoveDownload, onPlay, onBack, onNavigate)
     }
 }
 
@@ -82,6 +98,14 @@ private fun TvTitleDetailContent(
     title: ShelfTitle,
     prefsStore: ArcPreferencesStore,
     authorized: Boolean,
+    twoPane: Boolean,
+    touchMode: Boolean,
+    siblings: List<ShelfTitle>,
+    onSelectTitle: (ShelfTitle) -> Unit,
+    downloads: Map<Long, DownloadEntry>,
+    onDownload: (CloudVideoItem) -> Unit,
+    onCancelDownload: (CloudVideoItem) -> Unit,
+    onRemoveDownload: (CloudVideoItem) -> Unit,
     onPlay: (Playable) -> Unit,
     onBack: () -> Unit,
     onNavigate: (TvPage) -> Unit,
@@ -121,6 +145,8 @@ private fun TvTitleDetailContent(
         lastPlayedMs = prefsStore.watchedAt,
     )
     val playFile = title.parts.firstOrNull { it.stableId == choice?.partId } ?: title.representative
+    val offlineEntry = downloads[playFile.stableId]
+    val cloudPlayFile = playFile as? CloudVideoItem
     val playLabel = if ((choice?.resumeMs ?: 0L) > 0) "Resume" else "Play"
     val favorite = title.representative.stableId in prefsStore.favoriteIds
     val episodes = remember(title, detail) { tvLibraryEpisodes(title, detail) }
@@ -146,17 +172,18 @@ private fun TvTitleDetailContent(
     val restoreCast = returningCast in cast.indices
     val member = person
     if (member != null) {
-        TvDetailPerson(member, prefsStore, authorized, onNavigate) { person = null }
+        TvDetailPerson(member, prefsStore, authorized, twoPane, touchMode, onNavigate) { person = null }
         return
     }
     BackHandler(onBack = onBack)
     LaunchedEffect(member) {
+        if (touchMode) return@LaunchedEffect
         withFrameNanos { }
         // The restore target can sit below the lazy list's composed window; focus falls back to the rail then.
         runCatching { entryFocus.requestFocus() }
     }
 
-    TvDetailFrame(detail?.backdropUrl ?: shown.posterUrl, onNavigate, authorized) {
+    val detailContent: @Composable () -> Unit = {
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
@@ -190,10 +217,11 @@ private fun TvTitleDetailContent(
                         contentPadding = PaddingValues(vertical = 6.dp, horizontal = 3.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
+                        if (touchMode) item { TvAction("Back", onBack) }
                         item {
                             TvAction(
                                 playLabel, { onPlay(playFile) },
-                                Modifier.width(132.dp).then(if (!restoreCast) Modifier.focusRequester(entryFocus) else Modifier),
+                                Modifier.width(132.dp).then(if (!touchMode && !restoreCast) Modifier.focusRequester(entryFocus) else Modifier),
                             )
                         }
                         item {
@@ -201,6 +229,24 @@ private fun TvTitleDetailContent(
                                 if (favorite) "Remove favorite" else "Add favorite",
                                 { prefsStore.toggleFavorite(title.representative.stableId) },
                             )
+                        }
+                        if (touchMode && cloudPlayFile != null) {
+                            item {
+                                TvAction(
+                                    when {
+                                        offlineEntry?.isComplete == true -> "Remove offline"
+                                        offlineEntry != null -> "Cancel download"
+                                        else -> "Keep offline"
+                                    },
+                                    {
+                                        when {
+                                            offlineEntry?.isComplete == true -> onRemoveDownload(cloudPlayFile)
+                                            offlineEntry != null -> onCancelDownload(cloudPlayFile)
+                                            else -> onDownload(cloudPlayFile)
+                                        }
+                                    },
+                                )
+                            }
                         }
                         if (detail == null && !loading && canFetch) {
                             item { TvAction("Retry details", { attempt++ }) }
@@ -309,6 +355,40 @@ private fun TvTitleDetailContent(
             }
         }
     }
+    TvDetailFrame(detail?.backdropUrl ?: shown.posterUrl, onNavigate, authorized, !twoPane, touchMode) {
+        if (twoPane) {
+            Row(Modifier.fillMaxSize()) {
+                TvTitleListPane(title, siblings, onSelectTitle)
+                Box(Modifier.weight(1f).fillMaxHeight()) { detailContent() }
+            }
+        } else detailContent()
+    }
+}
+
+@Composable
+private fun TvTitleListPane(selected: ShelfTitle, titles: List<ShelfTitle>, onSelect: (ShelfTitle) -> Unit) {
+    Column(
+        Modifier.width(310.dp).fillMaxHeight().tvGlass(TvPanelShape, .94f).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Text("Your library", color = TvColors.Text, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Text("${titles.size} titles", color = TvColors.Muted, fontSize = 13.sp)
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            modifier = Modifier.weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            items(titles, key = { it.group.key }) { title ->
+                TvPoster(title.name, title.posterUrl, Modifier.fillMaxWidth(), false, { onSelect(title) }) {
+                    if (title.group.key == selected.group.key) {
+                        Text("Selected", color = TvColors.Accent, fontSize = 12.sp,
+                            modifier = Modifier.padding(horizontal = 6.dp))
+                    }
+                }
+            }
+        }
+    }
 }
 
 private data class TvLibraryEpisode(
@@ -398,6 +478,8 @@ private fun TvDetailPerson(
     member: CastMember,
     prefsStore: ArcPreferencesStore,
     authorized: Boolean,
+    twoPane: Boolean,
+    touchMode: Boolean,
     onNavigate: (TvPage) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -423,13 +505,14 @@ private fun TvDetailPerson(
     }
     val credits = remember(cached) { PersonCredits.rank(cached?.credits.orEmpty()) }
     BackHandler(onBack = onBack)
-    TvDetailFrame(null, onNavigate, authorized) {
+    TvDetailFrame(null, onNavigate, authorized, !twoPane, touchMode) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(start = 24.dp, end = 48.dp, top = 8.dp, bottom = 40.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
             item {
+                if (touchMode) TvAction("Back", onBack, modifier = Modifier.padding(bottom = 16.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(28.dp)) {
                     TvArtwork(cached?.photoUrl ?: member.photoUrl, member.name, Modifier.width(148.dp).height(198.dp).clip(RoundedCornerShape(12.dp)), 632)
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -476,7 +559,14 @@ private fun TvDetailPerson(
 }
 
 @Composable
-private fun TvDetailFrame(artUrl: String?, onNavigate: (TvPage) -> Unit, authorized: Boolean, content: @Composable () -> Unit) {
+private fun TvDetailFrame(
+    artUrl: String?,
+    onNavigate: (TvPage) -> Unit,
+    authorized: Boolean,
+    showRail: Boolean,
+    touchMode: Boolean,
+    content: @Composable () -> Unit,
+) {
     Box(Modifier.fillMaxSize().background(TvColors.Background)) {
         if (artUrl != null) {
             TvArtwork(artUrl, null, Modifier.fillMaxSize(), 1280)
@@ -484,7 +574,10 @@ private fun TvDetailFrame(artUrl: String?, onNavigate: (TvPage) -> Unit, authori
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(TvColors.Background.copy(alpha = .2f), TvColors.Background.copy(alpha = .7f), TvColors.Background))))
         }
         Row(Modifier.fillMaxSize()) {
-            TvRail(TvPage.LIBRARY, onNavigate, authorized, Modifier.padding(start = 12.dp))
+            if (showRail) {
+                TvRail(TvPage.LIBRARY, onNavigate, authorized, Modifier.padding(start = 12.dp),
+                    mode = if (touchMode) TvShellMode.EXPANDED_TOUCH else TvShellMode.TELEVISION)
+            }
             Box(Modifier.weight(1f).fillMaxHeight().padding(top = 40.dp)) { content() }
         }
     }
@@ -493,13 +586,17 @@ private fun TvDetailFrame(artUrl: String?, onNavigate: (TvPage) -> Unit, authori
 @Composable
 private fun TvDetailTile(modifier: Modifier = Modifier, onClick: (() -> Unit)? = null, content: @Composable () -> Unit) {
     var focused by remember { mutableStateOf(false) }
+    val presses = remember { MutableInteractionSource() }
+    val pressed by presses.collectIsPressedAsState()
+    val active = focused || pressed
     Column(
         modifier.onFocusChanged { focused = it.hasFocus }
-            .tvJellyFocus(focused, 1.02f)
-            .border(2.dp, if (focused) TvColors.Focus else Color.Transparent, TvCardShape)
+            .tvJellyFocus(active, 1.02f)
+            .border(2.dp, if (active) TvColors.Focus else Color.Transparent, TvCardShape)
             .clip(TvCardShape)
             .tvGlass(TvCardShape, .6f)
-            .then(if (onClick == null) Modifier.focusable() else Modifier.clickable(onClick = onClick)),
+            .then(if (onClick == null) Modifier.focusable() else Modifier.clickable(
+                interactionSource = presses, indication = null, onClick = onClick)),
     ) { content() }
 }
 

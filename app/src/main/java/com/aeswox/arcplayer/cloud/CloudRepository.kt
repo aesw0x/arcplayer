@@ -36,6 +36,8 @@ import org.drinkless.tdlib.TdApi
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -86,6 +88,14 @@ class CloudRepository(
     private val _authState = MutableStateFlow(CloudAuthMachine.initial(hasCredentials))
     val authState: StateFlow<CloudAuthState> = _authState.asStateFlow()
 
+    /** The reviewer shelf: no Telegram session, bundled artwork, public stream addresses. */
+    private val _demoMode = MutableStateFlow(false)
+    val demoMode: StateFlow<Boolean> = _demoMode.asStateFlow()
+
+    /** True between the demo number and its code, so the code form can say what it is waiting for. */
+    private val _demoPending = MutableStateFlow(false)
+    val demoPending: StateFlow<Boolean> = _demoPending.asStateFlow()
+
     /** Reserve before enqueueing: repeated D-pad presses must not queue a second QR request. */
     private val qrRequestQueued = AtomicBoolean(false)
 
@@ -94,6 +104,12 @@ class CloudRepository(
 
     private val _videos = MutableStateFlow<Map<Long, List<CloudVideoItem>>>(emptyMap())
     val videos: StateFlow<Map<Long, List<CloudVideoItem>>> = _videos.asStateFlow()
+
+    // Restores the reviewer shelf only after every flow it writes exists: an init block runs in
+    // declaration order, and above the flows it would set null ones.
+    init {
+        if (demoPrefs().getBoolean(KEY_DEMO, false)) enterDemo(persist = false)
+    }
 
     /**
      * The captions forwarded into each chat, newest first, kept apart from the shelf itself.
@@ -310,6 +326,7 @@ class CloudRepository(
         // hands the sweep its first chance to delete a saved film. Starting it here rather than waiting
         // for the grid gives that sweep something to check against.
         scope.launch { runCatching { restoreLedger() }.onFailure { Log.w(TAG, "download ledger", it) } }
+        if (_demoMode.value) return
         scope.launch {
             bridge.start()
             if (started) return@launch
@@ -346,6 +363,33 @@ class CloudRepository(
         else CloudAuthInput.StartRequested
     }
 
+    /** Open the reviewer shelf. No TDLib client is started, so no Telegram session exists at all. */
+    private fun enterDemo(persist: Boolean = true) {
+        if (persist) demoPrefs().edit().putBoolean(KEY_DEMO, true).apply()
+        _demoPending.value = false
+        _demoMode.value = true
+        _chats.value = listOf(CloudChat(DemoCatalog.CHAT_ID, DemoCatalog.CHAT_TITLE, true))
+        _videos.value = mapOf(DemoCatalog.CHAT_ID to DemoCatalog.items)
+        _authState.value = CloudAuthMachine.transition(_authState.value, CloudAuthInput.Authorized).state
+    }
+
+    /** Leave the reviewer shelf and begin a real Telegram session from the phone form. */
+    fun exitDemo() {
+        demoPrefs().edit().putBoolean(KEY_DEMO, false).apply()
+        _demoMode.value = false
+        _demoPending.value = false
+        _videos.value = emptyMap()
+        _chats.value = emptyList()
+        _authState.value = CloudAuthMachine.initial(true)
+        scope.launch {
+            bridge.start()
+            started = true
+            bridge.submit(CloudAuthInput.StartRequested)
+        }
+    }
+
+    private fun demoPrefs() = appContext.getSharedPreferences("arc_player_prefs", Context.MODE_PRIVATE)
+
     private fun launchInput(input: () -> CloudAuthInput) {
         bridge.submit(input())
     }
@@ -361,7 +405,7 @@ class CloudRepository(
         runEffect(transition.effect)
 
         if (previousStage != CloudAuthStage.AUTHORIZED && transition.state.stage == CloudAuthStage.AUTHORIZED) {
-            if (_chats.value.isEmpty()) {
+            if (_chats.value.isEmpty() && !_demoMode.value) {
                 // Off the collector: a chat sweep is tens of round trips, and holding the queue during
                 // it would stall any login update TDLib sends while the list is being built.
                 scope.launch {
@@ -412,10 +456,32 @@ class CloudRepository(
                  * an authentication request, so it is refused with 401 before it reaches the
                  * network. `setAuthenticationPhoneNumber` is the live spelling of the same call.
                  */
-                is CloudAuthEffect.RequestCode -> bridge.call(
-                    TdApi.SetAuthenticationPhoneNumber(effect.phoneNumber, authenticationSettings())
-                )
-                is CloudAuthEffect.SubmitCode -> bridge.call(TdApi.CheckAuthenticationCode(effect.code))
+                is CloudAuthEffect.RequestCode -> {
+                    if (effect.phoneNumber == DemoCatalog.PHONE) {
+                        _demoPending.value = true
+                        bridge.submit(CloudAuthInput.CodeNeeded(CodeHint(codeLength = DemoCatalog.CODE.length)))
+                    } else {
+                        _demoPending.value = false
+                        bridge.call(
+                            TdApi.SetAuthenticationPhoneNumber(effect.phoneNumber, authenticationSettings())
+                        )
+                    }
+                }
+                is CloudAuthEffect.SubmitCode -> {
+                    if (_demoPending.value) {
+                        if (effect.code == DemoCatalog.CODE) {
+                            enterDemo()
+                        } else {
+                            bridge.submit(
+                                CloudAuthInput.Rejected(
+                                    "The demo code is ${DemoCatalog.CODE}. No message is sent to the demo number."
+                                )
+                            )
+                        }
+                    } else {
+                        bridge.call(TdApi.CheckAuthenticationCode(effect.code))
+                    }
+                }
                 is CloudAuthEffect.SubmitPassword -> bridge.call(
                     TdApi.CheckAuthenticationPassword(effect.password)
                 )
@@ -538,6 +604,7 @@ class CloudRepository(
      * title changed by hand is the viewer's and is never touched.
      */
     suspend fun readShelf(storedChatId: Long): ShelfRead {
+        if (_demoMode.value) return ShelfRead.Ready(DemoCatalog.CHAT_ID)
         if (storedChatId == 0L) return adoptOrKeep(null)
         restoreManifest(storedChatId)
         if (chatTitle(storedChatId) == LEGACY_SHELF_CHANNEL_TITLE) {
@@ -563,6 +630,7 @@ class CloudRepository(
      * how two channels end up carrying the same name and the viewer has to guess which one is real.
      */
     suspend fun ensureShelf(storedChatId: Long): Long {
+        if (_demoMode.value) return DemoCatalog.CHAT_ID
         if (storedChatId != 0L && runCatching { loadVideos(storedChatId) }.orCancelled().isSuccess) {
             return storedChatId
         }
@@ -661,6 +729,7 @@ class CloudRepository(
         withContext(Dispatchers.Default) { walkChat(chatId, force) }
 
     private suspend fun walkChat(chatId: Long, force: Boolean): List<CloudVideoItem> {
+        if (chatId == DemoCatalog.CHAT_ID) return DemoCatalog.items
         if (!force) _videos.value[chatId]?.let { return it }
         val messages = searchByFilter(chatId, TdApi.SearchMessagesFilterVideo()) +
             searchByFilter(chatId, TdApi.SearchMessagesFilterDocument())
@@ -699,6 +768,7 @@ class CloudRepository(
      * before this walk has even started.
      */
     suspend fun refreshVideos(chatId: Long): List<CloudVideoItem> {
+        if (chatId == DemoCatalog.CHAT_ID) return DemoCatalog.items
         val items = loadVideos(chatId, force = true)
         writeManifest(chatId, items)
         writeSubtitleManifest(chatId)
@@ -716,7 +786,7 @@ class CloudRepository(
      * was "Reading your shelf…" over cards that were already on the disk.
      */
     suspend fun restoreManifest(chatId: Long) {
-        if (chatId == 0L) return
+        if (chatId == 0L || chatId == DemoCatalog.CHAT_ID) return
         if (!_videos.value.containsKey(chatId)) {
             val text = withContext(Dispatchers.IO) {
                 runCatching { File(manifestPath).readText() }.getOrNull()
@@ -770,7 +840,7 @@ class CloudRepository(
      * evidence the retired id is wrong, and the number from last launch is the only one there is.
      */
     suspend fun resolveLive(video: CloudVideoItem): CloudVideoItem {
-        if (!video.isFromManifest) return video
+        if (DemoCatalog.isDemo(video) || !video.isFromManifest) return video
         val message = withTimeoutOrNull(ROUND_TRIP_TIMEOUT_MS) {
             runCatching { bridge.call(TdApi.GetMessage(video.chatId, video.messageId)) }.getOrNull()
         } ?: return video
@@ -942,6 +1012,7 @@ class CloudRepository(
      * out from under a playing film is a track that vanishes mid-scene.
      */
     suspend fun captionFileFor(video: CloudVideoItem): File? {
+        if (DemoCatalog.isDemo(video)) return null
         var candidates = _subtitles.value[video.chatId].orEmpty()
         if (candidates.isEmpty()) {
             // Nothing has been read for this chat yet. The captions ride on the same walk as the
@@ -1024,6 +1095,7 @@ class CloudRepository(
         prepareIndex: Boolean,
         televisionOwned: Boolean,
     ): String? {
+        if (DemoCatalog.isDemo(video)) return DemoCatalog.streamUrlFor(video)
         // Claimed before anything is waited for. The sweep hands back the copies no watch of this
         // session owns, and an open still waiting for its head is indistinguishable from one: the wait
         // is up to twelve seconds and the sweep walks the whole shelf inside that, deleting as it goes.
@@ -1409,7 +1481,7 @@ class CloudRepository(
      * Called by the player as it reads, to keep Telegram's download window ahead of the play head.
      */
     suspend fun advanceWindow(video: CloudVideoItem, readPositionBytes: Long) {
-        if (seekDepth.get() > 0) return
+        if (DemoCatalog.isDemo(video) || seekDepth.get() > 0) return
         aimWindowAt(video, readPositionBytes)
     }
 
@@ -1425,6 +1497,8 @@ class CloudRepository(
      * said the window carrying those bytes was still downloading.
      */
     suspend fun settledAhead(video: CloudVideoItem, readPositionBytes: Long): Long? {
+        // A public stream is whole by definition: the watchdog must never read it as a stalled fetch.
+        if (DemoCatalog.isDemo(video)) return video.sizeBytes
         val facts = pollFacts(video.fileId) ?: return null
         publishProgress(video.fileId, facts)
         return StreamWindow.readableBytes(
@@ -1590,7 +1664,11 @@ class CloudRepository(
      * [cachedByteOffset] for a seek, which is the one moment where fetching the index is worth it.
      */
     suspend fun awaitByteOffsetForSeek(video: CloudVideoItem, positionMs: Long, durationMs: Long): Long =
-        seeking { byteOffset(positionMs, durationMs, video.sizeBytes, cueTableFor(video)) }
+        if (DemoCatalog.isDemo(video)) {
+            byteOffset(positionMs, durationMs, video.sizeBytes, null)
+        } else {
+            seeking { byteOffset(positionMs, durationMs, video.sizeBytes, cueTableFor(video)) }
+        }
 
     private fun byteOffset(positionMs: Long, durationMs: Long, sizeBytes: Long, table: MkvSeekIndex.CueTable?): Long {
         val fromTable = table?.byteFor(positionMs, sizeBytes)
@@ -1931,7 +2009,7 @@ class CloudRepository(
     suspend fun breakOffFetch(video: CloudVideoItem) {
         val fileId = video.fileId
         inUse.remove(fileId)
-        tryCall(TdApi.CancelDownloadFile(fileId, false))
+        if (!DemoCatalog.isDemo(video)) tryCall(TdApi.CancelDownloadFile(fileId, false))
         demoteToKeepPriority(video)
         _progress.value = _progress.value - fileId
         Log.i(TAG, "fetch broken off file=$fileId, the player has moved on")
@@ -1954,6 +2032,11 @@ class CloudRepository(
      * open skip the index hunt entirely.
      */
     suspend fun forgetCopy(video: CloudVideoItem) {
+        if (DemoCatalog.isDemo(video)) {
+            inUse.remove(video.fileId)
+            _progress.value = _progress.value - video.fileId
+            return
+        }
         val fileId = video.fileId
         // The second of the two doors a saved film can leave through: every watch closes by putting its
         // file down, and a copy the viewer pressed Download on is watched like any other. Only the
@@ -1989,6 +2072,10 @@ class CloudRepository(
      * confirm is whole.
      */
     suspend fun download(video: CloudVideoItem) {
+        if (DemoCatalog.isDemo(video)) {
+            downloadDemo(video)
+            return
+        }
         val fileId = video.fileId
         restoreLedger()
         if (_downloads.value[video.stableId]?.isComplete == true) return
@@ -2040,6 +2127,85 @@ class CloudRepository(
         }
     }
 
+    /** A demo keep is an ordinary HTTP fetch into the same catalog row a Telegram keep uses. */
+    private suspend fun downloadDemo(video: CloudVideoItem) {
+        restoreLedger()
+        if (_downloads.value[video.stableId]?.isComplete == true) return
+        if (!keepRequests.add(video.fileId)) return
+        val handle = keptMedia.reserve(DownloadLedger.fileNameFor(video.title))
+        if (handle == null) {
+            keepRequests.remove(video.fileId)
+            Log.w(TAG, "demo keep refused title=${video.title}, no folder to keep it in")
+            return
+        }
+        updateLedger { entries ->
+            entries + (video.stableId to DownloadEntry(
+                stableId = video.stableId,
+                chatId = video.chatId,
+                messageId = video.messageId,
+                fileId = video.fileId,
+                sizeBytes = video.sizeBytes,
+                path = handle,
+                isComplete = false,
+            ))
+        }
+        _keepLine.value = KeepLine.ask(_keepLine.value, video.stableId)
+        scope.launch {
+            downloadSemaphore.withPermit {
+                if (!keepRequests.contains(video.fileId)) return@withPermit
+                val url = DemoCatalog.streamUrlFor(video)
+                val temp = File(appContext.cacheDir, "demo-keep-${video.stableId}")
+                val landed = if (url == null) -1L else runCatching {
+                    withContext(Dispatchers.IO) { streamDemoKeep(url, temp, video) }
+                }.getOrDefault(-1L)
+                if (landed > 0L && keepRequests.contains(video.fileId)) {
+                    val outcome = promoteDownload(video, temp.absolutePath, landed)
+                    if (outcome != PublishOutcome.Held) {
+                        giveUpDownload(video, "demo keep $outcome", DownloadFailure.WOULD_NOT_STORE)
+                    }
+                } else if (keepRequests.contains(video.fileId)) {
+                    giveUpDownload(video, "demo stream stopped at $landed bytes", DownloadFailure.STOPPED_ARRIVING)
+                }
+                temp.delete()
+            }
+            _keepLine.value = KeepLine.release(_keepLine.value, video.stableId)
+        }
+    }
+
+    /** Bytes first, progress beside them: the same readout a Telegram keep draws its fraction from. */
+    private fun streamDemoKeep(url: String, into: File, video: CloudVideoItem): Long {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 30_000
+            instanceFollowRedirects = true
+        }
+        var copied = 0L
+        try {
+            connection.inputStream.use { input ->
+                into.outputStream().use { output ->
+                    val buffer = ByteArray(128 * 1024)
+                    while (keepRequests.contains(video.fileId)) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        copied += read
+                        _progress.value = _progress.value + (video.fileId to CloudProgress(
+                            downloadedBytes = copied,
+                            totalBytes = video.sizeBytes,
+                            isDownloading = true,
+                            isComplete = false,
+                            bytesOnDisk = copied,
+                        ))
+                    }
+                }
+            }
+        } finally {
+            connection.disconnect()
+            _progress.value = _progress.value - video.fileId
+        }
+        return copied
+    }
+
     /**
      * Break off every other promised fetch, because this one has the link now.
      *
@@ -2072,7 +2238,7 @@ class CloudRepository(
         keepRequests.remove(video.fileId)
         fullFetches.remove(video.fileId)
         _keepLine.value = KeepLine.release(_keepLine.value, video.stableId)
-        tryCall(TdApi.CancelDownloadFile(video.fileId, false))
+        if (!DemoCatalog.isDemo(video)) tryCall(TdApi.CancelDownloadFile(video.fileId, false))
         val handle = _downloads.value[video.stableId]?.path.orEmpty()
         updateLedger { it - video.stableId }
         _progress.value = _progress.value - video.fileId
@@ -2327,6 +2493,7 @@ class CloudRepository(
         // It goes before the Telegram round trip below, which can time out on a bad link and would
         // otherwise delay the news of a film that is already sitting there finished.
         DownloadNotifier.postFinished(appContext, video.title, video.sizeBytes)
+        if (DemoCatalog.isDemo(video)) return PublishOutcome.Held
         // Telegram may have its space back, since the film no longer depends on it. Left alone, the
         // viewer is paying for the same film twice.
         //
@@ -2371,7 +2538,7 @@ class CloudRepository(
         // filling a film this app has just declared it does not want, and the next episode in line starts
         // beside it — so the queue the viewer pressed once turns into several films sharing one link,
         // which is the thing that makes every one of them slow.
-        tryCall(TdApi.CancelDownloadFile(video.fileId, false))
+        if (!DemoCatalog.isDemo(video)) tryCall(TdApi.CancelDownloadFile(video.fileId, false))
         keptMedia.release(handle)
         DownloadNotifier.postFailed(appContext, video.title, failure.viewerLine)
         Log.w(TAG, "download given up file=${video.fileId} — $logLine")
@@ -2876,6 +3043,7 @@ class CloudRepository(
 
     private companion object {
         const val TAG = "ArcCloud"
+        const val KEY_DEMO = "demo_mode"
         const val CHAT_PAGE = 60
 
         /** Channels carrying the shelf's name worth checking; there is realistically one or two. */

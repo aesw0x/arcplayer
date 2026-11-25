@@ -65,6 +65,9 @@ only media the user already possesses.
 
 ## Changes and contact
 
-If this policy changes, the new version is published at this same URL with a new effective
-date. Questions or requests: open an issue at
-[github.com/aesw0x/arcplayer](https://github.com/aesw0x/arcplayer/issues).
+The public policy is published at
+https://aesw0x.github.io/app-privacy-policies/arcplayer/. If it changes, the new version is
+published there with a new effective date. Questions or requests: open an issue at
+[github.com/aesw0x/app-privacy-policies](https://github.com/aesw0x/app-privacy-policies/issues).
+Do not include phone numbers, login codes, passwords, session files, or private videos in a
+public issue.

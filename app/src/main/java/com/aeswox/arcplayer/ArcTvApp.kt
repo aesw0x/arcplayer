@@ -1,6 +1,7 @@
 package com.aeswox.arcplayer
 
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -14,13 +15,18 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -37,6 +43,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -47,11 +55,19 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.aeswox.arcplayer.cloud.CloudAuthStage
+import com.aeswox.arcplayer.cloud.CloudProgress
 import com.aeswox.arcplayer.cloud.CloudRepository
 import com.aeswox.arcplayer.cloud.CloudSession
 import com.aeswox.arcplayer.cloud.CloudVideoItem
+import com.aeswox.arcplayer.cloud.DemoCatalog
+import com.aeswox.arcplayer.cloud.DownloadEntry
+import com.aeswox.arcplayer.cloud.DownloadNotifier
 import com.aeswox.arcplayer.metadata.MediaCard
 import com.aeswox.arcplayer.metadata.PlayOrder
+import com.aeswox.arcplayer.tvserver.TvAddress
+import com.aeswox.arcplayer.tvserver.TvPairing
+import com.aeswox.arcplayer.tvserver.TvServerConfigStore
+import com.aeswox.arcplayer.tvserver.TvServerService
 import com.aeswox.arcplayer.ui.animations.JellySkeleton
 import com.aeswox.arcplayer.ui.animations.StaggeredListItem
 import com.aeswox.arcplayer.ui.animations.jellyTabCrossSlide
@@ -59,6 +75,7 @@ import com.aeswox.arcplayer.ui.components.FrostedDialog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 internal enum class TvPage(val label: String) {
@@ -67,7 +84,11 @@ internal enum class TvPage(val label: String) {
 
 @OptIn(ExperimentalSharedTransitionApi::class)
 @Composable
-internal fun ArcTvApp() {
+internal fun ArcTvApp(
+    mode: TvShellMode = TvShellMode.TELEVISION,
+    onPlaybackActive: (Boolean) -> Unit = {},
+) {
+    val television = mode == TvShellMode.TELEVISION
     val context = LocalContext.current
     val prefs = remember { ArcPreferencesStore(context) }
     val repository = remember { CloudSession.repositoryFor(context, prefs.effectiveTelegramApiId(), prefs.effectiveTelegramApiHash()) }
@@ -82,7 +103,19 @@ internal fun ArcTvApp() {
     var page by rememberSaveable { mutableStateOf(TvPage.HOME) }
     var titleKey by rememberSaveable { mutableStateOf<String?>(null) }
     var playback by remember { mutableStateOf<ActiveVideoPlayback?>(null) }
+    LaunchedEffect(playback != null, mode) { onPlaybackActive(playback != null) }
+    SideEffect {
+        if (!television && playback == null) {
+            context.findActivity()?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+    }
     val auth by repository.authState.collectAsState()
+    val demo by repository.demoMode.collectAsState()
+    val demoPending by repository.demoPending.collectAsState()
+    val repositoryBusy by repository.busy.collectAsState()
+    val downloads by repository.downloads.collectAsState()
+    val keepLine by repository.keepLine.collectAsState()
+    LaunchedEffect(demo) { if (demo) DemoCatalog.seedInto(prefs) }
     val shelfHandle = rememberCollectionShelf(repository, prefs, snapshot)
     val shelf by shelfHandle.shelf
     val savedState = rememberSaveableStateHolder()
@@ -145,6 +178,7 @@ internal fun ArcTvApp() {
         scanTick++
         if (!canRead) notice = "Video access wasn't granted. You can still use your Telegram library."
     }
+    val notifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
     val openFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
@@ -154,10 +188,16 @@ internal fun ArcTvApp() {
                 }
             }.getOrNull() ?: "Local video"
             val file = VideoItem(id = uri.toString().hashCode().toLong().and(0x7fffffffL) + Long.MAX_VALUE / 2,
-                uri = uri, title = name, bucketId = "document", folderName = "On this TV", durationMs = 0L,
+                uri = uri, title = name, bucketId = "document", folderName = if (television) "On this TV" else "Opened file", durationMs = 0L,
                 durationFormatted = "", sizeBytes = 0L, dateAddedSec = 0L)
             play(file, listOf(file))
         }
+    }
+    fun keepOffline(file: CloudVideoItem) {
+        if (DownloadNotifier.needsPermissionAsk(context)) {
+            notifications.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+        scope.launch { repository.download(file) }
     }
     LaunchedEffect(repository) { repository.begin() }
     LaunchedEffect(repository, prefs.movieFolderChatId) { repository.restoreManifest(prefs.movieFolderChatId) }
@@ -168,7 +208,8 @@ internal fun ArcTvApp() {
         if (canRead) {
             try { snapshot = scanDeviceVideos(context) }
             catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { notice = "Couldn't read videos on this TV. Try granting video access again." }
+            catch (_: Exception) { notice = if (television) "Couldn't read videos on this TV. Try granting video access again."
+                else "Couldn't read device videos. Try granting video access again." }
         } else snapshot = MediaLibrarySnapshot()
     }
     LaunchedEffect(playback) { if (playback == null) hold(null) }
@@ -178,8 +219,11 @@ internal fun ArcTvApp() {
         }
         owner.lifecycle.addObserver(observer)
         val window = context.findActivity()?.window
-        window?.let { WindowCompat.getInsetsController(it, it.decorView).hide(WindowInsetsCompat.Type.systemBars()) }
-        onDispose { owner.lifecycle.removeObserver(observer) }
+        if (television) window?.let { WindowCompat.getInsetsController(it, it.decorView).hide(WindowInsetsCompat.Type.systemBars()) }
+        onDispose {
+            owner.lifecycle.removeObserver(observer)
+            window?.let { WindowCompat.getInsetsController(it, it.decorView).show(WindowInsetsCompat.Type.systemBars()) }
+        }
     }
     DisposableEffect(showLogin) {
         val window = context.findActivity()?.window
@@ -213,22 +257,80 @@ internal fun ArcTvApp() {
                         hold(current.cloudSources.firstOrNull { it.stableId == next.id } ?: next)
                         prefs.rememberWatchedAt(next.id)
                         playback = current.copy(video = next, switchReason = reason, refusedCopies = current.refusedCopies + current.video.id)
-                    }, onDismiss = { playback = null }, tvMode = true,
+                    }, onDismiss = { playback = null }, tvMode = television,
+                    restoreOrientation = if (television) ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                        else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED,
                 )
+                BackHandler { playback = null }
             } else {
                 Box(Modifier.fillMaxSize().background(TvColors.Background)) {
                     val selected = shelf.resolved.firstOrNull { it.group.key == titleKey }
                     when {
-                        showLogin -> TvTelegramLogin(repository) { showLogin = false; prefs.rememberTelegramWelcome() }
+                        showLogin -> if (television) {
+                            TvTelegramLogin(repository) { showLogin = false; prefs.rememberTelegramWelcome() }
+                        } else {
+                            val insets = WindowInsets.systemBars.asPaddingValues()
+                            Box(Modifier.fillMaxSize().background(TvColors.Background)) {
+                                TelegramOnboarding(
+                                    state = auth,
+                                    busy = repositoryBusy,
+                                    started = true,
+                                    hasCollection = prefs.movieFolderChatId != 0L,
+                                    setupBusy = busy,
+                                    setupError = notice,
+                                    demoPending = demoPending,
+                                    topPadding = insets.calculateTopPadding(),
+                                    bottomPadding = insets.calculateBottomPadding(),
+                                    onStart = {
+                                        if (auth.stage == CloudAuthStage.FAILED ||
+                                            (auth.stage == CloudAuthStage.READY_TO_START && auth.error != null)) {
+                                            repository.retryAuthorization()
+                                        } else repository.begin()
+                                    },
+                                    onWelcome = { showLogin = false; prefs.rememberTelegramWelcome() },
+                                    onExit = { showLogin = false; prefs.rememberTelegramWelcome() },
+                                    onPhone = repository::submitPhoneNumber,
+                                    onCode = repository::submitCode,
+                                    onPassword = repository::submitPassword,
+                                    onRegistration = repository::submitRegistration,
+                                    onKeys = prefs::updateTelegramCredentials,
+                                    onChangeNumber = repository::resetToPhoneNumber,
+                                    onSetup = {
+                                        if (prefs.movieFolderChatId != 0L) {
+                                            showLogin = false
+                                        } else perform {
+                                            prefs.rememberMovieFolder(repository.ensureShelf(0L))
+                                            showLogin = false
+                                        }
+                                    },
+                                )
+                            }
+                        }
                         selected != null -> savedState.SaveableStateProvider("title_${selected.group.key}") {
-                            TvTitleDetails(selected, prefs, shelf.authorized,
-                                onPlay = { play(it, selected.parts, selected.copySlots, selected.card) },
-                                onBack = { titleKey = null },
-                                onNavigate = { titleKey = null; page = it })
+                            BoxWithConstraints(Modifier.fillMaxSize()) {
+                                TvTitleDetails(selected, prefs, shelf.authorized,
+                                    twoPane = !television && maxWidth >= 900.dp,
+                                    touchMode = !television,
+                                    siblings = shelf.resolved,
+                                    onSelectTitle = { titleKey = it.group.key },
+                                    downloads = downloads,
+                                    onDownload = ::keepOffline,
+                                    onCancelDownload = { scope.launch { repository.cancelDownload(it) } },
+                                    onRemoveDownload = { scope.launch { repository.removeDownload(it) } },
+                                    onPlay = { play(it, selected.parts, selected.copySlots, selected.card) },
+                                    onBack = { titleKey = null },
+                                    onNavigate = { titleKey = null; page = it })
+                            }
                         }
                         else -> savedState.SaveableStateProvider("browse") {
                             TvBrowseShell(page, { page = it }, shelf, prefs, snapshot,
                                 canRead, busy || shelfHandle.refreshing, onTitle = { titleKey = it.group.key }, onPlayTitle = ::playTitle,
+                                mode = mode,
+                                downloads = downloads,
+                                keepLine = keepLine,
+                                progress = repository.progress,
+                                onCancelDownload = { scope.launch { repository.cancelDownload(it) } },
+                                onRemoveDownload = { scope.launch { repository.removeDownload(it) } },
                                 onLocal = { play(it, snapshot.videos.ifEmpty { listOf(it) }) },
                                 onResume = { item ->
                                     val title = item.title
@@ -239,7 +341,8 @@ internal fun ArcTvApp() {
                                 onPermission = { permissions.launch(requiredVideoPermissions()) },
                                 onOpenFile = {
                                     runCatching { openFile.launch(arrayOf("video/*")) }.onFailure {
-                                        notice = "This TV has no file picker. Grant video access to browse indexed videos instead."
+                                        notice = if (television) "This TV has no file picker. Grant video access to browse indexed videos instead."
+                                            else "No file picker is available. Grant video access to browse indexed videos instead."
                                     }
                                 },
                                 onCreateShelf = { perform {
@@ -247,6 +350,11 @@ internal fun ArcTvApp() {
                                     prefs.rememberMovieFolder(id)
                                     notice = "Forward your videos to Arc Player Server in Telegram, then refresh this library."
                                 } },
+                                demoMode = demo,
+                                onExitDemo = {
+                                    if (prefs.movieFolderChatId == DemoCatalog.CHAT_ID) prefs.rememberMovieFolder(0L)
+                                    repository.exitDemo()
+                                },
                             )
                         }
                     }
@@ -269,11 +377,21 @@ private fun TvBrowseShell(
     canRead: Boolean, busy: Boolean, onTitle: (ShelfTitle) -> Unit, onPlayTitle: (ShelfTitle) -> Unit, onLocal: (VideoItem) -> Unit,
     onResume: (CollectionResume) -> Unit, onSignIn: () -> Unit, onRefresh: () -> Unit,
     onPermission: () -> Unit, onOpenFile: () -> Unit, onCreateShelf: () -> Unit,
+    demoMode: Boolean = false, onExitDemo: () -> Unit = {},
+    mode: TvShellMode = TvShellMode.TELEVISION,
+    downloads: Map<Long, DownloadEntry> = emptyMap(),
+    keepLine: List<Long> = emptyList(),
+    progress: StateFlow<Map<Int, CloudProgress>>,
+    onCancelDownload: (CloudVideoItem) -> Unit,
+    onRemoveDownload: (CloudVideoItem) -> Unit,
 ) {
+    val touch = mode == TvShellMode.EXPANDED_TOUCH
+    var showDownloads by rememberSaveable { mutableStateOf(false) }
+    BackHandler(enabled = touch && showDownloads) { showDownloads = false }
     val initialFocus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { initialFocus.requestFocus() }
+    LaunchedEffect(Unit) { if (!touch) initialFocus.requestFocus() }
     Row(Modifier.fillMaxSize()) {
-        TvRail(page, onPage, shelf.authorized, Modifier.padding(start = 12.dp), initialFocus)
+        TvRail(page, { showDownloads = false; onPage(it) }, shelf.authorized, Modifier.padding(start = 12.dp), initialFocus, mode)
         Box(Modifier.weight(1f).fillMaxHeight()) {
             // The reference home sits on a dimmed wash of its own featured artwork; the glass
             // chips and cards need something behind them to read against.
@@ -297,12 +415,49 @@ private fun TvBrowseShell(
                 when (current) {
                     TvPage.HOME -> TvHome(shelf, prefs, busy, onTitle, onPlayTitle, onResume, onSignIn, onRefresh, { onPage(TvPage.SETTINGS) })
                     TvPage.SEARCH, TvPage.LIBRARY -> TvLibrary(current == TvPage.SEARCH, shelf, prefs, onTitle, onSignIn)
-                    TvPage.SETTINGS -> TvSettings(shelf, prefs, snapshot, canRead, busy, onSignIn, onRefresh,
-                        onPermission, onOpenFile, onCreateShelf, onLocal)
+                    TvPage.SETTINGS -> if (touch && showDownloads) {
+                        TvDownloads(shelf, downloads, keepLine, progress, prefs, { showDownloads = false },
+                            { showDownloads = false; onTitle(it) }, onCancelDownload, onRemoveDownload)
+                    } else TvSettings(shelf, prefs, snapshot, canRead, busy, onSignIn, onRefresh,
+                        onPermission, onOpenFile, onCreateShelf, onLocal, demoMode, onExitDemo, touch,
+                        onDownloads = { showDownloads = true })
                 }
             }
         }
     }
+}
+
+@Composable
+private fun TvDownloads(
+    shelf: CollectionShelf,
+    downloads: Map<Long, DownloadEntry>,
+    keepLine: List<Long>,
+    progress: StateFlow<Map<Int, CloudProgress>>,
+    prefs: ArcPreferencesStore,
+    onBack: () -> Unit,
+    onOpenTitle: (ShelfTitle) -> Unit,
+    onCancelDownload: (CloudVideoItem) -> Unit,
+    onRemoveDownload: (CloudVideoItem) -> Unit,
+) {
+    DownloadsContent(
+        shelf = shelf,
+        downloads = downloads,
+        keepLine = keepLine,
+        progress = progress,
+        prefsStore = prefs,
+        gridState = rememberLazyGridState(),
+        header = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                TvAction("Back", onBack)
+                Text("Downloads", color = TvColors.Text, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+            }
+        },
+        topPadding = 24.dp,
+        bottomPadding = 32.dp,
+        onOpenTitle = onOpenTitle,
+        onCancelDownload = onCancelDownload,
+        onRemoveDownload = onRemoveDownload,
+    )
 }
 
 private fun shelfMatchesFilter(title: ShelfTitle, filter: String, prefs: ArcPreferencesStore): Boolean = when (filter) {
@@ -388,13 +543,16 @@ private fun TvHome(shelf: CollectionShelf, prefs: ArcPreferencesStore, busy: Boo
 @Composable
 private fun TvFeaturedCard(title: ShelfTitle, prefs: ArcPreferencesStore, onClick: () -> Unit) {
     var focused by remember { mutableStateOf(false) }
+    val presses = remember { MutableInteractionSource() }
+    val pressed by presses.collectIsPressedAsState()
+    val active = focused || pressed
     Box(
         Modifier.width(320.dp).aspectRatio(16f / 9f)
             .onFocusChanged { focused = it.isFocused }
-            .tvJellyFocus(focused, 1.03f)
-            .border(2.dp, if (focused) TvColors.Focus else Color.Transparent, TvCardShape)
+            .tvJellyFocus(active, 1.03f)
+            .border(2.dp, if (active) TvColors.Focus else Color.Transparent, TvCardShape)
             .clip(TvCardShape)
-            .clickable(onClick = onClick),
+            .clickable(interactionSource = presses, indication = null, onClick = onClick),
     ) {
         TvArtwork(shelfArtUrl(title, prefs.titleDetail(title.providerId, title.isSeries)), title.name, Modifier.fillMaxSize(), 600)
         Box(Modifier.fillMaxSize().background(
@@ -433,13 +591,16 @@ private fun TvTitleRow(label: String, titles: List<ShelfTitle>, onTitle: (ShelfT
 }
 
 @Composable
-private fun TvPoster(name: String, url: String?, modifier: Modifier, wide: Boolean, onClick: () -> Unit, extra: @Composable () -> Unit = {}) {
+internal fun TvPoster(name: String, url: String?, modifier: Modifier, wide: Boolean, onClick: () -> Unit, extra: @Composable () -> Unit = {}) {
     var focused by remember { mutableStateOf(false) }
+    val presses = remember { MutableInteractionSource() }
+    val pressed by presses.collectIsPressedAsState()
+    val active = focused || pressed
     Column(modifier.onFocusChanged { focused = it.isFocused }
-        .tvJellyFocus(focused, 1.04f)
-        .border(2.dp, if (focused) TvColors.Focus else Color.Transparent, TvCardShape)
-        .clip(TvCardShape).background(if (focused) Color.White.copy(alpha = .08f) else Color.Transparent)
-        .clickable(onClick = onClick)
+        .tvJellyFocus(active, 1.04f)
+        .border(2.dp, if (active) TvColors.Focus else Color.Transparent, TvCardShape)
+        .clip(TvCardShape).background(if (active) Color.White.copy(alpha = .08f) else Color.Transparent)
+        .clickable(interactionSource = presses, indication = null, onClick = onClick)
         .padding(4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Box(Modifier.fillMaxWidth().aspectRatio(if (wide) 16f / 9f else 2f / 3f).clip(RoundedCornerShape(12.dp))) {
             TvArtwork(url, name, Modifier.fillMaxSize(), if (wide) 600 else 360)
@@ -493,8 +654,19 @@ private fun TvLibrary(search: Boolean, shelf: CollectionShelf, prefs: ArcPrefere
 @Composable
 private fun TvSettings(shelf: CollectionShelf, prefs: ArcPreferencesStore, snapshot: MediaLibrarySnapshot,
     canRead: Boolean, busy: Boolean, onSignIn: () -> Unit, onRefresh: () -> Unit, onPermission: () -> Unit,
-    onOpenFile: () -> Unit, onCreateShelf: () -> Unit, onLocal: (VideoItem) -> Unit) {
+    onOpenFile: () -> Unit, onCreateShelf: () -> Unit, onLocal: (VideoItem) -> Unit,
+    demoMode: Boolean = false, onExitDemo: () -> Unit = {}, touch: Boolean = false,
+    onDownloads: () -> Unit = {}) {
     var confirmCreate by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    var tvServer by remember { mutableStateOf(TvServerConfigStore.load(context)) }
+    val pairings by TvPairing.pending.collectAsState()
+    LaunchedEffect(pairings.isEmpty()) {
+        while (pairings.isNotEmpty()) {
+            delay(1_000)
+            TvPairing.sweep()
+        }
+    }
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 20.dp, end = 32.dp, top = 24.dp, bottom = 28.dp),
@@ -503,11 +675,15 @@ private fun TvSettings(shelf: CollectionShelf, prefs: ArcPreferencesStore, snaps
         item { Text("Settings", color = TvColors.Text, fontSize = 30.sp, fontWeight = FontWeight.Bold) }
         item {
             Column(Modifier.fillMaxWidth().tvGlass(TvCardShape, .6f).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                TvEmpty("Your Telegram collection", if (shelf.authorized)
-                    "Connected. Forward videos to Arc Player Server from Telegram on your phone. Your TV reads the same collection. Watch progress is stored on this device."
-                    else "Connect with a QR code, or use your phone number. You can browse local videos without an account.")
+                TvEmpty("Your Telegram collection", when {
+                    demoMode -> "Reviewer demo library is active. Exit demo mode to connect your own Telegram account."
+                    shelf.authorized -> "Connected. Forward videos to Arc Player Server from Telegram on your phone. " +
+                        if (touch) "Watch progress is stored on this device." else "Your TV reads the same collection. Watch progress is stored on this device."
+                    else -> "Connect with a QR code, or use your phone number. You can browse local videos without an account."
+                })
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    if (!shelf.authorized) TvAction("Connect Telegram", onSignIn)
+                    if (demoMode) TvAction("Exit demo mode", onExitDemo)
+                    else if (!shelf.authorized) TvAction("Connect Telegram", onSignIn)
                     else TvAction("Add from Telegram", { confirmCreate = true }, enabled = !busy)
                     TvAction(if (busy) "Refreshing…" else "Refresh library", onRefresh, enabled = !busy)
                 }
@@ -515,7 +691,7 @@ private fun TvSettings(shelf: CollectionShelf, prefs: ArcPreferencesStore, snaps
         }
         item {
             Column(Modifier.fillMaxWidth().tvGlass(TvCardShape, .6f).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                TvEmpty("On this TV", if (canRead) "Videos in the device's media library are listed below. Open a file to use an attached drive."
+                TvEmpty(if (touch) "On this device" else "On this TV", if (canRead) "Videos in the device's media library are listed below. Open a file to use an attached drive."
                     else "Allow video access to include local films, or choose a file from an attached drive.")
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     TvAction(if (canRead) "Video access" else "Allow video access", onPermission)
@@ -525,6 +701,49 @@ private fun TvSettings(shelf: CollectionShelf, prefs: ArcPreferencesStore, snaps
         }
         items(snapshot.videos, key = { it.id }) { file ->
             TvAction(file.title, { onLocal(file) }, Modifier.fillMaxWidth())
+        }
+        if (touch) item("downloads") {
+            Column(Modifier.fillMaxWidth().tvGlass(TvCardShape, .6f).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                TvEmpty("Downloads", "Manage films kept on this device for offline viewing.")
+                TvAction("Open downloads", onDownloads, Modifier.fillMaxWidth())
+            }
+        }
+        if (touch) item("tv-server") {
+            Column(Modifier.fillMaxWidth().tvGlass(TvCardShape, .6f).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                TvEmpty("TV access", "Let a TV on the same Wi-Fi browse and play this library.")
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Text("Serve films to a TV", color = TvColors.Text, modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = tvServer.enabled,
+                        onCheckedChange = { enabled ->
+                            tvServer = tvServer.copy(enabled = enabled)
+                            TvServerConfigStore.save(context, tvServer)
+                            if (enabled) TvServerService.start(context) else TvServerService.stop(context)
+                        },
+                        modifier = Modifier.semantics { contentDescription = "Serve films to a TV" },
+                    )
+                }
+                if (tvServer.enabled) {
+                    val host = remember { TvAddress.lanHost() }
+                    Text(host?.let { "http://$it:${tvServer.port}" } ?: "No LAN address available",
+                        color = TvColors.Muted, fontSize = 13.sp)
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(tvServer.token, color = TvColors.Muted, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        TvAction("New key", {
+                            tvServer = tvServer.copy(token = TvServerConfigStore.rotateToken(context))
+                            TvServerService.restart(context)
+                        })
+                    }
+                    pairings.forEach { pairing ->
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text("${pairing.tvName} · Code ${pairing.code}", color = TvColors.Text,
+                                modifier = Modifier.weight(1f))
+                            TvAction("Deny", onClick = { TvPairing.answer(pairing.code, approved = false) })
+                            TvAction("Allow", onClick = { TvPairing.answer(pairing.code, approved = true) })
+                        }
+                    }
+                }
+            }
         }
         item {
             Column(Modifier.fillMaxWidth().tvGlass(TvCardShape, .6f).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -536,13 +755,15 @@ private fun TvSettings(shelf: CollectionShelf, prefs: ArcPreferencesStore, snaps
                 }
             }
         }
-        item { TvEmpty("Arc Player ${BuildConfig.VERSION_NAME}", "Built for your remote. Use the directional buttons to browse, OK to select, and Back to return. Playback and media processing powered by VideoLAN LibVLC; Telegram connectivity powered by TDLib.") }
+        item { TvEmpty("Arc Player ${BuildConfig.VERSION_NAME}", if (touch)
+            "Touch, keyboard and controller friendly. Playback and media processing powered by VideoLAN LibVLC; Telegram connectivity powered by TDLib."
+            else "Built for your remote. Use the directional buttons to browse, OK to select, and Back to return. Playback and media processing powered by VideoLAN LibVLC; Telegram connectivity powered by TDLib.") }
         item { TvEmpty("Data sources", "This product uses the TMDB API but is not endorsed or certified by TMDB. Additional metadata comes from AniList, IMDb and Wikipedia. Artwork belongs to its respective owners.") }
     }
     if (confirmCreate) FrostedDialog(
         onDismissRequest = { confirmCreate = false },
         title = { Text("Add your videos") },
-        text = { Text("Arc will reuse your existing Arc Player Server channel, or create a private one if none exists. Forward your videos to that channel from Telegram, then refresh this TV.") },
+        text = { Text("Arc will reuse your existing Arc Player Server channel, or create a private one if none exists. Forward your videos to that channel from Telegram, then refresh this library.") },
         confirmButton = { TvAction("Continue", { confirmCreate = false; onCreateShelf() }) },
         dismissButton = { TvAction("Cancel", { confirmCreate = false }) },
     )

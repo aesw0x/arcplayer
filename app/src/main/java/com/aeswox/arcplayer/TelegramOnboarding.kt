@@ -64,6 +64,7 @@ import com.aeswox.arcplayer.cloud.CloudAuthStage
 import com.aeswox.arcplayer.cloud.CloudAuthState
 import com.aeswox.arcplayer.cloud.TelegramStep
 import com.aeswox.arcplayer.cloud.telegramAuthError
+import com.aeswox.arcplayer.cloud.DemoCatalog
 import com.aeswox.arcplayer.cloud.telegramCodeInstruction
 import com.aeswox.arcplayer.cloud.telegramStep
 import com.aeswox.arcplayer.ui.animations.StaggeredListItem
@@ -80,6 +81,7 @@ internal fun TelegramOnboarding(
     hasCollection: Boolean,
     setupBusy: Boolean,
     setupError: String?,
+    demoPending: Boolean = false,
     topPadding: Dp,
     bottomPadding: Dp,
     onStart: () -> Unit,
@@ -222,7 +224,9 @@ internal fun TelegramOnboarding(
                                 Text(when (page) {
                                     TelegramStep.WELCOME -> "Bring your Telegram movies and series into Arc Player. Your collection, beautifully organised."
                                     TelegramStep.PHONE -> "Use your Telegram phone number, including + and the country code."
-                                    TelegramStep.CODE -> telegramCodeInstruction(state.codeHint)
+                                    TelegramStep.CODE -> if (demoPending)
+                                        "Demo mode: enter ${DemoCatalog.CODE}. No message is sent to this number."
+                                    else telegramCodeInstruction(state.codeHint)
                                     TelegramStep.PASSWORD -> "Your account uses two-step verification. Enter your Telegram password, not your phone's PIN."
                                     TelegramStep.REGISTER -> "This number doesn't have a Telegram account yet. Continuing creates one."
                                     TelegramStep.CONNECTED -> if (hasCollection) "Your private collection is ready to open." else "Now give your movies a home. Set up a private Telegram channel for your collection."

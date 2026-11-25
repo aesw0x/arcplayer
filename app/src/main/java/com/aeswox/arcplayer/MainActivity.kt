@@ -296,6 +296,7 @@ import com.aeswox.arcplayer.backdrop.backdrops.rememberLayerBackdrop
 import com.aeswox.arcplayer.cloud.CloudAuthStage
 import com.aeswox.arcplayer.cloud.CloudRepository
 import com.aeswox.arcplayer.cloud.CloudSession
+import com.aeswox.arcplayer.cloud.DemoCatalog
 import com.aeswox.arcplayer.cloud.CloudVideoItem
 import com.aeswox.arcplayer.cloud.CloudWindowPlanner
 import com.aeswox.arcplayer.cloud.PausedWindow
@@ -403,6 +404,8 @@ class MainActivity : ComponentActivity() {
     var isVideoActivelyPlaying: Boolean = false
     var autoPipEnabled: Boolean = true
     var isInPipState by mutableStateOf(false)
+    private var keepExpandedShell by mutableStateOf(false)
+    private var keepPhoneShell by mutableStateOf(false)
 
     private var introNotDrawnYet = true
 
@@ -412,6 +415,10 @@ class MainActivity : ComponentActivity() {
         if (isTelevision()) {
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
             autoPipEnabled = false
+        } else if (resources.configuration.screenWidthDp < 600) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
         // Android's own splash panel would show the launcher icon and then crossfade into the app — a
         // second, frozen clapperboard stacked on top of the one the intro draws. It is not removed, only
@@ -431,9 +438,38 @@ class MainActivity : ComponentActivity() {
                 ClapperIntroGate(
                     onFirstFrame = { introNotDrawnYet = false }
                 ) {
-                    if (isTelevision()) ArcTvApp() else ArcPlayerHomeScreen()
+                    BoxWithConstraints(Modifier.fillMaxSize()) {
+                        val television = isTelevision()
+                        val expanded = !television && !keepPhoneShell &&
+                            expandedShellMode(maxWidth, maxHeight) != null
+                        when {
+                            television -> ArcTvApp(TvShellMode.TELEVISION)
+                            expanded || keepExpandedShell -> ArcTvApp(
+                                TvShellMode.EXPANDED_TOUCH,
+                                onPlaybackActive = { keepExpandedShell = it },
+                            )
+                            else -> ArcPlayerHomeScreen(
+                                onPlaybackActive = { keepPhoneShell = it },
+                            )
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (isTelevision()) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            return
+        }
+        when {
+            keepPhoneShell && newConfig.screenWidthDp >= 600 ->
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            keepExpandedShell -> Unit
+            newConfig.screenWidthDp < 600 -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            else -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
     }
 
@@ -3057,7 +3093,7 @@ internal data class ActiveVideoPlayback(
 
 @OptIn(ExperimentalSharedTransitionApi::class)
 @Composable
-fun ArcPlayerHomeScreen() {
+fun ArcPlayerHomeScreen(onPlaybackActive: (Boolean) -> Unit = {}) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
@@ -3201,6 +3237,8 @@ fun ArcPlayerHomeScreen() {
     LaunchedEffect(cloudRepository) {
         cloudRepository.begin()
     }
+    val demoMode by cloudRepository.demoMode.collectAsState()
+    LaunchedEffect(demoMode) { if (demoMode) DemoCatalog.seedInto(prefsStore) }
     val telegramAuth by cloudRepository.authState.collectAsState()
     val showingTelegramSetup = showingBrowser && livePage == LibraryPage.CLOUD &&
         cloudScreenName == CloudScreen.SHELF.name &&
@@ -3274,6 +3312,7 @@ fun ArcPlayerHomeScreen() {
     }
 
     var activePlayback by remember { mutableStateOf<ActiveVideoPlayback?>(null) }
+    LaunchedEffect(activePlayback != null) { onPlaybackActive(activePlayback != null) }
 
     // A page pushed over the search field does not take the field's focus away — it keeps sitting there
     // behind the slide, so the keyboard it asked for stays standing over the page the tap just opened.
@@ -4726,6 +4765,7 @@ private fun CloudTabContent(
         else -> "Library"
     }
     val authState by repository.authState.collectAsState()
+    val demoPending by repository.demoPending.collectAsState()
     if (screen == CloudScreen.SHELF && (authState.stage != CloudAuthStage.AUTHORIZED || onboardingStarted)) {
         val busy by repository.busy.collectAsState()
         val scope = rememberCoroutineScope()
@@ -4738,6 +4778,7 @@ private fun CloudTabContent(
             hasCollection = prefsStore.movieFolderChatId != 0L,
             setupBusy = settingUp,
             setupError = setupError,
+            demoPending = demoPending,
             topPadding = topPadding,
             bottomPadding = onboardingBottomPadding,
             onStart = {
@@ -9056,7 +9097,7 @@ private fun openAppSettings(context: Context) {
     }
 }
 
-private const val PRIVACY_POLICY_URL = "https://aesw0x.github.io/arcplayer/privacy-policy.html"
+private const val PRIVACY_POLICY_URL = "https://aesw0x.github.io/app-privacy-policies/arcplayer/"
 
 /**
  * One line of the ledger with the shelf next to it: what this install is keeping, what the viewer calls
@@ -9154,7 +9195,7 @@ private fun keptFilms(
  * claimed bytes while five of them were not getting any.
  */
 @Composable
-private fun DownloadsContent(
+internal fun DownloadsContent(
     shelf: CollectionShelf,
     downloads: Map<Long, DownloadEntry>,
     keepLine: List<Long>,
@@ -9444,6 +9485,7 @@ private fun SettingsContent(
     val totalBytes = remember(snapshot.videos) { snapshot.videos.sumOf { it.sizeBytes } }
     val authState by repository.authState.collectAsState()
     val connected = authState.stage == CloudAuthStage.AUTHORIZED
+    val demoMode by repository.demoMode.collectAsState()
     val context = LocalContext.current
     // The device's answer, not this app's, so it is re-read every time the page is looked at again —
     // which is also the moment the viewer has most likely just come back from changing it.
@@ -9992,6 +10034,37 @@ private fun SettingsContent(
                             fontSize = 12.sp,
                             color = OneUiTextSecondary
                         )
+                    }
+                }
+            }
+        }
+
+        if (demoMode) {
+            item(key = "menu_demo_exit") {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = OneUiCardSurface,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(20.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Demo mode", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                "Browsing the reviewer demo library. Exit to connect your own Telegram.",
+                                fontSize = 12.sp,
+                                color = OneUiTextSecondary
+                            )
+                        }
+                        TextButton(onClick = {
+                            if (prefsStore.movieFolderChatId == DemoCatalog.CHAT_ID) prefsStore.rememberMovieFolder(0L)
+                            repository.exitDemo()
+                        }) {
+                            Text("Exit", color = OneUiAccent)
+                        }
                     }
                 }
             }
@@ -10752,7 +10825,8 @@ internal fun HeroVlcVideoPlayerScreen(
     onSelectAdjacentVideo: (VideoItem) -> Unit,
     onFallToAnotherCopy: (VideoItem, String) -> Unit,
     onDismiss: () -> Unit,
-    tvMode: Boolean = false
+    tvMode: Boolean = false,
+    restoreOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT,
 ) {
     val context = LocalContext.current
     val activity = remember(context) { context.findActivity() }
@@ -11114,7 +11188,7 @@ internal fun HeroVlcVideoPlayerScreen(
                 }
                 isAskingTelegram = false
                 android.util.Log.i("ArcPlayer", "resolve file=${asked?.fileId} path=${path ?: "none"}")
-                path?.let { Uri.fromFile(File(it)) } ?: Uri.EMPTY
+                path?.let { if (it.startsWith("http")) Uri.parse(it) else Uri.fromFile(File(it)) } ?: Uri.EMPTY
             }
         }
         if (streamUri == Uri.EMPTY) {
@@ -11135,7 +11209,8 @@ internal fun HeroVlcVideoPlayerScreen(
         // device already owns in full — a film from the phone's own library, a copy the viewer kept —
         // and only the last is a sparse file Telegram is still filling. A whole one cannot have a hole
         // in it, so its ending needs no evidence behind it and its play head is believed outright.
-        val streamWasWholeOnDisk = video.uri != Uri.EMPTY || keptHandle != null
+        val streamWasWholeOnDisk = video.uri != Uri.EMPTY || keptHandle != null ||
+            streamUri.scheme == "http" || streamUri.scheme == "https"
         vlcEngine.loadAndPlay(media, startPositionMs = savedResumePos, wholeFileOnDisk = streamWasWholeOnDisk)
         if (savedResumePos > ResumeRules.MIN_RESUME_POSITION_MS) {
             gestureHudText = "Resumed from ${formatDuration(savedResumePos)}"
@@ -11672,15 +11747,10 @@ internal fun HeroVlcVideoPlayerScreen(
                 lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
                 win.attributes = lp
             }
-            // Back to the lock the rest of the app lives in, not to the viewer's own switch. FULL_USER
-            // follows auto-rotate, so on a phone with that turned on the home was measured lying
-            // landscape after a film that had turned itself sideways — and there is no landscape home
-            // to lie in. PORTRAIT is what the manifest launches into, so this is the same opinion the
-            // app had before the player ever spoke up.
+            // The caller chooses the shell's lock: phone portrait, TV landscape, expanded windows free.
             pendingSingleTapJob?.cancel()
             multiTapResetJob?.cancel()
-            activity?.requestedOrientation = if (tvMode) ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-                else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            activity?.requestedOrientation = restoreOrientation
             vlcEngine.release()
         }
     }

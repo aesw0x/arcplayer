@@ -73,6 +73,7 @@ import com.aeswox.arcplayer.cloud.CloudAuthMachine
 import com.aeswox.arcplayer.cloud.CloudAuthStage
 import com.aeswox.arcplayer.cloud.CloudRepository
 import com.aeswox.arcplayer.cloud.telegramAuthError
+import com.aeswox.arcplayer.cloud.DemoCatalog
 import com.aeswox.arcplayer.cloud.telegramCodeInstruction
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
@@ -96,6 +97,7 @@ private enum class TvLoginForm { QR, PHONE, CODE, PASSWORD, REGISTER, CONNECTING
 internal fun TvTelegramLogin(repository: CloudRepository, onBrowse: () -> Unit) {
     val state by repository.authState.collectAsStateWithLifecycle()
     val repositoryBusy by repository.busy.collectAsStateWithLifecycle()
+    val demoPending by repository.demoPending.collectAsStateWithLifecycle()
     var phoneFallback by rememberSaveable(repository) { mutableStateOf(false) }
     // Saving the attempt flag is safe; the token, code and password are deliberately NOT saveable.
     var qrAttempted by rememberSaveable(repository) {
@@ -233,7 +235,9 @@ internal fun TvTelegramLogin(repository: CloudRepository, onBrowse: () -> Unit) 
                     Text(when (form) {
                         TvLoginForm.QR -> "Open Telegram on your phone to sign in."
                         TvLoginForm.PHONE -> "Enter your Telegram number, including + and the country code."
-                        TvLoginForm.CODE -> telegramCodeInstruction(state.codeHint)
+                        TvLoginForm.CODE -> if (demoPending)
+                            "Demo mode: enter ${DemoCatalog.CODE}. No message is sent to this number."
+                        else telegramCodeInstruction(state.codeHint)
                         TvLoginForm.PASSWORD -> "Enter your Telegram two-step verification password. This is not your phone's PIN."
                         TvLoginForm.REGISTER -> "This number has no Telegram account. Continuing creates one; use an existing account if you prefer."
                         TvLoginForm.CONFIGURATION -> "This build is missing its Telegram app credentials. Install a configured build to sign in. You can still browse without Telegram."

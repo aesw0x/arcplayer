@@ -15,8 +15,12 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -56,15 +60,20 @@ import androidx.compose.ui.unit.sp
 import com.aeswox.arcplayer.ui.components.HugeIcons
 
 internal fun Context.isTelevision(): Boolean =
-    (getSystemService(Context.UI_MODE_SERVICE) as UiModeManager).currentModeType == Configuration.UI_MODE_TYPE_TELEVISION
+    (getSystemService(Context.UI_MODE_SERVICE) as UiModeManager).currentModeType ==
+        Configuration.UI_MODE_TYPE_TELEVISION
 
 /**
  * The TV reads the same Frosted Jelly foundation as the phone: AMOLED black page, lifted
  * containers, soft white text, one muted accent. Focus is white — the phone's primary —
  * because a remote user needs the loudest possible "this is the one" mark.
  */
-internal object TvColors {
-    val Background = Color(0xFF000000)
+internal enum class TvShellMode { TELEVISION, EXPANDED_TOUCH }
+
+internal fun expandedShellMode(maxWidth: androidx.compose.ui.unit.Dp, maxHeight: androidx.compose.ui.unit.Dp): TvShellMode? =
+    if (maxWidth >= 600.dp && maxHeight >= 480.dp) TvShellMode.EXPANDED_TOUCH else null
+
+internal object TvColors {    val Background = Color(0xFF000000)
     val Panel = Color(0xFF141414)
     val Focus = Color(0xFFFFFFFF)
     val Text = Color(0xFFEEEEEE)
@@ -105,24 +114,28 @@ internal fun TvAction(
     enabled: Boolean = true,
 ) {
     var focused by remember { mutableStateOf(false) }
+    val presses = remember { MutableInteractionSource() }
+    val pressed by presses.collectIsPressedAsState()
+    val active = focused || pressed
     Surface(
         onClick = onClick,
         enabled = enabled,
+        interactionSource = presses,
         modifier = modifier.heightIn(min = 48.dp)
             .onFocusChanged { focused = it.isFocused }
-            .tvJellyFocus(focused && enabled),
+            .tvJellyFocus(active && enabled),
         shape = CircleShape,
         color = when {
             !enabled -> Color.White.copy(alpha = .04f)
-            focused -> TvColors.Focus
+            active -> TvColors.Focus
             else -> Color.White.copy(alpha = .08f)
         },
         contentColor = when {
             !enabled -> TvColors.Muted.copy(alpha = .5f)
-            focused -> Color.Black
+            active -> Color.Black
             else -> TvColors.Text
         },
-        border = BorderStroke(2.dp, if (focused && enabled) TvColors.Focus else Color.Transparent),
+        border = BorderStroke(2.dp, if (active && enabled) TvColors.Focus else Color.Transparent),
     ) {
         Text(label, fontSize = 16.sp, fontWeight = FontWeight.Medium,
             modifier = Modifier.padding(horizontal = 22.dp, vertical = 10.dp))
@@ -137,20 +150,24 @@ internal fun TvChip(
     modifier: Modifier = Modifier,
 ) {
     var focused by remember { mutableStateOf(false) }
+    val presses = remember { MutableInteractionSource() }
+    val pressed by presses.collectIsPressedAsState()
+    val active = focused || pressed
     Surface(
         onClick = onClick,
-        modifier = modifier.heightIn(min = 40.dp)
+        interactionSource = presses,
+        modifier = modifier.heightIn(min = 48.dp)
             .onFocusChanged { focused = it.isFocused }
-            .tvJellyFocus(focused, 1.05f)
+            .tvJellyFocus(active, 1.05f)
             .semantics { this.selected = selected },
         shape = CircleShape,
         color = when {
-            focused -> TvColors.Focus
+            active -> TvColors.Focus
             selected -> Color.White.copy(alpha = .16f)
             else -> Color.White.copy(alpha = .06f)
         },
-        contentColor = if (focused) Color.Black else TvColors.Text,
-        border = BorderStroke(2.dp, if (focused) TvColors.Focus else Color.Transparent),
+        contentColor = if (active) Color.Black else TvColors.Text,
+        border = BorderStroke(2.dp, if (active) TvColors.Focus else Color.Transparent),
     ) {
         Text(label, fontSize = 14.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
             modifier = Modifier.padding(horizontal = 18.dp, vertical = 7.dp))
@@ -169,15 +186,17 @@ internal fun TvRail(
     authorized: Boolean,
     modifier: Modifier = Modifier,
     initialFocus: FocusRequester? = null,
+    mode: TvShellMode = TvShellMode.TELEVISION,
 ) {
     val cell = 56.dp
+    val touch = mode == TvShellMode.EXPANDED_TOUCH
     val offset by animateDpAsState(
         targetValue = cell * TvPage.entries.indexOf(active).coerceAtLeast(0),
         animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMediumLow),
         label = "tv_rail_pill",
     )
     Column(
-        modifier.width(84.dp).fillMaxHeight().padding(vertical = 20.dp),
+        modifier.width(if (touch) 136.dp else 84.dp).fillMaxHeight().padding(vertical = 20.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text("ARC", color = TvColors.Text, fontWeight = FontWeight.Bold, fontSize = 15.sp,
@@ -186,7 +205,8 @@ internal fun TvRail(
             Box(
                 Modifier.align(Alignment.TopCenter)
                     .offset { IntOffset(0, offset.roundToPx()) }
-                    .size(cell)
+                    .width(if (touch) 120.dp else cell)
+                    .height(cell)
                     .background(Color.White.copy(alpha = .09f), CircleShape)
             )
             Column(Modifier.align(Alignment.TopCenter)) {
@@ -196,7 +216,8 @@ internal fun TvRail(
                         selected = page == active,
                         onSelect = onSelect,
                         modifier = Modifier.height(cell),
-                        focusRequester = if (page == active) initialFocus else null,
+                        focusRequester = if (page == active && !touch) initialFocus else null,
+                        showLabel = touch,
                     )
                 }
             }
@@ -217,8 +238,12 @@ private fun TvRailButton(
     onSelect: (TvPage) -> Unit,
     modifier: Modifier = Modifier,
     focusRequester: FocusRequester? = null,
+    showLabel: Boolean = false,
 ) {
     var focused by remember { mutableStateOf(false) }
+    val presses = remember { MutableInteractionSource() }
+    val pressed by presses.collectIsPressedAsState()
+    val active = focused || pressed
     val (outline, filled) = when (page) {
         TvPage.HOME -> HugeIcons.Home to HugeIcons.HomeFilled
         TvPage.SEARCH -> HugeIcons.Search to HugeIcons.SearchFilled
@@ -226,7 +251,7 @@ private fun TvRailButton(
         TvPage.SETTINGS -> HugeIcons.Settings to HugeIcons.SettingsFilled
     }
     val tint by animateColorAsState(
-        targetValue = if (selected || focused) TvColors.Focus else TvColors.Muted,
+        targetValue = if (selected || active) TvColors.Focus else TvColors.Muted,
         animationSpec = spring<Color>(stiffness = Spring.StiffnessLow),
         label = "tv_rail_tint",
     )
@@ -239,20 +264,25 @@ private fun TvRailButton(
         modifier.fillMaxWidth()
             .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
             .onFocusChanged { focused = it.isFocused }
-            .clickable { onSelect(page) }
+            .clickable(interactionSource = presses, indication = null) { onSelect(page) }
             .semantics(mergeDescendants = true) {
                 this.selected = selected
                 contentDescription = page.label
             },
         contentAlignment = Alignment.Center,
     ) {
-        Crossfade(targetState = selected, animationSpec = tween(200), label = "tv_rail_icon") { showFill ->
-            Icon(
-                imageVector = if (showFill) filled else outline,
-                contentDescription = null,
-                tint = tint,
-                modifier = Modifier.size(24.dp).graphicsLayer { scaleX = scale; scaleY = scale },
-            )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Crossfade(targetState = selected, animationSpec = tween(200), label = "tv_rail_icon") { showFill ->
+                Icon(
+                    imageVector = if (showFill) filled else outline,
+                    contentDescription = null,
+                    tint = tint,
+                    modifier = Modifier.size(24.dp).graphicsLayer { scaleX = scale; scaleY = scale },
+                )
+            }
+            if (showLabel) {
+                Text(page.label, color = tint, fontSize = 12.sp, maxLines = 1)
+            }
         }
         if (focused) {
             Box(Modifier.size(48.dp).border(2.dp, TvColors.Focus, CircleShape))
