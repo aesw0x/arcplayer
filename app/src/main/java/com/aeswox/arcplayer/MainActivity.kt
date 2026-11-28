@@ -465,9 +465,10 @@ class MainActivity : ComponentActivity() {
             return
         }
         when {
-            keepPhoneShell && newConfig.screenWidthDp >= 600 ->
-                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            keepExpandedShell -> Unit
+            // While playback is open on either phone or expanded shell, the player screen owns
+            // requestedOrientation (defaulting to sensor landscape, toggling via Rotate, and
+            // restoring on exit); overwriting it here would undo the player's landscape lock.
+            keepPhoneShell || keepExpandedShell -> Unit
             newConfig.screenWidthDp < 600 -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             else -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
